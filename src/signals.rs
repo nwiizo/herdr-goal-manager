@@ -277,11 +277,18 @@ fn sgr_faint(parameters: &str, mut faint: bool) -> bool {
     faint
 }
 pub(crate) fn empty_composer(screen: &str, agent: &str) -> bool {
+    composer(screen, agent) == Some("")
+}
+/// Text typed into the agent's input line: empty for an empty line or one that
+/// shows only the agent's placeholder, `None` when no known input line is on screen.
+fn composer<'a>(screen: &'a str, agent: &str) -> Option<&'a str> {
     if agent == "copilot" {
         let lines: Vec<_> = screen.lines().rev().take(8).map(str::trim).collect();
-        return lines
-            .windows(3)
-            .any(|w| w[0].starts_with("╹") && w[1] == "┃" && w[2].starts_with("╻"));
+        return lines.windows(3).find_map(|w| {
+            (w[0].starts_with("╹") && w[2].starts_with("╻"))
+                .then(|| w[1].strip_prefix('┃').map(str::trim))
+                .flatten()
+        });
     }
     for line in screen.lines().rev().take(16) {
         let line = line.trim();
@@ -292,12 +299,12 @@ pub(crate) fn empty_composer(screen: &str, agent: &str) -> bool {
         };
         if let Some(tail) = tail {
             let tail = tail.trim();
-            return tail.is_empty()
-                || (agent == "codex" && tail.starts_with("Ask Codex "))
+            let placeholder = (agent == "codex" && tail.starts_with("Ask Codex "))
                 || (agent == "claude" && tail.starts_with("Try \"") && tail.ends_with('"'));
+            return Some(if placeholder { "" } else { tail });
         }
     }
-    false
+    None
 }
 /// Whether the screen shows a turn still running where Herdr's state may not:
 /// Herdr 0.9.5 lists Copilot 1.0.110 as `done` while it runs a tool, and
@@ -323,6 +330,74 @@ pub(crate) fn can_prompt(live: &Value, screen: &str) -> bool {
     matches!(live["agent_status"].as_str(), Some("idle" | "done"))
         && !busy_on_screen(screen, agent)
         && empty_composer(screen, agent)
+}
+
+/// The one observed reason an agent cannot take typed input now, so a refusal
+/// tells the manager whether to wait or to ask the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Its turn has not ended.
+    Working,
+    /// A dialog waits for an answer.
+    Dialog,
+    /// The input line holds text nobody sent (quoted, shortened).
+    Draft(String),
+    /// Neither Herdr's state nor the screen shows a known input state.
+    Unknown(String),
+}
+impl Refusal {
+    /// A sentence naming the cause for `who` and the next step, without a final period.
+    pub(crate) fn explain(&self, who: &str) -> String {
+        match self {
+            Self::Working => {
+                format!("{who} is working: its turn has not ended. Wait for it to finish")
+            }
+            Self::Dialog => format!("{who} shows a dialog: ask the user to answer it"),
+            Self::Draft(text) => format!(
+                "{who} has draft text in its input: \"{text}\". Do not type over it; ask the user whether to send or clear it"
+            ),
+            Self::Unknown(detail) => {
+                format!("{who} is in an unknown state ({detail}): inspect its pane before retrying")
+            }
+        }
+    }
+}
+/// Why the agent cannot take a prompt; `None` exactly when [`can_prompt`] holds.
+pub(crate) fn refusal(live: &Value, screen: &str) -> Option<Refusal> {
+    if can_prompt(live, screen) {
+        return None;
+    }
+    let agent = live["agent"].as_str().unwrap_or("");
+    Some(match live["agent_status"].as_str() {
+        Some("blocked") => Refusal::Dialog,
+        Some("working") => Refusal::Working,
+        _ if busy_on_screen(screen, agent) => Refusal::Working,
+        Some("idle" | "done") => input_refusal(live, screen).unwrap_or_else(|| {
+            Refusal::Unknown("its input line looks empty but was not accepted".into())
+        }),
+        other => Refusal::Unknown(format!("Herdr lists it as {}", other.unwrap_or("missing"))),
+    })
+}
+/// What on screen keeps typed input from reaching the agent, whatever its
+/// state: a dialog, draft text, or no input line hgm recognizes.
+pub(crate) fn input_refusal(live: &Value, screen: &str) -> Option<Refusal> {
+    const QUOTE: usize = 40;
+    if needs_human(live, screen) {
+        return Some(Refusal::Dialog);
+    }
+    match composer(screen, live["agent"].as_str().unwrap_or("")) {
+        Some("") => None,
+        Some(draft) => {
+            let mut quoted: String = draft.chars().take(QUOTE).collect();
+            if draft.chars().count() > QUOTE {
+                quoted.push('…');
+            }
+            Some(Refusal::Draft(quoted))
+        }
+        None => Some(Refusal::Unknown(
+            "no input line recognized on screen".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +505,45 @@ mod tests {
         assert!(!can_prompt(
             &json!({"agent":"codex","agent_status":"working"}),
             "› "
+        ));
+    }
+    #[test]
+    fn a_refusal_names_the_one_cause_observed() {
+        let agent = |agent: &str, status: &str| json!({"agent":agent,"agent_status":status});
+        assert_eq!(refusal(&agent("claude", "idle"), "result\n❯ "), None);
+        assert_eq!(
+            refusal(&agent("codex", "working"), "Editing\n› "),
+            Some(Refusal::Working)
+        );
+        assert_eq!(
+            refusal(&agent("claude", "blocked"), "anything"),
+            Some(Refusal::Dialog)
+        );
+        assert_eq!(
+            refusal(
+                &agent("claude", "idle"),
+                "Do you want to create a.txt?\n❯ 1. Yes\n  2. No"
+            ),
+            Some(Refusal::Dialog)
+        );
+        let long = "please also rename every module and update the docs accordingly";
+        assert_eq!(
+            refusal(&agent("claude", "done"), &format!("result\n❯ {long}")),
+            Some(Refusal::Draft(
+                "please also rename every module and upda…".into()
+            ))
+        );
+        assert_eq!(
+            refusal(&agent("copilot", "idle"), "╻▄▄\n┃ fix the test\n╹▀▀\n"),
+            Some(Refusal::Draft("fix the test".into()))
+        );
+        assert!(matches!(
+            refusal(&agent("codex", "idle"), "no recognized composer"),
+            Some(Refusal::Unknown(_))
+        ));
+        assert!(matches!(
+            refusal(&agent("codex", "unknown"), "› "),
+            Some(Refusal::Unknown(detail)) if detail.contains("unknown")
         ));
     }
     #[test]

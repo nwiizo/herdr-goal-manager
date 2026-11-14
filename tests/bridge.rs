@@ -137,13 +137,30 @@ fn dispatch_keeps_original_pane_and_rejects_drafts_and_replacements() {
     bridge.ok(&["send", "Inspect report.txt and test the stated outcome"]);
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.starts_with("w1:p1\n"));
+    // A refusal names the one cause observed and what to do about it.
+    let refused = |bridge: &Bridge| {
+        let output = bridge.call(&["send", "do not append this"]);
+        assert!(!output.status.success());
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
     bridge.write("target.screen", "› user's unfinished draft");
+    let draft = refused(&bridge);
     assert!(
-        !bridge
-            .call(&["send", "do not append this"])
-            .status
-            .success()
+        draft.contains("draft text in its input: \"user's unfinished draft\"")
+            && draft.contains("ask the user")
+            && !draft.contains("working"),
+        "{draft}"
     );
+    bridge.write("target.screen", "Editing src/lib.rs\n› ");
+    bridge.inventory("working", "idle", "original");
+    let working = refused(&bridge);
+    assert!(
+        working.contains("is working: its turn has not ended")
+            && working.contains("send --interrupt")
+            && !working.contains("draft"),
+        "{working}"
+    );
+    bridge.inventory("idle", "idle", "original");
     bridge.write("target.screen", "› ");
     bridge.inventory("idle", "idle", "replacement");
     assert!(!bridge.call(&["send", "do not retarget"]).status.success());

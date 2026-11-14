@@ -3,16 +3,16 @@ pub(crate) use crate::binding::{
     Target, args, capture_origin, live_pane, operation_lease, origin_terminal, path, screen,
     session,
 };
-pub(crate) use crate::signals::can_prompt;
+pub(crate) use crate::signals::{can_prompt, refusal};
 use crate::{
     binding::{SESSION_CHANGED, Session},
     herdr_cli as herdr,
     model::{Control, GoalStatus},
-    signals::{empty_composer, needs_human},
+    signals::{Refusal, empty_composer, input_refusal},
     store::Store,
     watch::{Watch, end_watch, load_watch, save_watch, watch_path, watch_running},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
 pub(crate) async fn target(
@@ -200,22 +200,18 @@ pub(crate) async fn send(
             "{} ({agent}) is working and is not known to queue input typed during a turn; send when its turn settles",
             assignment.to
         );
-        ensure!(
-            !needs_human(&live, &screen) && empty_composer(&screen, agent),
-            "{} is working with a dialog or draft input on screen; nothing was typed",
-            assignment.to
-        );
-    } else {
-        ensure!(
-            can_prompt(&live, &screen),
-            "{} is {}, blocked, unknown, or has draft input; inspect it first{}",
-            assignment.to,
-            if working { "working" } else { "busy" },
-            if working {
-                " (send --interrupt queues a linked assignment for an agent that supports it)"
-            } else {
-                ""
-            }
+        if let Some(refusal) = input_refusal(&live, &screen) {
+            bail!("{}; nothing was typed", refusal.explain(assignment.to));
+        }
+    } else if let Some(refusal) = refusal(&live, &screen) {
+        let hint = if refusal == Refusal::Working {
+            ", or queue a linked assignment with send --interrupt (for an agent that reads input during a turn)"
+        } else {
+            ""
+        };
+        bail!(
+            "{}{hint}; nothing was typed",
+            refusal.explain(assignment.to)
         );
     }
     let pane = live["pane_id"].as_str().context("missing pane")?;

@@ -226,13 +226,15 @@ pub(crate) async fn request(store: &Store) -> Result<Value> {
         );
     }
     let observation = supervision::target(store, None, None).await?;
-    ensure!(
-        supervision::can_prompt(
-            &observation["live"],
-            observation["screen"].as_str().unwrap_or("")
-        ),
-        "wait for the original agent to finish its turn and clear its input before requesting handoff"
-    );
+    if let Some(refusal) = supervision::refusal(
+        &observation["live"],
+        observation["screen"].as_str().unwrap_or(""),
+    ) {
+        anyhow::bail!(
+            "handoff not requested: {}",
+            refusal.explain("the original agent")
+        );
+    }
     let origin: Target = serde_json::from_value(observation["binding"].clone())?;
     ensure!(
         origin

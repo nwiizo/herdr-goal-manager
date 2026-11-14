@@ -5,7 +5,7 @@ use crate::{
     herdr_cli as herdr,
     manager::{Provider, codex_environment, manager_path, quote},
     store::Store,
-    supervision::{Target, args, can_prompt, live_pane, operation_lease, path, screen, session},
+    supervision::{Target, args, live_pane, operation_lease, path, refusal, screen, session},
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
@@ -484,10 +484,9 @@ pub(crate) async fn request_review(
     let live = live_pane(&role.target.pane).await?;
     role.target.check(&live)?;
     let current = screen(&role.target.pane).await?;
-    ensure!(
-        can_prompt(&live, &current),
-        "{reviewer} is busy, blocked, unknown, or has draft input; inspect it before sending"
-    );
+    if let Some(refusal) = refusal(&live, &current) {
+        bail!("{}; nothing was sent", refusal.explain(reviewer));
+    }
     let review = format!("r-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let digest = workspace_digest(&store.workspace)?;
     let list = |items: &[String]| {
