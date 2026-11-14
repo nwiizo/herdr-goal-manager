@@ -2108,6 +2108,49 @@ fn status_event(status: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// How long a test waits for a state another process records; slow CI hosts
+/// must not turn a late state into a failure.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Polls `probe` until it returns a value, failing after [`WAIT`].
+fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Runs a state-changing command, retrying while the state is busy: a running
+/// watch saving its record makes the CLI ask the caller to retry.
+fn ok_when_free(bridge: &Bridge, args: &[&str]) -> Value {
+    eventually(&args.join(" "), || {
+        let output = bridge.call(args);
+        if output.status.success() {
+            return Some(serde_json::from_slice(&output.stdout).unwrap());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("is busy"), "{}: {stderr}", args.join(" "));
+        None
+    })
+}
+
+/// The Herdr sidebar calls the fixture recorded.
+fn metadata(bridge: &Bridge) -> String {
+    std::fs::read_to_string(bridge.root.path().join("metadata.txt")).unwrap_or_default()
+}
+
+/// Complete sidebar reports in `metadata`: each ends with the budget token.
+fn sidebar_reports(metadata: &str) -> usize {
+    metadata.matches("\n--token\nbudget=").count()
+}
+
 #[test]
 fn event_watch_reads_the_screen_on_each_change_so_a_dialog_reported_done_is_held() {
     let bridge = Bridge::new();
@@ -2369,22 +2412,25 @@ fn watch_tab_and_sidebar_show_the_goal_and_the_end_clears_the_sidebar() {
     let bridge = Bridge::new();
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
+    // The pause below ends the watch at its next poll; the run limit only
+    // bounds a watch that never ends.
     let child = bridge
-        .command(&["watch-loop", "--polling", "--run-for-secs", "4"])
+        .command(&["watch-loop", "--polling", "--run-for-secs", "30"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let metadata = || std::fs::read_to_string(bridge.root.path().join("metadata.txt")).unwrap();
     // While watching: the worker's sidebar carries the goal, state and budget.
-    let shown = metadata();
+    let shown = eventually("the sidebar report", || {
+        let shown = metadata(&bridge);
+        (sidebar_reports(&shown) > 0).then_some(shown)
+    });
     assert!(
         shown.starts_with("pane\nreport-metadata\nw1:p1\n--source\nhgm\n"),
         "{shown}"
     );
     assert!(shown.contains("--token") && !shown.contains("--clear-title"));
-    bridge.ok(&["pause", &goal]);
+    ok_when_free(&bridge, &["pause", &goal]);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let tab = String::from_utf8_lossy(&output.stdout);
@@ -2397,7 +2443,7 @@ fn watch_tab_and_sidebar_show_the_goal_and_the_end_clears_the_sidebar() {
         tab.contains("stopped_by_goal") && tab.contains(&format!("hgm supervise {goal}")),
         "{tab}"
     );
-    assert!(metadata().contains("--clear-title"));
+    assert!(metadata(&bridge).contains("--clear-title"));
 }
 
 #[test]
@@ -2681,27 +2727,49 @@ fn a_redeployed_build_takes_over_the_running_watch() {
     std::fs::create_dir(&deployed).unwrap();
     let program = deployed.join("hgm");
     std::fs::copy(env!("CARGO_BIN_EXE_hgm"), &program).unwrap();
-    let root = bridge.root.path().to_path_buf();
+    let (subscribed, subscription) = std::sync::mpsc::channel();
+    let (redeployed, redeploy) = std::sync::mpsc::channel::<()>();
     let _server = fake_socket(&bridge, move |stream| {
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !root.join("replaced").exists() && std::time::Instant::now() < end {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = subscribed.send(());
+        if redeploy.recv_timeout(WAIT).is_ok() {
+            // Any state change wakes the loop, which then notices the new build.
+            stream.write_all(&status_event("working")).unwrap();
         }
-        // Any state change wakes the loop, which then notices the new build.
-        stream.write_all(&status_event("working")).unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        // The stream stays open until the test ends.
+        let _ = redeploy.recv_timeout(WAIT);
     });
+    // The pause below ends the watch; the run limit only bounds a watch that
+    // never ends.
     let child = bridge
-        .command_with(&program, &["watch-loop", "--run-for-secs", "3"])
+        .command_with(&program, &["watch-loop", "--run-for-secs", "30"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1000));
+    // A subscribed watch has already noted the build it runs from.
+    subscription
+        .recv_timeout(WAIT)
+        .expect("the watch subscribes to Herdr events");
     let staged = deployed.join("hgm.new");
     std::fs::copy(env!("CARGO_BIN_EXE_hgm"), &staged).unwrap();
     std::fs::rename(&staged, &program).unwrap();
-    bridge.write("replaced", "");
+    redeployed.send(()).unwrap();
+    eventually("the watch to reload", || {
+        kinds(&bridge, &goal)
+            .iter()
+            .any(|kind| kind == "watch_reloaded")
+            .then_some(())
+    });
+    // The new build shows the watch in the worker's sidebar again.
+    eventually("the new build to report the sidebar", || {
+        (sidebar_reports(&metadata(&bridge)) > 1).then_some(())
+    });
+    assert_eq!(
+        bridge.ok(&["watch"])["active"],
+        true,
+        "the watch did not end"
+    );
+    ok_when_free(&bridge, &["pause", &goal]);
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -2716,12 +2784,8 @@ fn a_redeployed_build_takes_over_the_running_watch() {
         .filter(|e| e["kind"] == "watch_reloaded")
         .cloned()
         .collect();
+    // Each replacement reloads once: the new build does not reload itself.
     assert_eq!(reloads.len(), 1, "{reloads:?}");
-    assert_eq!(
-        bridge.ok(&["watch"])["active"],
-        true,
-        "the watch did not end"
-    );
 }
 
 /// The user restarts the original agent in its tab: same pane, new session.

@@ -6,6 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long a test waits for a state another process records; slow CI hosts
+/// must not turn a late state into a failure.
+const WAIT: Duration = Duration::from_secs(30);
+
 struct Sandbox {
     root: tempfile::TempDir,
     workspace: PathBuf,
@@ -277,23 +281,33 @@ fn pause_stops_owned_processes_and_preserves_interrupted_attempt() {
     let mut command = sandbox.command(&["run", &id]);
     command
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     while !sandbox.workspace.join("runner.pid").exists() {
         assert!(Instant::now() < deadline, "runner did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
     sandbox.success(&["pause", &id]);
-    while child.try_wait().unwrap().is_none() {
+    // The run notices the pause on its own poll, records it, and exits.
+    let deadline = Instant::now() + WAIT;
+    let goal = loop {
+        let goal = sandbox.show(&id);
+        let exited = child.try_wait().unwrap().is_some();
+        if exited && goal["status"] == "paused" {
+            break goal;
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            panic!("pause did not stop runner");
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "pause did not stop the run (exited: {exited}, status: {}): {}",
+                goal["status"],
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let goal = sandbox.show(&id);
-    assert_eq!(goal["status"], "paused");
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(goal["tasks"][0]["attempts"][0]["status"], "interrupted");
     sandbox.success(&["cancel", &id]);
     assert!(!sandbox.call(&["resume", &id]).status.success());
