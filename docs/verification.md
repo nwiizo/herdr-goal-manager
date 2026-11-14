@@ -79,6 +79,20 @@ counting as a repeated tool call (only lines that name the command count); and
 the tab showing the whole budget before the first assignment, the next patrol
 for a settled agent, and a pending wake apart from a hold.
 
+## Published release (2026-11-14)
+
+Tag `v0.1.0` (commit `3ed45a1`) on the public repository. CI on main passed on
+Linux and macOS before the tag was pushed; the tag's release workflow built and
+smoke-tested all four targets and then created the release with
+`hgm-v0.1.0-{aarch64,x86_64}-{apple-darwin,unknown-linux-gnu}.tar.gz` and
+`SHA256SUMS`.
+
+| Check | Observed |
+| --- | --- |
+| Prebuilt archive | Following the README: `aarch64-apple-darwin` downloaded with `curl`, `shasum -a 256 -c SHA256SUMS --ignore-missing` OK, extracted folder holds `target/release/hgm`, `herdr-plugin.toml`, `README.md`, `LICENSE` and `CHANGELOG.md`; `hgm --version` printed `hgm 0.1.0`, `--help` ran. |
+| `herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.0` | After unlinking the local copy: Herdr built the plugin with its build step in 66 seconds; `herdr plugin list` shows `[github:nwiizo/herdr-goal-manager@v0.1.0]`, the checkout is at `3ed45a1`, its `hgm --version` printed `hgm 0.1.0`, and the actions `herdr-goal-manager.open` and `.board` are listed. |
+| Goal Manager from the installed plugin | Opened through the plugin's `panel` entrypoint in an owned workspace with temporary state: the manager's `HGM_BIN` was the installed build, it ran `hgm overview` and asked what to move forward. The person then opened Goal Manager with their own shortcut. |
+
 ## Release build checks (2026-11-14)
 
 Build: hgm 0.1.0 release (`cargo build --release --locked`, sha256
