@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pane list") cat "$FIXTURE_ROOT/panes.json" ;;
+  "pane process-info") cat "$FIXTURE_ROOT/process.json" ;;
+  "agent list") cat "$FIXTURE_ROOT/agents.json" ;;
+  "agent read")
+    if [ "$3" = w1:p1 ]; then cat "$FIXTURE_ROOT/target.screen"; else cat "$FIXTURE_ROOT/manager.screen"; fi ;;
+  "agent prompt")
+    printf '%s\n%s\n' "$3" "$4" >> "$FIXTURE_ROOT/sent.txt"
+    if [ -f "$FIXTURE_ROOT/fail-send" ]; then exit 1; fi
+    if [ -f "$FIXTURE_ROOT/after-prompt.screen" ]; then cp "$FIXTURE_ROOT/after-prompt.screen" "$FIXTURE_ROOT/target.screen"; fi
+    if [ "$4" = /exit ] && [ -f "$FIXTURE_ROOT/exited.json" ]; then
+      cp "$FIXTURE_ROOT/exited.json" "$FIXTURE_ROOT/panes.json"
+      cp "$FIXTURE_ROOT/exited-agents.json" "$FIXTURE_ROOT/agents.json"
+    fi
+    printf '{"result":{"type":"admitted"}}\n' ;;
+  "agent start")
+    # Like Herdr: arguments with a line break cannot be encoded for the shell.
+    for arg in "$@"; do
+      case "$arg" in *"
+"*) printf '{"error":{"code":"invalid_agent_argument"}}\n' >&2; exit 1 ;; esac
+    done
+    printf '%s\n' "$@" >> "$FIXTURE_ROOT/started.txt"
+    # A provider stopped at its own first-run question never becomes ready.
+    if [ -f "$FIXTURE_ROOT/fail-start" ]; then printf '{"error":{"code":"agent_blocked"}}\n' >&2; exit 1; fi
+    if [ -f "$FIXTURE_ROOT/successor.json" ]; then
+      cp "$FIXTURE_ROOT/successor.json" "$FIXTURE_ROOT/panes.json"
+      cp "$FIXTURE_ROOT/successor-agents.json" "$FIXTURE_ROOT/agents.json"
+    fi
+    if [ -f "$FIXTURE_ROOT/role-panes.json" ]; then
+      cp "$FIXTURE_ROOT/role-panes.json" "$FIXTURE_ROOT/panes.json"
+      cp "$FIXTURE_ROOT/role-panes.json" "$FIXTURE_ROOT/agents.json"
+    fi
+    printf '{"result":{}}\n' ;;
+  "pane report-metadata") printf '%s\n' "$@" >> "$FIXTURE_ROOT/metadata.txt"; printf '{"result":{}}\n' ;;
+  "notification show") printf '%s\n' "$3" >> "$FIXTURE_ROOT/notified.txt"; printf '{"result":{}}\n' ;;
+  "plugin pane") printf '%s\n' "$@" >> "$FIXTURE_ROOT/opened.txt"; printf '{"result":{}}\n' ;;
+  "tab get") cat "$FIXTURE_ROOT/tab.json" ;;
+  "tab rename") printf '%s %s\n' "$3" "$4" >> "$FIXTURE_ROOT/renamed.txt"; printf '{"result":{}}\n' ;;
+  "tab focus") printf '%s\n' "$3" >> "$FIXTURE_ROOT/focused.txt"; printf '{"result":{}}\n' ;;
+  "tab create") printf '%s\n' "$@" >> "$FIXTURE_ROOT/created.txt"; cat "$FIXTURE_ROOT/tab-create.json" ;;
+  "tab close") printf '%s\n' "$3" >> "$FIXTURE_ROOT/closed.txt"; printf '{"result":{"type":"ok"}}\n' ;;
+  *) printf 'unexpected fixture command\n' >&2; exit 2 ;;
+esac
