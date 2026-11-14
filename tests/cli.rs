@@ -630,12 +630,19 @@ fn a_cancelled_goal_leaves_the_inbox_despite_its_saved_wait() {
     let id = sandbox.add(json!({"objective":"Drop the idea","acceptance":["n/a"]}));
     sandbox.success(&["wait", &id, "--reason", "Ask whether to keep it"]);
     assert_eq!(sandbox.success(&["inbox"])[0]["kind"], "answer_manager");
+    assert_eq!(
+        sandbox.success(&["status"])[0]["waiting_for"],
+        "Ask whether to keep it"
+    );
     sandbox.success(&["cancel", &id]);
     let goal = sandbox.show(&id);
     assert_eq!(goal["status"], "cancelled");
     assert_eq!(goal["waiting"]["note"], "Ask whether to keep it");
     assert_eq!(sandbox.success(&["inbox"]), json!([]));
     assert_eq!(sandbox.success(&["overview"])["needs_you"], json!([]));
+    // Status still lists the goal but no longer says it waits for anyone.
+    assert!(sandbox.success(&["status"])[0]["waiting_for"].is_null());
+    assert!(sandbox.success(&["overview"])["goals"][0]["waiting_for"].is_null());
 }
 
 #[test]

@@ -112,12 +112,15 @@ fn print_attempts(attempts: &[Attempt]) {
     }
 }
 
-/// One row per goal with its next useful action.
+/// One row per goal with its next useful action. A completed or cancelled
+/// goal waits for nobody, whatever wait reason it kept as history.
 pub(crate) fn status_rows(goals: &[Goal]) -> Vec<serde_json::Value> {
     use crate::model::GoalStatus;
     goals
         .iter()
         .map(|goal| {
+            let finished = matches!(goal.status, GoalStatus::Completed | GoalStatus::Cancelled);
+            let waiting = goal.waiting.as_ref().filter(|_| !finished);
             let next = match goal.status {
                 GoalStatus::Completed | GoalStatus::Cancelled => "none",
                 GoalStatus::Running => "inspect_execution",
@@ -136,7 +139,7 @@ pub(crate) fn status_rows(goals: &[Goal]) -> Vec<serde_json::Value> {
             serde_json::json!({"id":goal.id,"objective":goal.spec.objective,"status":goal.status,
             "completed_tasks":goal.tasks.iter().filter(|t|t.succeeded()).count(),
             "total_tasks":goal.tasks.len(),"next_action":next,"message":goal.message,
-            "waiting_for":goal.waiting.as_ref().map(|w| &w.note)})
+            "waiting_for":waiting.map(|w| &w.note)})
         })
         .collect()
 }
@@ -284,6 +287,18 @@ mod tests {
         let rows = inbox_rows(&store, &store.list()?)?;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["id"], ids[2]);
+        let waits: Vec<_> = status_rows(&store.list()?)
+            .iter()
+            .map(|row| row["waiting_for"].clone())
+            .collect();
+        assert_eq!(
+            waits,
+            [
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "Ask the user".into()
+            ]
+        );
         Ok(())
     }
 }
