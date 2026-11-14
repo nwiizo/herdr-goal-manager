@@ -16,8 +16,13 @@ least one agent CLI. hgm is one binary plus a Herdr plugin manifest.
 
 ### 1. Herdr and an agent CLI
 
-- Install Herdr from [herdr.dev](https://herdr.dev), start it with `herdr`, and
-  check `herdr --version` (0.9.5 or later). Goal Manager runs in Herdr tabs.
+- Install [Herdr](https://herdr.dev) with its installer or Homebrew, then start
+  it with `herdr` and check `herdr --version` (0.9.5 or later). Goal Manager
+  runs in Herdr tabs.
+
+  ```sh
+  curl -fsSL https://herdr.dev/install.sh | sh   # or: brew install herdr
+  ```
 - Install at least one agent CLI, sign in, and start it once in a terminal so
   its own first-run questions (sign-in, folder trust) are answered:
   [Claude Code](https://github.com/anthropics/claude-code) (`claude`),
@@ -38,6 +43,9 @@ herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.0
 
 **Prebuilt archive** (no Rust needed). Download the archive for your machine,
 check it, and extract it into a folder that stays: Herdr links to that folder.
+Run these lines in bash or zsh (from fish, start `bash` first). The Linux
+archives are built on Ubuntu 24.04; if the binary does not start on an older
+distribution (an older glibc), build from a checkout instead.
 
 ```sh
 case "$(uname -s)-$(uname -m)" in
@@ -64,9 +72,10 @@ with `curl` as above, or clear the attribute with
 **From a checkout** (Rust 1.89 or later):
 
 ```sh
-git clone https://github.com/nwiizo/herdr-goal-manager
+git clone --branch v0.1.0 https://github.com/nwiizo/herdr-goal-manager
 cd herdr-goal-manager
 cargo build --release --locked
+target/release/hgm --version  # hgm 0.1.0
 herdr plugin link "$PWD"
 ```
 
@@ -92,12 +101,13 @@ Validate it with `herdr config check` and apply it with
 
 ### 4. First run
 
-1. In Herdr, open a tab in the folder you work in and start your agent there
-   (`claude`, `codex` or `copilot`). This tab is main: the agent that does the
-   work.
+1. In Herdr, open a tab (**prefix, c**), change to the folder you work in, and
+   start your agent there (`claude`, `codex` or `copilot`). This tab is main:
+   the agent that does the work.
 2. Press the shortcut from that tab. A Goal Manager tab opens with the same
    agent and asks what you want to move forward. If its provider asks whether to
-   trust the folder, answer it in that tab.
+   trust the folder, answer it in that tab. With Copilot, set a capable model
+   for the manager first (`models.copilot`, see Limits).
 3. Describe the problem or the result you want. Small requests go straight to
    main; for larger work the manager writes a contract, shows it to you and
    sends the work once you agree. It keeps the goal records (no YAML to write)
@@ -105,9 +115,11 @@ Validate it with `herdr config check` and apply it with
 
 Pressing the shortcut again from the same tab switches to its running manager.
 To run `hgm` in your own shell as well (`hgm overview`, `hgm log`), link the
-binary onto your `PATH`, for example
-`ln -s ~/.local/share/hgm-v0.1.0-$target/target/release/hgm ~/.local/bin/hgm`;
-the managers do not need it.
+plugin's `target/release/hgm` onto your `PATH`: inside the archive or checkout
+folder, or for a GitHub install under
+`~/.config/herdr/plugins/github-installations/`. For the archive above:
+`ln -s ~/.local/share/hgm-v0.1.0-$target/target/release/hgm ~/.local/bin/hgm`
+(any folder on your `PATH`). The managers do not need it.
 
 ### Uninstall
 
