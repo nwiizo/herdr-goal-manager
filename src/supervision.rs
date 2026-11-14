@@ -421,6 +421,7 @@ async fn arm(
         goal: goal.into(),
         goals: Vec::new(),
         spent: Default::default(),
+        wake_anchor: String::new(),
         origin,
         role: role.into(),
         checked_through: None,

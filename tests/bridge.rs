@@ -177,7 +177,7 @@ fn watcher_wakes_manager_but_does_not_complete_work_and_pause_stops_it() {
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.starts_with("w1:p2\n"));
-    assert!(sent.contains("Idle/done is not acceptance"));
+    assert!(sent.contains("idle/done is not acceptance"));
     assert_eq!(bridge.ok(&["show", &goal])["status"], "ready");
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     assert_eq!(
@@ -813,9 +813,12 @@ fn watcher_patrols_a_working_agent_and_escalates_a_spent_time_budget() {
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.contains("5-minute check of main"), "{sent}");
-    assert!(sent.contains("Last assignment: Draft the Q3 report"));
-    assert!(sent.contains("Invariants: Keep the Q2 numbers"));
-    assert!(sent.contains("Stop when: Q3 data is unavailable"));
+    // The first wake after an assignment carries it in full; the contract
+    // (invariants, stop conditions) stays one command away.
+    let wake = &sent[sent.rfind("Goal Manager observation").unwrap()..];
+    assert!(wake.contains("New assignment (full text):\nDraft the Q3 report"));
+    assert!(wake.contains(&format!("Contract: hgm show {goal}")));
+    assert!(!wake.contains("Keep the Q2 numbers"), "{wake}");
     assert!(kinds(&bridge, &goal).contains(&"patrol".to_string()));
 
     // Age the first assignment past the one-hour budget.
@@ -3052,4 +3055,96 @@ fn watch_state_saved_under_a_manager_context_moves_to_the_terminal() {
     assert_eq!(bridge.ok(&["watch"])["active"], true);
     assert!(!legacy.exists());
     assert!(manager_dir.join("t-original-watch.json").exists());
+}
+
+/// A patrol and a settle wake for a contract and assignment the size of the
+/// ones managers wrote on 2026-11-14; returns the two wake texts.
+fn sample_wakes() -> (String, String) {
+    let bridge = Bridge::new();
+    let item = |n: usize| {
+        format!(
+            "Criterion {n}: hgm keeps the recorded evidence, names the observed cause and the next step for the manager, and a test covers the case described here"
+        )
+    };
+    let goal = add_file(
+        &bridge,
+        json!({
+            "objective":"Adopt the manager ideas that Herdr supports: an isolated checkout per goal, one watch per pane serving several goals, compact wakes, settle checks that only flag real regressions, and status without stale waits.",
+            "acceptance":(1..=6).map(item).collect::<Vec<_>>(),
+            "invariants":["Existing commands, flags, JSON fields and goal state transitions keep their meaning; new fields and options are additive.","No PR or merge automation, daemon process, Slack integration, formal specification or automatic task decomposition.","The main checkout stays unchanged until the publish; no version bump, tag, release or plugin reinstall."],
+            "out_of_scope":["Merging the TODO branches into main","Codex native checks"],
+            "checks":[{"name":"workspace-checks","command":"true"}],
+            "loop":{"patrol_minutes":1,"stop_when":["a fix needs a Herdr change"]}
+        }),
+    );
+    bridge.ok(&["confirm", &goal, "--evidence", "User: go"]);
+    let assignment = "Implement the shared watch: add goals to Watch with serde default so old state files read as one goal, let a second goal on the same pane join the running watch, pick the goal and task of the latest linked assignment to that pane on every wake, keep the wake budget per goal, and remove only the paused, cancelled or waiting goal from the watch, ending it when none is left. Run settle checks only for the chosen goal. Add tests for two goals on one pane and for one of them waiting. Then run fmt, clippy -D warnings, the tests and a release build, commit with a conventional message, and report briefly.";
+    bridge.ok(&["send", "--goal", &goal, "--task", "work", assignment]);
+    let screen: String = (1..=30)
+        .map(|n| {
+            format!("⏺ Step {n}: edited src/watch.rs and ran cargo test --locked; 116 passed\n")
+        })
+        .collect();
+    let sent = bridge.root.path().join("sent.txt");
+    let wake = |bridge: &Bridge| {
+        let before = std::fs::read_to_string(&sent).unwrap().len();
+        assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+        let text = std::fs::read_to_string(&sent).unwrap()[before..].to_string();
+        text.strip_prefix("w1:p2\n")
+            .unwrap_or(&text)
+            .trim_end()
+            .to_string()
+    };
+    bridge.write("target.screen", &format!("{screen}› "));
+    bridge.inventory("working", "idle", "original");
+    let watch_path = state_directory(&bridge).join("manager/t-original-watch.json");
+    let mut watch: Value = serde_json::from_slice(&std::fs::read(&watch_path).unwrap()).unwrap();
+    watch["last_patrol"] = json!(0);
+    std::fs::write(&watch_path, watch.to_string()).unwrap();
+    let patrol = wake(&bridge);
+    bridge.write("target.screen", &format!("{screen}⏺ Done: committed.\n› "));
+    bridge.inventory("done", "idle", "original");
+    let mut watch: Value = serde_json::from_slice(&std::fs::read(&watch_path).unwrap()).unwrap();
+    watch["last_sent"] = json!(0);
+    std::fs::write(&watch_path, watch.to_string()).unwrap();
+    let settle = wake(&bridge);
+    (patrol, settle)
+}
+/// Wakes carry what changed: the assignment in full only on its first wake,
+/// and new screen lines only. docs/verification.md records the sizes
+/// (`cargo test --test bridge wakes_carry -- --nocapture` prints them).
+#[test]
+fn wakes_carry_the_full_assignment_once_and_only_new_lines() {
+    let (patrol, settle) = sample_wakes();
+    println!(
+        "patrol wake: {} bytes, settle wake: {} bytes",
+        patrol.len(),
+        settle.len()
+    );
+    let full = "Implement the shared watch: add goals to Watch with serde default";
+    assert!(
+        patrol.contains("New assignment (full text):") && patrol.contains("and report briefly."),
+        "{patrol}"
+    );
+    assert!(
+        settle.contains(&format!("Assignment: {full}"))
+            && settle.contains("(full text: hgm log")
+            && !settle.contains("and report briefly."),
+        "{settle}"
+    );
+    // The settle wake quotes only the line added since the patrol.
+    assert!(
+        settle.contains("⏺ Done: committed.") && !settle.contains("Step 30:"),
+        "{settle}"
+    );
+    for wake in [&patrol, &settle] {
+        assert!(wake.contains("Contract: hgm show g-") && !wake.contains("Criterion 1"));
+    }
+    assert!(settle.contains("every command check passes"), "{settle}");
+    assert!(
+        patrol.len() < 2_500 && settle.len() < 1_600,
+        "patrol {} / settle {} bytes",
+        patrol.len(),
+        settle.len()
+    );
 }

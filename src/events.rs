@@ -236,6 +236,16 @@ pub(crate) fn since(text: &str) -> Result<DateTime<Utc>> {
 
 /// One readable line per event for `hgm log`.
 pub(crate) fn describe(event: &Event) -> String {
+    format!(
+        "{}  {}  {:<14} {}",
+        event.at.format("%Y-%m-%d %H:%M:%S"),
+        &event.goal[..event.goal.len().min(10)],
+        event.kind,
+        summary(event)
+    )
+}
+/// What an event says, in at most 200 characters.
+pub(crate) fn summary(event: &Event) -> String {
     let d = &event.detail;
     let text = |key: &str| d[key].as_str().unwrap_or_default().to_string();
     let summary = match event.kind.as_str() {
@@ -263,14 +273,25 @@ pub(crate) fn describe(event: &Event) -> String {
         "waiting" | "attention" | "watch_ended" => text("reason"),
         "accepted" | "confirmed" => text("evidence"),
         "patrol" => text("reason"),
+        "watch_joined" => format!(
+            "shares the watch on {} ({} goals)",
+            text("pane"),
+            d["goals"].as_array().map_or(0, Vec::len)
+        ),
+        "settle_checks" => {
+            let names = |key: &str, name: &dyn Fn(&Value) -> Option<&str>| {
+                d[key]
+                    .as_array()
+                    .map(|items| items.iter().filter_map(name).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default()
+            };
+            format!(
+                "passed: {}; failed: {}",
+                names("passed", &|v| v.as_str()),
+                names("failed", &|v| v["name"].as_str())
+            )
+        }
         _ => d.to_string(),
     };
-    let summary: String = summary.chars().take(200).collect();
-    format!(
-        "{}  {}  {:<14} {}",
-        event.at.format("%Y-%m-%d %H:%M:%S"),
-        &event.goal[..event.goal.len().min(10)],
-        event.kind,
-        summary
-    )
+    summary.chars().take(200).collect()
 }

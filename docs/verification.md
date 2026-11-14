@@ -295,6 +295,31 @@ Limits found:
   `send --interrupt` and corrections to a working Codex are refused, since text
   typed into a working Codex is not known to be kept.
 
+## Wake size (2026-11-14)
+
+Every wake used to repeat the acceptance, invariants, stop conditions and the
+full last assignment, and to quote the whole visible screen. Managers on
+2026-11-14 spent much of their context on that repetition. Wakes now carry the
+goal, task and one-line objective, the budget line, the assignment in full only
+on its first wake (its first line afterwards), events since the previous wake,
+and only screen lines added since then; the contract is one `hgm show GOAL`
+away. Notices for the person (dialogs, spent budgets) are unchanged.
+
+Measured with the fake Herdr in `tests/bridge.rs`
+(`wakes_carry_the_full_assignment_once_and_only_new_lines`; run it with
+`-- --nocapture` to print the sizes): a contract with six acceptance items,
+three invariants, two out-of-scope items and one stop condition, a 618-character
+linked assignment and a 30-line screen. The patrol is the first wake after the
+assignment; the settle wake follows when the worker finishes.
+
+| Wake | Before (62eed89) | After | Change |
+|---|---|---|---|
+| Patrol (first wake after the assignment) | 5,505 bytes | 2,393 bytes | −57% |
+| Settle (later wake, one new screen line) | 5,457 bytes | 1,479 bytes | −73% |
+
+The patrol stays larger because it carries the full assignment once and, with
+no earlier wake to compare against, the last 8 screen lines.
+
 ## Watch measurement: polling and events (2026-11-13, counted 2026-11-14)
 
 Herdr calls and wake latency were measured on 2026-11-13 with Herdr 0.9.5 in
