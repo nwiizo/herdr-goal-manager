@@ -271,6 +271,27 @@ pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result
     }
     Ok(())
 }
+/// Whether a running watch, in any manager context, serves `goal`.
+pub(crate) fn watched(store: &Store, goal: &str) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    for entry in std::fs::read_dir(store.private_directory("manager")?)? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-watch.json"))
+        {
+            continue;
+        }
+        let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
+            continue;
+        };
+        if watch.active && watch.serves(goal) && watch_running(store, &watch, now)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 /// Takes `goal` off the watch. The watch itself ends with `reason` only when
 /// no other goal shares it; otherwise only `goal`'s timeline records the end.
 fn drop_goal(
@@ -571,7 +592,16 @@ async fn settle_checks(
             prompt_stdin: false,
         };
         let id = format!("settle-{}", uuid::Uuid::new_v4());
-        match crate::process::execute(store, &id, &command, "", check.timeout_secs).await {
+        match crate::process::execute(
+            store,
+            goal.work_dir(),
+            &id,
+            &command,
+            "",
+            check.timeout_secs,
+        )
+        .await
+        {
             Ok(_) => passed.push(check.name.clone()),
             Err(error) => {
                 let detail: String = format!("{error:#}").chars().take(300).collect();
@@ -738,7 +768,7 @@ pub(crate) async fn watch_once(
     let policy = &goal.spec.loop_policy;
     if let Some(baseline) = &goal.protected_digest
         && !goal.spec.protected_paths.is_empty()
-        && crate::contract::protected_digest(&store.workspace, &goal.spec.protected_paths)?
+        && crate::contract::protected_digest(goal.work_dir(), &goal.spec.protected_paths)?
             != *baseline
     {
         let reason = format!(
@@ -819,9 +849,16 @@ pub(crate) async fn watch_once(
             prompt_stdin: false,
         };
         let id = format!("stop-{}", uuid::Uuid::new_v4());
-        if crate::process::execute(store, &id, &command, "", check.timeout_secs)
-            .await
-            .is_ok()
+        if crate::process::execute(
+            store,
+            goal.work_dir(),
+            &id,
+            &command,
+            "",
+            check.timeout_secs,
+        )
+        .await
+        .is_ok()
         {
             let reason = format!(
                 "Stop condition {} holds. Decide whether to revise the goal or stop.",

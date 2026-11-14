@@ -1,6 +1,7 @@
 //! herdr-goal-manager CLI entrypoint.
 mod admission;
 mod binding;
+mod checkout;
 mod cli;
 mod config;
 mod contract;

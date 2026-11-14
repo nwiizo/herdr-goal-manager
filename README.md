@@ -204,7 +204,17 @@ The original agent makes; the manager and registered checks verify. `auto`
 autonomy needs at least one command check. Every linked assignment stays under
 400 words and carries the binding contract; with `plan_first`, implementation
 waits for `approve-plan`. `protected_paths` and machine `stop_checks` stop the
-loop mechanically. A failed check becomes a linked fix assignment within budget. A spent budget, a stop
+loop mechanically.
+
+A contract can ask for its own checkout:
+`"checkout": {"repository": "/abs/repo", "base": "main", "branch": "goal/x"}`
+(`repository` defaults to the workspace; an optional absolute `path` places it).
+`confirm` creates it with `herdr worktree create`, so it appears as a Herdr
+workspace, or reopens the worktree that already holds the branch; a branch
+without a worktree is refused. Linked assignments say to work there, and
+checks, settle checks, stop checks and `protected_paths` use it.
+`hgm checkout remove ID` removes it through Herdr, never with uncommitted
+changes, a running watch or a running goal; the branch stays. A failed check becomes a linked fix assignment within budget. A spent budget, a stop
 condition, an approval dialog in the original tab, a result awaiting review, or
 monitoring that stops abnormally becomes a Herdr notification and an `inbox`
 entry. `revise ID --feedback` reopens work you reject; acceptance is always yours.

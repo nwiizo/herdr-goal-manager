@@ -43,6 +43,7 @@ as one word) unless "long_spec_reason" says why. Shape (omit empty fields):
  "invariants":["What must not change"],"out_of_scope":["Boundary"],
  "on_boundary":"What to do at a boundary (default: stop and report)",
  "protected_paths":["workspace/relative/dir"],
+ "checkout":{"repository":"/absolute/repo (default: workspace)","base":"main","branch":"goal/branch"},
  "notes":["Prior attempts, similar code to read first"],
  "open_questions":[{"question":"Unknown","resolve_by":"How to find out","default":"Until then"}],
  "checks":[{"name":"check-id","command":"user-agreed command","timeout_secs":300}],
@@ -52,7 +53,10 @@ as one word) unless "long_spec_reason" says why. Shape (omit empty fields):
   "stop_checks":[{"name":"id","command":"exits 0 when the loop must stop"}],
   "autonomy":"auto","handoff_percent":85}}
 Make boundaries mechanical where you can: protected_paths stop the loop when
-changed, and stop_checks stop it when their command succeeds. Choose autonomy by
+changed, and stop_checks stop it when their command succeeds. Ask for a
+checkout when the work should not touch the workspace in use: confirm creates it
+as a Herdr worktree workspace, linked assignments say to work there, and checks
+run there. Remove it with hgm checkout remove ID once its work is committed. Choose autonomy by
 who is harmed if the work is wrong and how cheaply it can be verified: ask for
 auth, security, money, production, external accountability; auto only when a
 mistake is cheap to detect and undo. hgm refuses to confirm auto without at least

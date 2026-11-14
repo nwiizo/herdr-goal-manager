@@ -310,8 +310,19 @@ pub(crate) fn admit(store: &Store, assignment: &Assignment<'_>, text: &str) -> R
     let practice = crate::config::load(&store.workspace)?
         .assignment_append
         .unwrap_or_default();
+    let place = goal
+        .checkout
+        .as_ref()
+        .map(|checkout| {
+            format!(
+                "Work in {} (branch {}): edit, build and commit there.\n",
+                checkout.path.display(),
+                checkout.branch
+            )
+        })
+        .unwrap_or_default();
     Ok(format!(
-        "Goal {id}, {task}, assigned to {}.\n{text}\n{request}\n{practice}\n\n{}",
+        "Goal {id}, {task}, assigned to {}.\n{place}{text}\n{request}\n{practice}\n\n{}",
         assignment.to,
         goal.spec.assignment_contract()
     ))

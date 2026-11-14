@@ -9,8 +9,10 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
+/// Runs `spec` in `dir`: the goal's checkout, or the managed workspace.
 pub(crate) async fn execute(
     store: &Store,
+    dir: &std::path::Path,
     id: &str,
     spec: &CommandSpec,
     prompt: &str,
@@ -27,7 +29,7 @@ pub(crate) async fn execute(
     // Prompts are data on stdin or in HGM_PROMPT, never generated shell source.
     command
         .args(&spec.args)
-        .current_dir(&store.workspace)
+        .current_dir(dir)
         .env("HGM_PROMPT", prompt)
         .env("HGM_WORKSPACE", &store.workspace)
         .env("HGM_RUN_ID", id)

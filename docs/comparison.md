@@ -50,6 +50,25 @@ Useful follow-ons include a richer panel, artifact references, executor profiles
 and an adapter to an existing PR workflow. A generic daemon or parallel scheduler
 should follow demonstrated needs rather than precede basic recovery and acceptance.
 
+## What came from TAKT manager (2026-11-14)
+
+A day of managing hgm and ccswarm work showed which TAKT manager ideas Herdr
+already supports, so they were adopted without new machinery:
+
+- An isolated checkout per goal: `herdr worktree create` gives it, and the
+  checkout appears as a Herdr workspace the person can open. hgm only records
+  it, points assignments and checks at it, and removes it on request.
+- One watch per pane serving several goals, each with its own wake budget,
+  instead of refusing the second goal.
+- Compact wakes that carry what changed, with the contract one `hgm show` away.
+- Settle checks that ask for a correction only when a check regressed.
+
+PR and merge automation stays out: hgm's job ends at evidence and the person's
+acceptance, and the repository's own review and merge flow (or an adapter to
+it) decides what lands. A daemon stays out too: the watch runs in a visible
+Herdr tab per manager and stops with its goals, so there is no hidden process
+to supervise, restart or secure.
+
 ## Conversation-first direction
 
 The current interface prioritizes the recipient's ability to proceed and a small

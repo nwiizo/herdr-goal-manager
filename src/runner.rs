@@ -10,6 +10,7 @@ pub(crate) trait Executor: Sync {
     async fn execute(
         &self,
         store: &Store,
+        dir: &std::path::Path,
         id: &str,
         command: &CommandSpec,
         prompt: &str,
@@ -22,12 +23,13 @@ impl Executor for CommandExecutor {
     async fn execute(
         &self,
         store: &Store,
+        dir: &std::path::Path,
         id: &str,
         command: &CommandSpec,
         prompt: &str,
         timeout: u64,
     ) -> Result<String> {
-        process::execute(store, id, command, prompt, timeout).await
+        process::execute(store, dir, id, command, prompt, timeout).await
     }
 }
 
@@ -82,7 +84,14 @@ async fn run_inner(
         let Some(result) = controlled(
             store,
             &goal.id,
-            executor.execute(store, &attempt.id, &command, &prompt, options.timeout_secs),
+            executor.execute(
+                store,
+                goal.work_dir(),
+                &attempt.id,
+                &command,
+                &prompt,
+                options.timeout_secs,
+            ),
         )
         .await?
         else {
@@ -145,7 +154,14 @@ async fn run_inner(
         let Some(result) = controlled(
             store,
             &goal.id,
-            executor.execute(store, &attempt.id, &command, &prompt, options.timeout_secs),
+            executor.execute(
+                store,
+                goal.work_dir(),
+                &attempt.id,
+                &command,
+                &prompt,
+                options.timeout_secs,
+            ),
         )
         .await?
         else {
@@ -217,7 +233,14 @@ async fn run_inner(
         let Some(result) = controlled(
             store,
             &goal.id,
-            executor.execute(store, &attempt.id, &command, &prompt, options.timeout_secs),
+            executor.execute(
+                store,
+                goal.work_dir(),
+                &attempt.id,
+                &command,
+                &prompt,
+                options.timeout_secs,
+            ),
         )
         .await?
         else {
@@ -265,7 +288,14 @@ async fn verify(store: &Store, id: &str, executor: &impl Executor) -> Result<Opt
         let Some(result) = controlled(
             store,
             id,
-            executor.execute(store, &attempt.id, &command, "", check.timeout_secs),
+            executor.execute(
+                store,
+                goal.work_dir(),
+                &attempt.id,
+                &command,
+                "",
+                check.timeout_secs,
+            ),
         )
         .await?
         else {

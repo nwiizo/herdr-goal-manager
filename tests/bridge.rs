@@ -1827,6 +1827,122 @@ fn compaction_on_screen_asks_the_manager_for_a_goal_check_and_reanchor_is_free()
 }
 
 #[test]
+fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
+    let bridge = Bridge::new();
+    let root = bridge.root.path();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
+    let checkout = root.join("checkout");
+    let spec = |branch: &str, path: &std::path::Path| {
+        json!({"objective":"Fix the copy","acceptance":["Copy fixed"],
+            "checks":[{"name":"where","command":"pwd > where.txt"}],
+            "checkout":{"repository":repo,"base":"HEAD","branch":branch,"path":path}})
+    };
+    let calls = || std::fs::read_to_string(root.join("worktree.txt")).unwrap_or_default();
+
+    // A branch that exists without a worktree is the person's call: refused.
+    git(&repo, &["branch", "taken"]);
+    let taken = add_file(&bridge, spec("taken", &root.join("unused")));
+    let refused = bridge.call(&["confirm", &taken, "--evidence", "User: go"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && stderr.contains("already exists"),
+        "{stderr}"
+    );
+    assert!(bridge.ok(&["show", &taken])["confirmed"].is_null());
+    assert!(calls().is_empty());
+
+    // Confirming creates the checkout as a Herdr worktree workspace.
+    let goal = add_file(&bridge, spec("todo/copy", &checkout));
+    let shown = bridge.ok(&["confirm", &goal, "--evidence", "User: go"]);
+    assert_eq!(
+        shown["checkout"]["path"],
+        checkout.to_str().unwrap(),
+        "{shown}"
+    );
+    assert_eq!(shown["checkout"]["branch"], "todo/copy");
+    assert_eq!(shown["checkout"]["workspace_id"], "w9");
+    assert!(calls().contains("worktree create --cwd") && calls().contains("--no-focus"));
+    assert_eq!(
+        git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "todo/copy"
+    );
+    // Another goal on the same branch reopens that worktree instead.
+    let again = add_file(&bridge, spec("todo/copy", &root.join("elsewhere")));
+    let reopened = bridge.ok(&["confirm", &again, "--evidence", "User: go"]);
+    assert_eq!(
+        std::fs::canonicalize(reopened["checkout"]["path"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&checkout).unwrap()
+    );
+    assert_eq!(reopened["checkout"]["workspace_id"], "w8");
+
+    // Linked assignments say where to work; checks run there.
+    bridge.ok(&["send", "--goal", &goal, "--task", "work", "Fix the copy"]);
+    let sent = std::fs::read_to_string(root.join("sent.txt")).unwrap();
+    assert!(
+        sent.contains(&format!(
+            "Work in {} (branch todo/copy)",
+            checkout.display()
+        )),
+        "{sent}"
+    );
+    bridge.ok(&["complete", &goal, "work", "--evidence", "Copy fixed"]);
+    assert_eq!(bridge.ok(&["run", &goal])["status"], "ready_for_review");
+    let ran_in = std::fs::read_to_string(checkout.join("where.txt")).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(ran_in.trim()).unwrap(),
+        std::fs::canonicalize(&checkout).unwrap()
+    );
+    assert!(!bridge.workspace.join("where.txt").exists());
+
+    // Removal refuses a running watch, then uncommitted changes; nothing goes.
+    let remove = || bridge.call(&["checkout", "remove", &goal]);
+    let refused = remove();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && stderr.contains("running watch"),
+        "{stderr}"
+    );
+    bridge.ok(&["wait", &goal, "--reason", "Review the copy"]);
+    let refused = remove();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && stderr.contains("1 uncommitted change"),
+        "{stderr}"
+    );
+    assert!(checkout.exists() && !calls().contains("worktree remove"));
+    // Clean, it goes through Herdr without --force, and the branch stays.
+    std::fs::remove_file(checkout.join("where.txt")).unwrap();
+    let removed = bridge.ok(&["checkout", "remove", &goal]);
+    assert!(removed["checkout"]["removed_at"].is_string(), "{removed}");
+    assert!(!checkout.exists());
+    assert!(calls().contains("worktree remove --workspace w9") && !calls().contains("--force"));
+    git(&repo, &["rev-parse", "--verify", "refs/heads/todo/copy"]);
+    assert!(
+        kinds(&bridge, &goal)
+            .iter()
+            .any(|k| k == "checkout_removed")
+    );
+}
+
+#[test]
 fn goals_on_one_pane_share_a_watch_and_a_waiting_goal_gets_no_wake() {
     let bridge = Bridge::new();
     let spec = |objective: &str| {

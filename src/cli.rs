@@ -137,6 +137,11 @@ pub(crate) enum Action {
         #[command(subcommand)]
         action: RoleAction,
     },
+    /// Manage a goal's own checkout (a Herdr worktree workspace)
+    Checkout {
+        #[command(subcommand)]
+        action: CheckoutAction,
+    },
     /// Ask a reviewer role to judge the current result against the contract
     Review {
         id: String,
@@ -506,11 +511,29 @@ impl Cli {
                 }
             }
             Action::Confirm { id, evidence } => {
-                let protected = store.load(id)?.spec.protected_paths;
-                let digest = crate::contract::protected_digest(&store.workspace, &protected)?;
-                let goal = store.update(id, |g| g.confirm(evidence.clone(), digest))?;
+                let mut goal = store.load(id)?;
+                // A contract that cannot be confirmed creates no checkout.
+                goal.clone().confirm(evidence.clone(), String::new())?;
+                if goal.spec.checkout.is_some() && goal.checkout.is_none() {
+                    goal.checkout = Some(crate::checkout::prepare(&goal).await?);
+                }
+                let digest =
+                    crate::contract::protected_digest(goal.work_dir(), &goal.spec.protected_paths)?;
+                let goal = store.update(id, |g| {
+                    if g.checkout.is_none() {
+                        g.checkout = goal.checkout.clone();
+                    }
+                    g.confirm(evidence.clone(), digest)
+                })?;
                 print_goal(&goal, &store, self.json)?;
             }
+            Action::Checkout {
+                action: CheckoutAction::Remove { id },
+            } => print_goal(
+                &crate::checkout::remove(&store, id).await?,
+                &store,
+                self.json,
+            )?,
             Action::ApprovePlan { id, task, evidence } => {
                 ensure!(
                     !evidence.trim().is_empty(),
@@ -910,6 +933,13 @@ pub(crate) fn command_reference() -> String {
         lines.push(format!("- `{usage}` — {about}"));
     }
     lines.join("\n")
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CheckoutAction {
+    /// Remove the checkout; refused with uncommitted changes, a running watch
+    /// or a running goal. The branch stays.
+    Remove { id: String },
 }
 
 #[derive(Debug, Subcommand)]

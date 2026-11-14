@@ -41,5 +41,38 @@ case "$1 $2" in
   "tab focus") printf '%s\n' "$3" >> "$FIXTURE_ROOT/focused.txt"; printf '{"result":{}}\n' ;;
   "tab create") printf '%s\n' "$@" >> "$FIXTURE_ROOT/created.txt"; cat "$FIXTURE_ROOT/tab-create.json" ;;
   "tab close") printf '%s\n' "$3" >> "$FIXTURE_ROOT/closed.txt"; printf '{"result":{"type":"ok"}}\n' ;;
+  "worktree create"|"worktree open"|"worktree remove")
+    # Like Herdr 0.9.5: a real Git worktree, reported as a workspace.
+    printf '%s\n' "$*" >> "$FIXTURE_ROOT/worktree.txt"
+    action=$2; shift 2
+    cwd=; branch=; base=; path=; workspace=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --cwd) cwd=$2; shift ;;
+        --branch) branch=$2; shift ;;
+        --base) base=$2; shift ;;
+        --path) path=$2; shift ;;
+        --workspace) workspace=$2; shift ;;
+        --label) shift ;;
+      esac
+      shift
+    done
+    case "$action" in
+      create)
+        path=${path:-"$cwd-$branch"}
+        git -C "$cwd" worktree add -q -b "$branch" "$path" "$base" >&2
+        workspace=w9 ;;
+      open)
+        branch=$(git -C "$path" rev-parse --abbrev-ref HEAD)
+        workspace=w8 ;;
+      remove)
+        path=$(cat "$FIXTURE_ROOT/worktree-$workspace")
+        common=$(git -C "$path" rev-parse --path-format=absolute --git-common-dir)
+        git -C "$common/.." worktree remove "$path" >&2
+        printf '{"result":{"type":"worktree_removed"}}\n'
+        exit 0 ;;
+    esac
+    printf '%s' "$path" > "$FIXTURE_ROOT/worktree-$workspace"
+    printf '{"result":{"type":"worktree_created","workspace":{"workspace_id":"%s","worktree":{"checkout_path":"%s"}},"worktree":{"branch":"%s","path":"%s"}}}\n' "$workspace" "$path" "$branch" "$path" ;;
   *) printf 'unexpected fixture command\n' >&2; exit 2 ;;
 esac

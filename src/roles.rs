@@ -488,7 +488,7 @@ pub(crate) async fn request_review(
         bail!("{}; nothing was sent", refusal.explain(reviewer));
     }
     let review = format!("r-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let digest = workspace_digest(&store.workspace)?;
+    let digest = workspace_digest(goal.work_dir())?;
     let list = |items: &[String]| {
         if items.is_empty() {
             "(none)".to_string()
@@ -586,7 +586,7 @@ pub(crate) async fn submit_review(
         (verdict == Verdict::Revise) == (blocking > 0),
         "revise needs at least one blocking finding, and approve allows none"
     );
-    let current = workspace_digest(&store.workspace)? == request.detail["digest"];
+    let current = workspace_digest(store.load(goal_id)?.work_dir())? == request.detail["digest"];
     store.record(
         goal_id,
         "reviewed",

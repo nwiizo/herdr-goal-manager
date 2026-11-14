@@ -80,6 +80,10 @@ pub(crate) struct GoalSpec {
     /// A change detected while the agent works stops the loop.
     #[serde(default)]
     pub protected_paths: Vec<String>,
+    /// An isolated checkout for the work, created as a Herdr worktree
+    /// workspace when the contract is confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<CheckoutSpec>,
     /// Why this contract may exceed the word budget.
     #[serde(default)]
     pub long_spec_reason: Option<String>,
@@ -113,9 +117,53 @@ pub(crate) struct OpenQuestion {
 /// Spec length above which agents follow rules less reliably.
 pub(crate) const SPEC_WORD_BUDGET: usize = 800;
 
+/// The checkout a contract asks for: `branch` from `base` in `repository`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckoutSpec {
+    /// Absolute path of the Git repository; the managed workspace when omitted.
+    #[serde(default)]
+    pub repository: Option<PathBuf>,
+    pub base: String,
+    pub branch: String,
+    /// Absolute path for the checkout; Herdr chooses one when omitted.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+impl CheckoutSpec {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.base.trim().is_empty() && !self.branch.trim().is_empty(),
+            "checkout needs a base ref and a branch"
+        );
+        for path in [&self.repository, &self.path].into_iter().flatten() {
+            ensure!(
+                path.is_absolute(),
+                "checkout paths must be absolute: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+}
+/// The checkout hgm created or reopened for a goal (a Herdr workspace).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Checkout {
+    pub path: PathBuf,
+    pub branch: String,
+    pub base: String,
+    pub workspace_id: String,
+    /// When `hgm checkout remove` removed it; the record stays as history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<DateTime<Utc>>,
+}
 impl GoalSpec {
     pub fn validate(&self) -> Result<()> {
         self.loop_policy.validate()?;
+        if let Some(checkout) = &self.checkout {
+            checkout.validate()?;
+        }
         let words = self.words();
         ensure!(
             words <= SPEC_WORD_BUDGET
@@ -509,8 +557,19 @@ pub(crate) struct Goal {
     /// Digest of `spec.protected_paths` when the contract was confirmed.
     #[serde(default)]
     pub protected_digest: Option<String>,
+    /// The goal's own checkout; written only for goals that have one, so
+    /// goals without it stay readable by earlier hgm versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<Checkout>,
 }
 impl Goal {
+    /// Where the goal's commands, checks and protected paths live: its
+    /// checkout when it has one, otherwise the managed workspace.
+    pub fn work_dir(&self) -> &std::path::Path {
+        self.checkout
+            .as_ref()
+            .map_or(self.workspace.as_path(), |checkout| checkout.path.as_path())
+    }
     pub fn new(mut spec: GoalSpec, workspace: PathBuf) -> Result<Self> {
         spec.validate()?;
         if spec.tasks.is_empty() && spec.planner.is_none() {
@@ -542,6 +601,7 @@ impl Goal {
             waiting: None,
             confirmed: None,
             protected_digest: None,
+            checkout: None,
         })
     }
     pub fn validate(&self) -> Result<()> {
