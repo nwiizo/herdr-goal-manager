@@ -186,10 +186,15 @@ pub(crate) fn print_status(goals: &[Goal], json_output: bool) -> Result<()> {
 
 /// What needs a human now, most blocking first: an agent dialog or stopped
 /// monitoring, then results to review, manager questions, and missing input.
+/// Completed and cancelled goals need nobody: cancelling keeps the saved wait
+/// reason and the last event as history, so neither may surface them here.
 pub(crate) fn inbox_rows(store: &Store, goals: &[Goal]) -> Result<Vec<serde_json::Value>> {
     use crate::model::GoalStatus;
     let mut rows = vec![];
     for goal in goals {
+        if matches!(goal.status, GoalStatus::Completed | GoalStatus::Cancelled) {
+            continue;
+        }
         let blocking = store.events(&goal.id)?.pop().filter(|event| {
             event.kind == "attention"
                 || (event.kind == "watch_ended" && event.detail["notify"] == true)
@@ -245,4 +250,40 @@ pub(crate) fn print_inbox(store: &Store, goals: &[Goal], json_output: bool) -> R
             )
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Evidence, GoalStatus};
+
+    #[test]
+    fn finished_goals_need_nobody_whatever_they_kept() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let store = Store::new(workspace.path(), state.path())?;
+        let spec = || serde_norway::from_str("objective: Review\nacceptance: [Reviewed]\n");
+        let mut ids = vec![];
+        for status in [
+            GoalStatus::Completed,
+            GoalStatus::Cancelled,
+            GoalStatus::Paused,
+        ] {
+            let id = store.add(spec()?, None)?.id;
+            store.update(&id, |goal| {
+                goal.status = status;
+                goal.waiting = Some(Evidence {
+                    note: "Ask the user".into(),
+                    recorded_at: chrono::Utc::now(),
+                });
+                Ok(())
+            })?;
+            store.record(&id, "attention", serde_json::json!({"reason": "dialog"}))?;
+            ids.push(id);
+        }
+        let rows = inbox_rows(&store, &store.list()?)?;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["id"], ids[2]);
+        Ok(())
+    }
 }
