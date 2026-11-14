@@ -457,23 +457,60 @@ async fn settle_checks(
         "settle_checks",
         json!({"role": watch.role, "passed": passed, "failed": failed}),
     )?;
-    watch.pending = Some(if failed.is_empty() {
-        format!(
-            "{} settled and every command check passes; inspect the result against the acceptance, then record evidence and prepare review",
-            watch.role
-        )
-    } else {
-        let summary: Vec<String> = failed
-            .iter()
-            .map(|f| format!("{}: {}", f["name"], f["detail"]))
-            .collect();
-        format!(
-            "{} settled but checks fail ({}). Tell it what is off with hgm correct (or a linked fix assignment) instead of waiting for review",
-            watch.role,
-            summary.join(" | ")
-        )
-    });
+    watch.pending = Some(settle_note(&watch.role, &failed, events));
     Ok(())
+}
+/// The wake note after settle checks. A failing check asks for a correction
+/// only when it passed at an earlier settle of the goal (`events`): a check
+/// that never passed may only show unfinished work, so it is listed instead.
+fn settle_note(role: &str, failed: &[Value], events: &[crate::events::Event]) -> String {
+    if failed.is_empty() {
+        return format!(
+            "{role} settled and every command check passes; inspect the result against the acceptance, then record evidence and prepare review"
+        );
+    }
+    let passed_before = |name: &str| {
+        events.iter().any(|event| {
+            event.kind == "settle_checks"
+                && event.detail["passed"]
+                    .as_array()
+                    .is_some_and(|passed| passed.iter().any(|p| p.as_str() == Some(name)))
+        })
+    };
+    let (regressed, unfinished): (Vec<&Value>, Vec<&Value>) = failed
+        .iter()
+        .partition(|check| passed_before(check["name"].as_str().unwrap_or("")));
+    let summary = |checks: &[&Value]| {
+        checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "{}: {}",
+                    check["name"].as_str().unwrap_or(""),
+                    check["detail"].as_str().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    if regressed.is_empty() {
+        return format!(
+            "{role} settled; checks not yet passing ({}). None has passed for this goal yet, so this may be unfinished work: inspect the result and send the next step only if the work should have made them pass",
+            summary(&unfinished)
+        );
+    }
+    let mut note = format!(
+        "{role} settled but checks that passed before now fail ({}). Tell it what is off with hgm correct (or a linked fix assignment) instead of waiting for review",
+        summary(&regressed)
+    );
+    if !unfinished.is_empty() {
+        let names: Vec<&str> = unfinished
+            .iter()
+            .filter_map(|check| check["name"].as_str())
+            .collect();
+        note.push_str(&format!(". Not yet passing: {}", names.join(", ")));
+    }
+    note
 }
 /// The worker's native state in one `agent get`; the pane inventory (two
 /// listings) answers when that fails, e.g. for a pane without an agent.
@@ -908,6 +945,34 @@ pub(crate) fn rebind_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_check_that_passed_before_asks_for_a_correction() {
+        use crate::events::Event;
+        let earlier = [Event::new(
+            "g",
+            "settle_checks",
+            json!({"role":"main","passed":["build"],"failed":[{"name":"e2e","detail":"exit 2"}]}),
+        )];
+        let failed = [
+            json!({"name":"build","detail":"exit 1"}),
+            json!({"name":"e2e","detail":"exit 2"}),
+        ];
+        // build passed at the earlier settle: a regression to correct.
+        let note = settle_note("main", &failed, &earlier);
+        assert!(
+            note.contains("checks that passed before now fail (build: exit 1)")
+                && note.contains("hgm correct")
+                && note.contains("Not yet passing: e2e"),
+            "{note}"
+        );
+        // e2e never passed: listed, without asking for a correction.
+        let note = settle_note("main", &failed[1..], &earlier);
+        assert!(
+            note.contains("not yet passing (e2e: exit 2)") && !note.contains("hgm correct"),
+            "{note}"
+        );
+        assert!(settle_note("main", &[], &earlier).contains("every command check passes"));
+    }
     fn bound() -> Target {
         Target {
             pane: "w1:p1".into(),
