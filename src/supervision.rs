@@ -193,7 +193,7 @@ pub(crate) async fn send(
     let arming = match assignment.goal {
         Some(goal) if assignment.supervise => {
             let active = load_watch(store, &context.key()).is_ok_and(|watch| {
-                watch.active && watch.goal == goal && watch.role == assignment.to
+                watch.active && watch.serves(goal) && watch.role == assignment.to
             });
             if active {
                 None
@@ -362,9 +362,21 @@ async fn arm(
     };
     if let Some(watch) = &previous {
         // One watch per tab: a running (or just armed) watch is reused, so a
-        // second Goal watch tab never opens for it.
-        if watch.active && watch.goal == goal && watch_running(store, watch, now)? {
+        // second Goal watch tab never opens for it. Another goal whose work
+        // goes to the watched pane joins it; wakes follow the latest assignment.
+        let running = watch.active && watch_running(store, watch, now)?;
+        let joins = running && !watch.serves(goal) && watch.origin.pane == origin.pane;
+        if running && (watch.serves(goal) || joins) {
             let mut watch = watch.clone();
+            if joins {
+                watch.join(goal);
+                save_watch(store, &watch)?;
+                store.record(
+                    goal,
+                    "watch_joined",
+                    json!({"pane": watch.origin.pane, "goals": watch.members()}),
+                )?;
+            }
             if watch.role != role {
                 watch.role = role.into();
                 watch.origin = origin;
@@ -376,14 +388,24 @@ async fn arm(
             }
             return Ok(watch);
         }
-        if watch.active && watch.goal != goal {
+        ensure!(
+            !running,
+            "another goal is already supervised on another pane; wait/pause it first"
+        );
+        if watch.active && watch.members() != [goal] {
             // An active record with no watch process holding its lease is stale
-            // (its tab closed or the server restarted): end it and continue.
-            ensure!(
-                !watch_running(store, watch, now)?,
-                "another goal is already supervised; wait/pause it first"
-            );
+            // (its tab closed or the server restarted): end it for every goal
+            // it served and continue.
             let mut stale = watch.clone();
+            for member in stale.members() {
+                if member != goal && member != stale.goal {
+                    store.record(
+                        &member,
+                        "watch_ended",
+                        json!({"reason": "stale_recovered", "notify": false}),
+                    )?;
+                }
+            }
             end_watch(store, &mut stale, "stale_recovered", false);
             save_watch(store, &stale)?;
             // No process keeps the stale watch's sidebar current any more.
@@ -397,6 +419,8 @@ async fn arm(
     let watch = Watch {
         context: key.clone(),
         goal: goal.into(),
+        goals: Vec::new(),
+        spent: Default::default(),
         origin,
         role: role.into(),
         checked_through: None,

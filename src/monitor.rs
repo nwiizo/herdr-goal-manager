@@ -10,7 +10,6 @@
 use crate::{
     herdr_cli as herdr,
     herdr_events::{self, Signal, Subscription},
-    model::{Control, GoalStatus},
     store::Store,
     supervision::*,
     watch::*,
@@ -364,17 +363,12 @@ async fn drive(store: &Store, options: LoopOptions, display: &mut Display) -> Re
         if !watch.active {
             return Ok(());
         }
-        let goal = store.load(&watch.goal)?;
-        if goal.control != Control::Run
-            || matches!(
-                goal.status,
-                GoalStatus::Completed | GoalStatus::Cancelled | GoalStatus::ReadyForReview
-            )
-        {
-            end_watch(store, &mut watch, "stopped_by_goal", false);
+        // Goals that stopped leave the watch; wakes follow the pane's latest assignment.
+        if !refocus(store, &mut watch)? {
             save_watch(store, &watch)?;
             return Ok(());
         }
+        let goal = store.load(&watch.goal)?;
         // A retargeted watch (another role) needs its own subscription.
         if events
             .as_ref()

@@ -1824,6 +1824,86 @@ fn compaction_on_screen_asks_the_manager_for_a_goal_check_and_reanchor_is_free()
 }
 
 #[test]
+fn goals_on_one_pane_share_a_watch_and_a_waiting_goal_gets_no_wake() {
+    let bridge = Bridge::new();
+    let spec = |objective: &str| {
+        json!({"objective":objective,"acceptance":["Done"],
+            "checks":[{"name":"ok","command":"true"}]})
+    };
+    let first = confirmed(&bridge, spec("First outcome"));
+    let second = confirmed(&bridge, spec("Second outcome"));
+    bridge.ok(&[
+        "send",
+        "--goal",
+        &first,
+        "--task",
+        "work",
+        "First assignment",
+    ]);
+    let joined = bridge.ok(&[
+        "send",
+        "--goal",
+        &second,
+        "--task",
+        "work",
+        "Second assignment",
+    ]);
+    assert_eq!(joined["supervision"], "armed", "{joined}");
+    let watch = bridge.ok(&["watch"]);
+    assert_eq!(watch["goals"], json!([first, second]), "{watch}");
+    assert!(kinds(&bridge, &second).iter().any(|k| k == "watch_joined"));
+
+    let watch_path = state_directory(&bridge).join("manager/t-original-watch.json");
+    let sent = bridge.root.path().join("sent.txt");
+    // Lets the worker settle on `screen` and returns the manager's wake, if any.
+    let settle = |screen: &str| {
+        let mut watch: Value =
+            serde_json::from_slice(&std::fs::read(&watch_path).unwrap()).unwrap();
+        watch["last_sent"] = json!(0);
+        std::fs::write(&watch_path, watch.to_string()).unwrap();
+        bridge.write("target.screen", screen);
+        bridge.inventory("done", "idle", "original");
+        let before = std::fs::read_to_string(&sent).unwrap().len();
+        assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+        std::fs::read_to_string(&sent).unwrap()[before..].to_string()
+    };
+    // Wakes and settle checks follow the latest linked assignment to the pane.
+    let wake = settle("Second assignment done\n› ");
+    assert!(
+        wake.contains(&second) && wake.contains("Second assignment") && !wake.contains(&first),
+        "{wake}"
+    );
+    assert!(kinds(&bridge, &second).iter().any(|k| k == "settle_checks"));
+    assert!(!kinds(&bridge, &first).iter().any(|k| k == "settle_checks"));
+
+    // The first goal gets the newest assignment, then waits: it leaves the
+    // watch, and the next wake is about the second goal only.
+    bridge.write("target.screen", "Finished output\n› ");
+    bridge.inventory("idle", "idle", "original");
+    bridge.ok(&[
+        "send",
+        "--goal",
+        &first,
+        "--task",
+        "work",
+        "First follow-up",
+    ]);
+    bridge.ok(&["wait", &first, "--reason", "Ask the user"]);
+    let watch = bridge.ok(&["watch"]);
+    assert!(
+        watch["active"] == true && watch["goal"] == second.as_str() && watch["goals"].is_null(),
+        "{watch}"
+    );
+    assert!(kinds(&bridge, &first).iter().any(|k| k == "watch_ended"));
+    let wake = settle("Second assignment checked again\n› ");
+    assert!(wake.contains(&second) && !wake.contains(&first), "{wake}");
+
+    // The last goal leaving ends the watch.
+    bridge.ok(&["wait", &second, "--reason", "Ask the user"]);
+    assert_eq!(bridge.ok(&["watch"])["active"], false);
+}
+
+#[test]
 fn cancel_and_pause_end_watch_records_and_supervise_recovers_a_stale_one() {
     let bridge = Bridge::new();
     let first = bridge.goal();
@@ -1839,12 +1919,14 @@ fn cancel_and_pause_end_watch_records_and_supervise_recovers_a_stale_one() {
     bridge.ok(&["pause", &second]);
     assert_eq!(bridge.ok(&["watch"])["active"], false);
 
-    // A just-armed watch may still be starting its process: not stale yet.
+    // A just-armed watch may still be starting its process: not stale yet, so
+    // another goal for the same pane joins it.
     let third = bridge.goal();
     let fourth = bridge.goal();
     bridge.ok(&["supervise", &third]);
-    assert!(!bridge.call(&["supervise", &fourth]).status.success());
-    // Later, no watch process holds the lease: an active record for another goal is stale.
+    let joined = bridge.ok(&["supervise", &fourth]);
+    assert_eq!(joined["goals"], json!([third, fourth]), "{joined}");
+    // Later, no watch process holds the lease: the shared record is stale.
     age_watch(&bridge, 60);
     let watch = bridge.ok(&["supervise", &fourth]);
     assert_eq!(watch["goal"], fourth.as_str(), "{watch}");

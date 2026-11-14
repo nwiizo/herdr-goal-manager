@@ -13,12 +13,21 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fs::OpenOptions, path::PathBuf};
+use std::{collections::BTreeMap, fs::OpenOptions, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Watch {
     pub context: String,
+    /// The goal wakes are about: the one whose linked assignment reached the
+    /// observed pane last.
     pub goal: String,
+    /// Every goal sharing this watch because its work goes to the same pane.
+    /// Empty when `goal` is the only one, as in records written before sharing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goals: Vec<String>,
+    /// Wakes spent by member goals other than `goal`: each goal has its own budget.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub spent: BTreeMap<String, u32>,
     /// The observed worker: the original agent, or the helper role in `role`.
     pub origin: Target,
     /// `main` or the helper role that received the latest linked assignment.
@@ -115,6 +124,57 @@ fn rot_wake(watch: &mut Watch) {
     watch.rot_signals = 0;
 }
 impl Watch {
+    /// The goals this watch serves, `goal` among them.
+    pub(crate) fn members(&self) -> Vec<String> {
+        if self.goals.is_empty() {
+            vec![self.goal.clone()]
+        } else {
+            self.goals.clone()
+        }
+    }
+    pub(crate) fn serves(&self, goal: &str) -> bool {
+        self.members().iter().any(|member| member == goal)
+    }
+    /// Adds `goal` to the goals served; wakes stay about the current one.
+    pub(crate) fn join(&mut self, goal: &str) {
+        let mut members = self.members();
+        if !members.iter().any(|member| member == goal) {
+            members.push(goal.into());
+        }
+        self.goals = members;
+    }
+    /// Turns wakes to `goal`, a member. Each goal keeps its own wake count, and
+    /// a note waiting for the previous goal does not reach the next one.
+    pub(crate) fn focus(&mut self, goal: &str) {
+        if self.goal == goal {
+            return;
+        }
+        let wakes = self.spent.remove(goal).unwrap_or(0);
+        let previous = std::mem::replace(&mut self.goal, goal.into());
+        let spent = std::mem::replace(&mut self.wakes, wakes);
+        self.spent.insert(previous, spent);
+        self.pending = None;
+        self.reanchored_for = None;
+    }
+    /// Removes `goal`; true when no goal is left. Wakes turn to another member
+    /// when `goal` was the current one.
+    pub(crate) fn leave(&mut self, goal: &str) -> bool {
+        let members: Vec<String> = self
+            .members()
+            .into_iter()
+            .filter(|member| member != goal)
+            .collect();
+        let Some(next) = members.first() else {
+            self.goals.clear();
+            return true;
+        };
+        if self.goal == goal {
+            self.focus(next);
+        }
+        self.spent.remove(goal);
+        self.goals = if members.len() > 1 { members } else { vec![] };
+        false
+    }
     /// The same observation has already been delivered `MAX_SAME_WAKES` times.
     fn repeated(&self) -> bool {
         self.same_wakes >= MAX_SAME_WAKES && self.wake_fingerprint == self.fingerprint
@@ -200,20 +260,83 @@ pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result
         let Ok(mut watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
             continue;
         };
-        if watch.active && watch.goal == goal {
-            end_watch(store, &mut watch, reason, false);
+        if watch.active && watch.serves(goal) {
+            drop_goal(store, &mut watch, goal, reason, false)?;
             save_watch(store, &watch)?;
         }
     }
     Ok(())
 }
+/// Takes `goal` off the watch. The watch itself ends with `reason` only when
+/// no other goal shares it; otherwise only `goal`'s timeline records the end.
+fn drop_goal(
+    store: &Store,
+    watch: &mut Watch,
+    goal: &str,
+    reason: &str,
+    notify: bool,
+) -> Result<()> {
+    if watch.leave(goal) {
+        end_watch(store, watch, reason, notify);
+    } else {
+        store.record(
+            goal,
+            "watch_ended",
+            json!({"reason": reason, "notify": notify}),
+        )?;
+    }
+    Ok(())
+}
+/// Drops member goals that no longer want watching (paused, waiting, finished
+/// or ready for review) and turns wakes to the goal whose linked assignment
+/// reached the observed pane last. False once no goal is left: the watch ended.
+pub(crate) fn refocus(store: &Store, watch: &mut Watch) -> Result<bool> {
+    let mut latest: Option<(chrono::DateTime<Utc>, String)> = None;
+    for id in watch.members() {
+        let goal = store.load(&id)?;
+        if goal.control != Control::Run
+            || goal.waiting.is_some()
+            || matches!(
+                goal.status,
+                GoalStatus::Completed | GoalStatus::Cancelled | GoalStatus::ReadyForReview
+            )
+        {
+            drop_goal(store, watch, &id, "stopped_by_goal", false)?;
+            if !watch.active {
+                return Ok(false);
+            }
+            continue;
+        }
+        let assigned = store
+            .events(&id)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                matches!(event.kind.as_str(), "assigned" | "correction")
+                    && event.detail["pane"] == watch.origin.pane.as_str()
+            })
+            .map(|event| event.at);
+        if let Some(at) = assigned
+            && latest.as_ref().is_none_or(|(newest, _)| at > *newest)
+        {
+            latest = Some((at, id));
+        }
+    }
+    if let Some((_, id)) = latest {
+        watch.focus(&id);
+    }
+    Ok(true)
+}
 /// Ends the watch for a cause only the person can resolve: the goal waits for
 /// them with `reason`, so an unfinished goal is never left running unwatched.
 /// A watch otherwise ends only when its goal is completed, cancelled, paused
 /// or waiting.
+/// A cause on the observed pane blocks every goal sharing the watch.
 pub(crate) fn end_for_person(store: &Store, watch: &mut Watch, reason: &str) {
-    if let Err(error) = store.update(&watch.goal, |goal| goal.wait(reason.to_string())) {
-        eprintln!("Could not set the goal waiting: {error:#}");
+    for goal in watch.members() {
+        if let Err(error) = store.update(&goal, |goal| goal.wait(reason.to_string())) {
+            eprintln!("Could not set goal {goal} waiting: {error:#}");
+        }
     }
     end_watch(store, watch, reason, true);
 }
@@ -597,14 +720,15 @@ pub(crate) async fn watch_once(
         }
     }
     if watch.wakes >= watch.max_wakes {
-        end_for_person(
-            store,
-            watch,
-            &format!(
-                "wake_budget_exhausted: the watch spent its {} wakes; decide whether to continue (supervise with a larger --max-wakes), revise, or stop",
-                watch.max_wakes
-            ),
+        // The budget is the goal's own: only it waits, other goals stay watched.
+        let reason = format!(
+            "wake_budget_exhausted: the watch spent its {} wakes; decide whether to continue (supervise with a larger --max-wakes), revise, or stop",
+            watch.max_wakes
         );
+        if let Err(error) = store.update(&goal.id, |goal| goal.wait(reason.clone())) {
+            eprintln!("Could not set the goal waiting: {error:#}");
+        }
+        drop_goal(store, watch, &goal.id, &reason, true)?;
         return Ok(());
     }
     let policy = &goal.spec.loop_policy;
@@ -734,8 +858,8 @@ pub(crate) async fn watch_once(
     }
     watch.manager_unavailable_since = 0;
     watch.manager_notified = false;
-    if store.load(&watch.goal)?.control != Control::Run {
-        end_watch(store, watch, "stopped_by_goal", false);
+    if store.load(&goal.id)?.control != Control::Run {
+        drop_goal(store, watch, &goal.id, "stopped_by_goal", false)?;
         return Ok(());
     }
     if matches!(target["agent_status"].as_str(), Some("idle" | "done")) {
@@ -946,6 +1070,33 @@ pub(crate) fn rebind_watch(
 mod tests {
     use super::*;
     #[test]
+    fn a_waiting_member_never_takes_the_watch_and_each_goal_keeps_its_wakes() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let store = Store::new(workspace.path(), state.path())?;
+        let spec = || serde_norway::from_str("objective: Review\nacceptance: [Reviewed]\n");
+        let (active, waiting) = (store.add(spec()?, None)?.id, store.add(spec()?, None)?.id);
+        let mut watch = watch();
+        watch.goal = active.clone();
+        watch.join(&waiting);
+        watch.wakes = 2;
+        for id in [&active, &waiting] {
+            store.record(id, "assigned", json!({"pane": watch.origin.pane}))?;
+        }
+        // The waiting goal received the newest assignment, yet never takes the watch.
+        store.update(&waiting, |goal| goal.wait("Ask the user".into()))?;
+        assert!(refocus(&store, &mut watch)?);
+        assert_eq!((watch.goal.as_str(), watch.wakes), (active.as_str(), 2));
+        assert_eq!(watch.members(), std::slice::from_ref(&active));
+        // Switching goals keeps each goal's own wake count.
+        watch.join(&waiting);
+        watch.focus(&waiting);
+        assert_eq!(watch.wakes, 0);
+        watch.focus(&active);
+        assert_eq!(watch.wakes, 2);
+        Ok(())
+    }
+    #[test]
     fn only_a_check_that_passed_before_asks_for_a_correction() {
         use crate::events::Event;
         let earlier = [Event::new(
@@ -986,6 +1137,8 @@ mod tests {
         Watch {
             context: "m-test".into(),
             goal: "g-test".into(),
+            goals: Vec::new(),
+            spent: BTreeMap::new(),
             origin: bound(),
             role: "main".into(),
             checked_through: None,
