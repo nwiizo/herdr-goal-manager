@@ -908,6 +908,64 @@ fn confirmed(bridge: &Bridge, spec: Value) -> String {
 }
 
 #[test]
+fn a_linked_send_waits_for_a_watch_step_and_types_nothing_past_the_bound() {
+    use std::time::{Duration, Instant};
+    let bridge = Bridge::new();
+    let goal = confirmed(
+        &bridge,
+        json!({"objective":"Fix login copy","acceptance":["Copy updated"],
+            "checks":[{"name":"copy","command":"true"}]}),
+    );
+    // Another process (a watch step) holds the supervision lock for `time`.
+    let lock = state_directory(&bridge).join("manager/t-original-operation.lock");
+    let hold = |time: Duration| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        file.lock().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(time);
+            drop(file);
+        })
+    };
+    let sent = || std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap_or_default();
+    let before = sent();
+    let send = ["send", "--goal", &goal, "--task", "work", "Update the copy"];
+
+    // Past the bound the send fails before typing, names the lock and records nothing.
+    let holder = hold(Duration::from_secs(14));
+    let start = Instant::now();
+    let output = bridge.call(&send);
+    let waited = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && waited >= Duration::from_secs(9),
+        "{waited:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("t-original-operation.lock")
+            && stderr.contains("nothing was delivered or changed"),
+        "{stderr}"
+    );
+    assert_eq!(sent(), before);
+    assert!(!kinds(&bridge, &goal).iter().any(|k| k == "assigned"));
+    holder.join().unwrap();
+
+    // A short hold delays the send; it then types, records and arms the watch.
+    let holder = hold(Duration::from_millis(1500));
+    let start = Instant::now();
+    let result = bridge.ok(&send);
+    assert!(start.elapsed() >= Duration::from_millis(1200), "{result}");
+    assert_eq!(result["supervision"], "armed", "{result}");
+    assert_ne!(sent(), before);
+    assert!(kinds(&bridge, &goal).iter().any(|k| k == "assigned"));
+    holder.join().unwrap();
+}
+
+#[test]
 fn linked_assignments_carry_the_contract_and_stay_one_shot() {
     let bridge = Bridge::new();
     let goal = confirmed(

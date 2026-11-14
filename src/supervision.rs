@@ -1,7 +1,7 @@
 //! Origin-bound dispatch and arming of the watch; no automatic task completion.
 pub(crate) use crate::binding::{
     Target, args, capture_origin, live_pane, operation_lease, origin_terminal, path, screen,
-    session,
+    session, wait_operation_lease,
 };
 pub(crate) use crate::signals::{can_prompt, refusal};
 use crate::{
@@ -188,6 +188,27 @@ pub(crate) async fn send(
             "handoff is in progress; wait for verified adoption before assigning work"
         );
     }
+    // Every lock the delivery needs is taken before anything is typed: once the
+    // text leaves the input, no failure may invite a resend.
+    let arming = match assignment.goal {
+        Some(goal) if assignment.supervise => {
+            let active = load_watch(store, &context.key()).is_ok_and(|watch| {
+                watch.active && watch.goal == goal && watch.role == assignment.to
+            });
+            if active {
+                None
+            } else {
+                let config = crate::config::load(&store.workspace)?;
+                let pacing = (
+                    config.idle_secs(),
+                    config.cooldown_secs(),
+                    config.max_wakes(),
+                );
+                Some((pacing, wait_operation_lease(store, &context.key()).await?))
+            }
+        }
+        _ => None,
+    };
     let (live, screen) = observe_recipient(store, helper).await?;
     let agent = live["agent"].as_str().unwrap_or("");
     let working = live["agent_status"] == "working";
@@ -228,49 +249,54 @@ pub(crate) async fn send(
                 receipt_path.display()
             )
         })?;
-    let consumed = input_consumed(pane, agent).await?;
-    store.write_private(
+    // The text is delivered: from here on, failures are reported in the result
+    // and never returned, so nobody resends what the recipient already has.
+    let mut warnings = vec![];
+    let consumed = input_consumed(pane, agent).await.unwrap_or_else(|error| {
+        warnings.push(format!("could not confirm the input was taken: {error:#}"));
+        false
+    });
+    if !consumed {
+        warnings.push("the text may still sit in the recipient's input; inspect it".into());
+    }
+    let mut unrecorded = vec![];
+    if let Err(error) = store.write_private(
         &receipt_path,
         &json!({"status":"admitted","pane":pane,"text":delivered,"at":Utc::now(),"response":response,"consumed":consumed}),
-    )?;
-    let mut result = json!({"status":"admitted","to":assignment.to,"interrupted":interrupting,"consumed":consumed,"receipt":receipt_path,"message":"Admission is not completion. Inspect the result when the goal wakes you."});
-    if !consumed {
-        result["warning"] =
-            "the text may still sit in the recipient's input; inspect it and do not resend".into();
-    }
-    let Some(goal) = assignment.goal else {
-        return Ok(result);
-    };
-    // The assignment is already delivered: report later failures instead of failing it.
-    if let Err(error) = store.record(
-        goal,
-        assignment.kind.event(),
-        json!({"task": assignment.task, "text": text, "plan": assignment.plan, "to": assignment.to, "agent": agent, "pane": pane, "state": live["agent_status"], "seq": live["state_change_seq"], "interrupted": interrupting, "consumed": consumed, "receipt": receipt_path, "user_approval": assignment.user_approval}),
     ) {
-        result["timeline_error"] = format!("{error:#}").into();
+        unrecorded.push(format!("receipt: {error:#}"));
     }
-    if assignment.supervise {
-        let already = load_watch(store, &context.key())
-            .is_ok_and(|watch| watch.active && watch.goal == goal && watch.role == assignment.to);
-        result["supervision"] = if already {
-            "already_active".into()
-        } else {
-            let config = crate::config::load(&store.workspace)?;
-            match supervise(
-                store,
-                goal,
-                assignment.to,
-                helper.cloned(),
-                config.idle_secs(),
-                config.cooldown_secs(),
-                config.max_wakes(),
-            )
-            .await
-            {
-                Ok(_) => "armed".into(),
-                Err(error) => format!("not armed: {error:#}").into(),
-            }
-        };
+    let mut result = json!({"status":"admitted","to":assignment.to,"interrupted":interrupting,"consumed":consumed,"receipt":receipt_path,"message":"Admission is not completion. Inspect the result when the goal wakes you."});
+    if let Some(goal) = assignment.goal {
+        if let Err(error) = store.record(
+            goal,
+            assignment.kind.event(),
+            json!({"task": assignment.task, "text": text, "plan": assignment.plan, "to": assignment.to, "agent": agent, "pane": pane, "state": live["agent_status"], "seq": live["state_change_seq"], "interrupted": interrupting, "consumed": consumed, "receipt": receipt_path, "user_approval": assignment.user_approval}),
+        ) {
+            result["timeline_error"] = format!("{error:#}").into();
+            unrecorded.push(format!("timeline: {error:#}"));
+        }
+        if assignment.supervise {
+            result["supervision"] = match arming {
+                None => "already_active".into(),
+                Some((pacing, _operation)) => {
+                    match arm(store, goal, assignment.to, helper.cloned(), pacing).await {
+                        Ok(_) => "armed".into(),
+                        Err(error) => format!("not armed: {error:#}").into(),
+                    }
+                }
+            };
+        }
+    }
+    if !unrecorded.is_empty() {
+        warnings.push(format!(
+            "{} received the text, but hgm could not record it ({})",
+            assignment.to,
+            unrecorded.join("; ")
+        ));
+    }
+    if !warnings.is_empty() {
+        result["warning"] = format!("{}; do not resend", warnings.join("; ")).into();
     }
     Ok(result)
 }
@@ -286,9 +312,19 @@ pub(crate) async fn supervise(
     cooldown: u64,
     limit: u32,
 ) -> Result<Watch> {
+    let _operation = wait_operation_lease(store, &session(store)?.key()).await?;
+    arm(store, goal, role, helper, (idle, cooldown, limit)).await
+}
+/// Arms the watch; the caller holds the supervision lock.
+async fn arm(
+    store: &Store,
+    goal: &str,
+    role: &str,
+    helper: Option<Target>,
+    (idle, cooldown, limit): (u64, u64, u32),
+) -> Result<Watch> {
     let context = session(store)?;
     let key = context.key();
-    let _operation = operation_lease(store, &key)?;
     let goal_state = store.load(goal)?;
     ensure!(
         !matches!(

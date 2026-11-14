@@ -2,13 +2,20 @@
 
 use crate::events::{self, Event};
 use crate::model::{Goal, GoalSpec, validate_id};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+/// How long a command waits for a lock another hgm process holds for one short
+/// step: a state transaction, or a watch step on the supervision lock.
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// The pause between attempts to take a busy lock; nothing is held meanwhile.
+pub(crate) const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 pub(crate) struct Store {
     pub workspace: PathBuf,
@@ -46,7 +53,7 @@ impl Store {
         }
         Ok(())
     }
-    fn lock(&self, name: &str) -> Result<File> {
+    fn open_lock(&self, name: &str) -> Result<File> {
         self.initialize()?;
         let mut options = OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
@@ -55,11 +62,33 @@ impl Store {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(self.directory.join(name))?;
+        Ok(options.open(self.directory.join(name))?)
+    }
+    fn lock(&self, name: &str) -> Result<File> {
+        let file = self.open_lock(name)?;
         file.try_lock().with_context(|| {
             format!("workspace manager is busy ({name}); retry after the active operation finishes")
         })?;
         Ok(file)
+    }
+    /// The state transaction lock. Every holder keeps it for one short
+    /// transaction, so a busy lock is retried for up to [`LOCK_WAIT`].
+    fn transaction(&self) -> Result<File> {
+        let file = self.open_lock("state.lock")?;
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_RETRY);
+                }
+                Err(TryLockError::WouldBlock) => bail!(
+                    "workspace manager stayed busy for {}s (state.lock is held); nothing was changed; retry after the active operation finishes",
+                    LOCK_WAIT.as_secs()
+                ),
+                Err(TryLockError::Error(error)) => return Err(error).context("lock state.lock"),
+            }
+        }
     }
     /// Exclusive execution ownership across processes. This file lease guards
     /// no shared memory; individual state transactions are synchronous and short.
@@ -72,7 +101,7 @@ impl Store {
         goal.owner = owner;
         let events = events::transitions(None, &goal);
         {
-            let _transaction = self.lock("state.lock")?;
+            let _transaction = self.transaction()?;
             self.save(&goal)?;
             self.append(&goal.id, &events)?;
         }
@@ -115,7 +144,7 @@ impl Store {
     }
     pub fn update(&self, id: &str, mutate: impl FnOnce(&mut Goal) -> Result<()>) -> Result<Goal> {
         let (goal, events) = {
-            let _transaction = self.lock("state.lock")?;
+            let _transaction = self.transaction()?;
             let mut goal = self.load(id)?;
             let before = goal.clone();
             mutate(&mut goal)?;
@@ -217,7 +246,7 @@ impl Store {
         Ok(directory)
     }
     pub fn write_private(&self, path: &Path, value: &impl serde::Serialize) -> Result<()> {
-        let _transaction = self.lock("state.lock")?;
+        let _transaction = self.transaction()?;
         let directory = path.parent().context("state file needs a directory")?;
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         serde_json::to_writer_pretty(&mut file, value)?;
@@ -286,6 +315,24 @@ mod tests {
         );
         assert_eq!(store.load(&goal.id)?.version, 1);
         assert!(store.load("../escape").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_transaction_waits_for_a_short_one_in_another_process() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let store = Store::new(workspace.path(), state.path())?;
+        let held = store.open_lock("state.lock")?;
+        held.try_lock()?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let start = Instant::now();
+        store.add(spec(), None)?;
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        release.join().expect("holder thread");
         Ok(())
     }
 

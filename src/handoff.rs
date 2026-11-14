@@ -217,7 +217,7 @@ fn session_variable(provider: &str) -> Option<&'static str> {
 /// Reserve the request before delivery; a transport error never causes a replay.
 pub(crate) async fn request(store: &Store) -> Result<Value> {
     let context = supervision::session(store)?;
-    let _lease = supervision::operation_lease(store, &context.key())?;
+    let _lease = supervision::wait_operation_lease(store, &context.key()).await?;
     if record_path(store, &context.key())?.exists() {
         let previous = inspect(store)?;
         ensure!(
@@ -312,7 +312,7 @@ fn read_receipt(path: &std::path::Path) -> Result<Value> {
 /// One bounded transition. The monitor retries observations, never uncertain mutations.
 pub(crate) async fn advance(store: &Store) -> Result<Value> {
     let mut context = supervision::session(store)?;
-    let _lease = supervision::operation_lease(store, &context.key())?;
+    let _lease = supervision::wait_operation_lease(store, &context.key()).await?;
     let mut transfer: Transfer =
         serde_json::from_slice(&std::fs::read(record_path(store, &context.key())?)?)?;
     let live = supervision::live_pane(&transfer.predecessor.pane).await?;

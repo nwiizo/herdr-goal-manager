@@ -1,7 +1,10 @@
 //! The manager's binding to Herdr: the pinned target, the saved manager
 //! context, private state paths and leases, and the pane reads that dispatch
 //! and the watch both build on.
-use crate::{herdr_cli as herdr, store::Store};
+use crate::{
+    herdr_cli as herdr,
+    store::{LOCK_RETRY, LOCK_WAIT, Store},
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -294,16 +297,43 @@ pub(crate) async fn existing_manager(root: &Path, origin: &Target) -> Result<Opt
     }
     Ok(None)
 }
-pub(crate) fn operation_lease(store: &Store, context: &str) -> Result<std::fs::File> {
-    let file = OpenOptions::new()
+fn operation_lock(store: &Store, context: &str) -> Result<std::fs::File> {
+    Ok(OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path(store, context, "-operation.lock")?)?;
+        .open(path(store, context, "-operation.lock")?)?)
+}
+/// The supervision lock, taken at once or not at all: the watch skips a step
+/// when a manager command holds it.
+pub(crate) fn operation_lease(store: &Store, context: &str) -> Result<std::fs::File> {
+    let file = operation_lock(store, context)?;
     file.try_lock()
         .context("supervision state is busy; retry the operation")?;
     Ok(file)
+}
+/// The supervision lock for a manager command. A watch step holds it for a
+/// few seconds, so a busy lock is retried for up to [`LOCK_WAIT`] before the
+/// command fails with nothing delivered or changed.
+pub(crate) async fn wait_operation_lease(store: &Store, context: &str) -> Result<std::fs::File> {
+    let file = operation_lock(store, context)?;
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(LOCK_RETRY).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "supervision state stayed busy for {}s ({context}-operation.lock is held, usually by a watch step); nothing was delivered or changed; retry the operation",
+                LOCK_WAIT.as_secs()
+            ),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("lock the supervision state");
+            }
+        }
+    }
 }
 
 pub(crate) async fn screen(pane: &str) -> Result<String> {
