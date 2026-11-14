@@ -1,0 +1,276 @@
+//! Append-only goal timeline and human-attention notifications.
+//!
+//! Goal records stay the source of truth. Every record transition appends the
+//! events it implies, and assignments or observations without a record change
+//! are appended explicitly, so a returning user can see what happened and when.
+use crate::model::{AttemptStatus, Goal};
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::process::{Child, Stdio};
+
+/// One timeline entry, stored as a line of `<goal>.events.ndjson`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Event {
+    pub at: DateTime<Utc>,
+    pub goal: String,
+    pub kind: String,
+    #[serde(default)]
+    pub detail: Value,
+}
+impl Event {
+    pub fn new(goal: &str, kind: &str, detail: Value) -> Self {
+        Self {
+            at: Utc::now(),
+            goal: goal.into(),
+            kind: kind.into(),
+            detail,
+        }
+    }
+}
+
+/// Events implied by a goal record transition; `before` is `None` on registration.
+pub(crate) fn transitions(before: Option<&Goal>, after: &Goal) -> Vec<Event> {
+    let event = |kind: &str, detail: Value| Event::new(&after.id, kind, detail);
+    let Some(before) = before else {
+        return vec![event(
+            "registered",
+            json!({
+                "objective": after.spec.objective,
+                "owner": after.owner,
+                "tasks": after.tasks.iter().map(|t| &t.spec.id).collect::<Vec<_>>(),
+                "checks": after.spec.checks.len(),
+            }),
+        )];
+    };
+    let mut events = vec![];
+    if after.tasks.len() > before.tasks.len() {
+        let added: Vec<_> = after.tasks[before.tasks.len()..]
+            .iter()
+            .map(|t| &t.spec.id)
+            .collect();
+        events.push(event("tasks_planned", json!({ "tasks": added })));
+    }
+    for (old, new) in before.tasks.iter().zip(&after.tasks) {
+        match (old.succeeded(), new.succeeded()) {
+            (false, true) => events.push(event(
+                "task_completed",
+                json!({
+                    "task": new.spec.id,
+                    "evidence": new.manual_evidence.as_ref().map(|e| &e.note),
+                }),
+            )),
+            (true, false) => events.push(event("task_reopened", json!({ "task": new.spec.id }))),
+            _ => {}
+        }
+    }
+    for guidance in after.guidance.iter().skip(before.guidance.len()) {
+        events.push(event("guidance", json!({ "note": guidance.note })));
+    }
+    let finished = |goal: &Goal| {
+        goal.verifications
+            .iter()
+            .filter(|v| v.finished_at.is_some())
+            .count()
+    };
+    if finished(after) > finished(before)
+        && let Some(verification) = after
+            .verifications
+            .iter()
+            .rev()
+            .find(|v| v.finished_at.is_some())
+    {
+        events.push(event(
+            "checks",
+            json!({
+                "count": verification.results.len(),
+                "passed": verification
+                    .results
+                    .iter()
+                    .all(|r| r.attempt.status == AttemptStatus::Succeeded),
+                "results": verification
+                    .results
+                    .iter()
+                    .map(|r| json!({ "name": r.name, "status": r.attempt.status }))
+                    .collect::<Vec<_>>(),
+            }),
+        ));
+    }
+    if before.confirmed.is_none()
+        && let Some(confirmed) = &after.confirmed
+    {
+        events.push(event("confirmed", json!({ "evidence": confirmed.note })));
+    }
+    if before.waiting.is_none()
+        && let Some(waiting) = &after.waiting
+    {
+        events.push(event("waiting", json!({ "reason": waiting.note })));
+    }
+    if before.acceptance.is_none()
+        && let Some(acceptance) = &after.acceptance
+    {
+        events.push(event("accepted", json!({ "evidence": acceptance.note })));
+    }
+    if before.status != after.status {
+        events.push(event(
+            "status",
+            json!({ "from": before.status, "to": after.status, "message": after.message }),
+        ));
+    }
+    events
+}
+
+/// Title, reason and sound for events that need the user's attention.
+fn attention(event: &Event) -> Option<(&'static str, String, &'static str)> {
+    let text = |key: &str| event.detail[key].as_str().unwrap_or_default().to_string();
+    match event.kind.as_str() {
+        "status" => match event.detail["to"].as_str()? {
+            "ready_for_review" => Some(("Goal ready for your review", text("message"), "request")),
+            "needs_input" => Some(("Goal needs your input", text("message"), "request")),
+            _ => None,
+        },
+        "waiting" => Some(("Goal is waiting for you", text("reason"), "request")),
+        "attention" => Some(("Original agent needs you", text("reason"), "request")),
+        "watch_ended" if event.detail["notify"] == true => {
+            Some(("Goal monitoring stopped", text("reason"), "request"))
+        }
+        "accepted" => Some(("Goal accepted", text("evidence"), "done")),
+        // A verdict is input to the person's decision, so they hear of it
+        // even while no watch runs (the goal awaits their acceptance).
+        "reviewed" => Some((
+            "Review arrived",
+            format!(
+                "{} says {} with {} finding(s)",
+                text("reviewer"),
+                text("verdict"),
+                event.detail["findings"].as_array().map_or(0, Vec::len)
+            ),
+            "request",
+        )),
+        _ => None,
+    }
+}
+
+/// What the Goal watch tab's sheep says about `event`: a notification the
+/// user was shown, or a wake delivered to the manager.
+pub(crate) fn notice(event: &Event) -> Option<String> {
+    if let Some((title, reason, _)) = attention(event) {
+        return Some(if reason.is_empty() {
+            title.into()
+        } else {
+            format!("{title}: {reason}")
+        });
+    }
+    (event.kind == "wake").then(|| {
+        let reason = event.detail["reason"].as_str().unwrap_or_default();
+        format!("Woke the manager: {reason}")
+    })
+}
+
+/// Shows Herdr notifications for attention events. Best-effort: it runs only in
+/// a Herdr-bound manager context and never fails the state change behind it.
+pub(crate) fn notify(objective: &str, events: &[Event]) {
+    if cfg!(test)
+        || std::env::var("HERDR_ENV").as_deref() != Ok("1")
+        || std::env::var_os("HGM_CONTEXT").is_none()
+    {
+        return;
+    }
+    for event in events {
+        let Some((title, reason, sound)) = attention(event) else {
+            continue;
+        };
+        let body: String = format!("{objective} — {reason}")
+            .chars()
+            .take(300)
+            .collect();
+        let binary = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+        let spawned = std::process::Command::new(binary)
+            .args(["notification", "show", title, "--body", &body])
+            .args(["--sound", sound])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => wait_bounded(&mut child),
+            Err(error) => eprintln!("Goal notification not shown: {error}"),
+        }
+    }
+}
+fn wait_bounded(child: &mut Child) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
+/// Parses `--since`: RFC 3339, or a recent span such as `30m`, `2h`, `1d`.
+pub(crate) fn since(text: &str) -> Result<DateTime<Utc>> {
+    if let Ok(time) = DateTime::parse_from_rfc3339(text) {
+        return Ok(time.with_timezone(&Utc));
+    }
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let amount: i64 = number
+        .parse()
+        .with_context(|| format!("--since must be RFC 3339 or like 30m/2h/1d, got {text}"))?;
+    let span = match unit {
+        "m" => Duration::minutes(amount),
+        "h" => Duration::hours(amount),
+        "d" => Duration::days(amount),
+        _ => bail!("--since unit must be m, h, or d"),
+    };
+    Ok(Utc::now() - span)
+}
+
+/// One readable line per event for `hgm log`.
+pub(crate) fn describe(event: &Event) -> String {
+    let d = &event.detail;
+    let text = |key: &str| d[key].as_str().unwrap_or_default().to_string();
+    let summary = match event.kind.as_str() {
+        "registered" => text("objective"),
+        "status" => format!(
+            "{} -> {}{}",
+            text("from"),
+            text("to"),
+            d["message"]
+                .as_str()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        ),
+        "task_completed" | "task_reopened" => format!(
+            "{}{}",
+            text("task"),
+            d["evidence"]
+                .as_str()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        ),
+        "assigned" => format!("{}: {}", text("task"), text("text")),
+        "checks" => format!("{} checks, passed={}", d["count"], d["passed"]),
+        "guidance" => text("note"),
+        "waiting" | "attention" | "watch_ended" => text("reason"),
+        "accepted" | "confirmed" => text("evidence"),
+        "patrol" => text("reason"),
+        _ => d.to_string(),
+    };
+    let summary: String = summary.chars().take(200).collect();
+    format!(
+        "{}  {}  {:<14} {}",
+        event.at.format("%Y-%m-%d %H:%M:%S"),
+        &event.goal[..event.goal.len().min(10)],
+        event.kind,
+        summary
+    )
+}

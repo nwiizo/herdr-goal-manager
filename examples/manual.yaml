@@ -1,0 +1,11 @@
+objective: Prepare a workshop agenda
+acceptance:
+  - The organizer has reviewed the agenda and the materials are ready.
+out_of_scope:
+  - Sending invitations
+tasks:
+  - id: draft
+    instruction: Draft the agenda and attach its location as completion evidence.
+  - id: review
+    instruction: Review the draft with the organizer.
+    depends_on: [draft]

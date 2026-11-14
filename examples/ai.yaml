@@ -1,0 +1,30 @@
+# Requires an installed, authenticated Codex CLI. This example is not run in CI.
+# Replace the objective, acceptance criteria and checks before importing.
+objective: Write a concise project overview in OVERVIEW.md
+acceptance:
+  - OVERVIEW.md explains the current project and its main entrypoints.
+  - A person has checked the overview against the actual project.
+out_of_scope:
+  - Changing application code
+  - Committing, pushing or publishing
+constraints:
+  - Preserve all existing work.
+runners:
+  planner:
+    program: sh
+    prompt_stdin: true
+    args:
+      - '-c'
+      - 'codex exec --sandbox read-only --skip-git-repo-check --ephemeral --output-last-message "$HGM_RUN_DIR/reply.txt" - >&2 && cat "$HGM_RUN_DIR/reply.txt"'
+  writer:
+    program: sh
+    prompt_stdin: true
+    args:
+      - '-c'
+      - 'codex exec --sandbox workspace-write --skip-git-repo-check --ephemeral --output-last-message "$HGM_RUN_DIR/reply.txt" - >&2 && cat "$HGM_RUN_DIR/reply.txt"'
+planner: planner
+repair: writer
+checks:
+  - name: overview_exists
+    command: test -s OVERVIEW.md
+    timeout_secs: 10

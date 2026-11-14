@@ -1,0 +1,17 @@
+objective: Prepare a reviewed text report
+acceptance:
+  - The report contains a summary and a person has reviewed it
+runners:
+  planner:
+    program: printf
+    args:
+      - '%s'
+      - '[{"id":"draft","instruction":"Write the report","runner":"writer"},{"id":"review","instruction":"Review report.txt","depends_on":["draft"]}]'
+  writer:
+    program: sh
+    args: ['-c', 'printf "Summary: example result\n" > report.txt']
+planner: planner
+checks:
+  - name: report_has_summary
+    command: grep -q Summary report.txt
+    timeout_secs: 10

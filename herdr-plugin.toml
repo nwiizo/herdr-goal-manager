@@ -1,0 +1,45 @@
+id = "herdr-goal-manager"
+name = "Goal Manager"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Talk through useful outcomes, delegate to the original tab, and follow work through."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Goals: talk to the manager"
+description = "Open a native agent conversation bound to this pane."
+command = ["./target/release/hgm", "herdr-open"]
+
+[[actions]]
+id = "board"
+title = "Goals: open status board"
+command = ["./target/release/hgm", "herdr-board"]
+
+[[panes]]
+id = "panel"
+title = "Goal Manager"
+placement = "tab"
+command = ["/bin/sh", "-c", "exec env HGM_PLUGIN_PANEL=1 ./target/release/hgm --workspace \"$HGM_WORKSPACE\" manager"]
+
+[[panes]]
+id = "board"
+title = "Goals"
+placement = "tab"
+command = ["/bin/sh", "-c", "exec env HGM_PLUGIN_PANEL=1 ./target/release/hgm --workspace \"$HGM_WORKSPACE\" panel"]
+
+[[panes]]
+id = "runner"
+title = "Goal execution"
+placement = "tab"
+command = ["/bin/sh", "-c", "exec ./target/release/hgm --workspace \"$HGM_WORKSPACE\" --state-dir \"$HGM_STATE_DIR\" herdr-run"]
+
+[[panes]]
+id = "monitor"
+title = "Goal watch"
+placement = "tab"
+command = ["/bin/sh", "-c", "exec ./target/release/hgm --workspace \"$HGM_WORKSPACE\" --state-dir \"$HGM_STATE_DIR\" watch-loop"]
+
+[[build]]
+platforms = ["linux", "macos"]
+command = ["cargo", "build", "--release", "--locked"]

@@ -1,0 +1,18 @@
+objective: Produce and review a local report
+acceptance:
+  - report.txt contains the expected result and has been reviewed.
+runners:
+  report:
+    program: sh
+    args: ["-c", "printf 'Report ready\\n' > report.txt"]
+tasks:
+  - id: generate
+    instruction: Generate the local report.
+    runner: report
+  - id: review
+    instruction: Read report.txt and record your assessment.
+    depends_on: [generate]
+checks:
+  - name: report-content
+    command: "test -s report.txt && grep -q 'Report ready' report.txt"
+    timeout_secs: 10
