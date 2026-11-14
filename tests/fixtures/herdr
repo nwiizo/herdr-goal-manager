@@ -45,7 +45,7 @@ case "$1 $2" in
     # Like Herdr 0.9.5: a real Git worktree, reported as a workspace.
     printf '%s\n' "$*" >> "$FIXTURE_ROOT/worktree.txt"
     action=$2; shift 2
-    cwd=; branch=; base=; path=; workspace=
+    cwd=; branch=; base=; path=; workspace=; kind=
     while [ $# -gt 0 ]; do
       case "$1" in
         --cwd) cwd=$2; shift ;;
@@ -61,10 +61,10 @@ case "$1 $2" in
       create)
         path=${path:-"$cwd-$branch"}
         git -C "$cwd" worktree add -q -b "$branch" "$path" "$base" >&2
-        workspace=w9 ;;
+        workspace=w9; kind=worktree_created ;;
       open)
         branch=$(git -C "$path" rev-parse --abbrev-ref HEAD)
-        workspace=w8 ;;
+        workspace=w8; kind=worktree_opened ;;
       remove)
         path=$(cat "$FIXTURE_ROOT/worktree-$workspace")
         common=$(git -C "$path" rev-parse --path-format=absolute --git-common-dir)
@@ -73,6 +73,6 @@ case "$1 $2" in
         exit 0 ;;
     esac
     printf '%s' "$path" > "$FIXTURE_ROOT/worktree-$workspace"
-    printf '{"result":{"type":"worktree_created","workspace":{"workspace_id":"%s","worktree":{"checkout_path":"%s"}},"worktree":{"branch":"%s","path":"%s"}}}\n' "$workspace" "$path" "$branch" "$path" ;;
+    printf '{"result":{"type":"%s","workspace":{"workspace_id":"%s","worktree":{"checkout_path":"%s"}},"worktree":{"branch":"%s","path":"%s"}}}\n' "$kind" "$workspace" "$path" "$branch" "$path" ;;
   *) printf 'unexpected fixture command\n' >&2; exit 2 ;;
 esac

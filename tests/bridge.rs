@@ -1940,6 +1940,13 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
             .iter()
             .any(|k| k == "checkout_removed")
     );
+    // Later checks say the checkout is gone, not that a folder is missing.
+    let resumed = bridge.call(&["resume", &goal]);
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        !resumed.status.success() && stderr.contains("was removed with hgm checkout remove"),
+        "{stderr}"
+    );
 }
 
 #[test]

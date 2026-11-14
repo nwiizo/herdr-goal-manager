@@ -565,10 +565,21 @@ pub(crate) struct Goal {
 impl Goal {
     /// Where the goal's commands, checks and protected paths live: its
     /// checkout when it has one, otherwise the managed workspace.
-    pub fn work_dir(&self) -> &std::path::Path {
-        self.checkout
-            .as_ref()
-            .map_or(self.workspace.as_path(), |checkout| checkout.path.as_path())
+    /// A removed checkout leaves nowhere to run, which this says plainly
+    /// instead of a missing-directory error.
+    pub fn work_dir(&self) -> Result<&std::path::Path> {
+        let Some(checkout) = &self.checkout else {
+            return Ok(self.workspace.as_path());
+        };
+        if let Some(removed) = checkout.removed_at {
+            anyhow::bail!(
+                "goal {}'s checkout {} was removed with hgm checkout remove at {}; there is nowhere to run its commands or checks. Register a new goal for further work",
+                self.id,
+                checkout.path.display(),
+                removed.format("%Y-%m-%d %H:%M UTC")
+            );
+        }
+        Ok(checkout.path.as_path())
     }
     pub fn new(mut spec: GoalSpec, workspace: PathBuf) -> Result<Self> {
         spec.validate()?;

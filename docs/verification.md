@@ -295,6 +295,38 @@ Limits found:
   `send --interrupt` and corrections to a working Codex are refused, since text
   typed into a working Codex is not known to be kept.
 
+## Native checkout checks (2026-11-14)
+
+Herdr 0.9.5 on macOS, with a development build of hgm and a throwaway setup
+(a new Git repository with one commit on `main`, and a temporary hgm workspace
+and state directory), so no goal or workspace of the person was touched.
+
+- `confirm` of a contract without a command check under `autonomy: auto` was
+  refused before any Herdr call: no checkout is made for a contract that cannot
+  be confirmed.
+- `confirm` with `checkout: {repository, base: main, branch, path}` created the
+  worktree with `herdr worktree create --no-focus`. `herdr workspace list`
+  showed the new workspace with `focused: false`, labelled `goal g-…`; `git
+  worktree list` showed the branch at the path. The goal recorded path, branch,
+  base and `workspace_id`.
+- A second goal on the same branch reopened it with `herdr worktree open`: the
+  reply carries `type: worktree_opened`, `already_open: true`,
+  `workspace.workspace_id` and `worktree.path` (the real path, e.g. under
+  `/private/tmp` on macOS), and the goal recorded the same workspace.
+- `hgm checkout remove` with an untracked file in the checkout was refused with
+  `1 uncommitted change(s) … (nothing was removed)`. After the file was deleted
+  it succeeded: the workspace closed, `git worktree list` no longer showed the
+  checkout, its folder was gone, the branch stayed, and the goal recorded
+  `removed_at` and a `checkout_removed` event.
+- `herdr worktree create` also opened the source repository as an unfocused
+  workspace when none was open for it. It stays after `checkout remove`, since
+  the person may use it; the throwaway one was closed with
+  `herdr workspace close`.
+
+After removal, any command or check of the goal stops with "goal …'s checkout
+… was removed with hgm checkout remove at …" instead of a missing-directory
+error (covered by `a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run`).
+
 ## Wake size (2026-11-14)
 
 Every wake used to repeat the acceptance, invariants, stop conditions and the

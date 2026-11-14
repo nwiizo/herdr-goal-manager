@@ -594,7 +594,7 @@ async fn settle_checks(
         let id = format!("settle-{}", uuid::Uuid::new_v4());
         match crate::process::execute(
             store,
-            goal.work_dir(),
+            goal.work_dir()?,
             &id,
             &command,
             "",
@@ -768,7 +768,7 @@ pub(crate) async fn watch_once(
     let policy = &goal.spec.loop_policy;
     if let Some(baseline) = &goal.protected_digest
         && !goal.spec.protected_paths.is_empty()
-        && crate::contract::protected_digest(goal.work_dir(), &goal.spec.protected_paths)?
+        && crate::contract::protected_digest(goal.work_dir()?, &goal.spec.protected_paths)?
             != *baseline
     {
         let reason = format!(
@@ -851,7 +851,7 @@ pub(crate) async fn watch_once(
         let id = format!("stop-{}", uuid::Uuid::new_v4());
         if crate::process::execute(
             store,
-            goal.work_dir(),
+            goal.work_dir()?,
             &id,
             &command,
             "",

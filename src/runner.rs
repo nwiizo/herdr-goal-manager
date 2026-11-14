@@ -86,7 +86,7 @@ async fn run_inner(
             &goal.id,
             executor.execute(
                 store,
-                goal.work_dir(),
+                goal.work_dir()?,
                 &attempt.id,
                 &command,
                 &prompt,
@@ -156,7 +156,7 @@ async fn run_inner(
             &goal.id,
             executor.execute(
                 store,
-                goal.work_dir(),
+                goal.work_dir()?,
                 &attempt.id,
                 &command,
                 &prompt,
@@ -235,7 +235,7 @@ async fn run_inner(
             &goal.id,
             executor.execute(
                 store,
-                goal.work_dir(),
+                goal.work_dir()?,
                 &attempt.id,
                 &command,
                 &prompt,
@@ -290,7 +290,7 @@ async fn verify(store: &Store, id: &str, executor: &impl Executor) -> Result<Opt
             id,
             executor.execute(
                 store,
-                goal.work_dir(),
+                goal.work_dir()?,
                 &attempt.id,
                 &command,
                 "",

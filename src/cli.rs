@@ -517,8 +517,10 @@ impl Cli {
                 if goal.spec.checkout.is_some() && goal.checkout.is_none() {
                     goal.checkout = Some(crate::checkout::prepare(&goal).await?);
                 }
-                let digest =
-                    crate::contract::protected_digest(goal.work_dir(), &goal.spec.protected_paths)?;
+                let digest = crate::contract::protected_digest(
+                    goal.work_dir()?,
+                    &goal.spec.protected_paths,
+                )?;
                 let goal = store.update(id, |g| {
                     if g.checkout.is_none() {
                         g.checkout = goal.checkout.clone();
