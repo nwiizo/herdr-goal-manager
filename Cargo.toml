@@ -6,7 +6,6 @@ rust-version = "1.89"
 description = "Durable goals, evidence, and mixed human/command work in Herdr"
 license = "MIT"
 repository = "https://github.com/nwiizo/herdr-goal-manager"
-homepage = "https://github.com/nwiizo/herdr-goal-manager"
 readme = "README.md"
 keywords = ["herdr", "agents", "goals", "terminal", "cli"]
 categories = ["command-line-utilities", "development-tools"]
