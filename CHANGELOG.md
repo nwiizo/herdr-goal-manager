@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 (2026-11-14)
+
+- Published on crates.io as a fallback install: `cargo install herdr-goal-manager`
+  installs `hgm`, and the new `hgm plugin-folder` makes a Herdr plugin folder
+  around it (the manifest and a link to the installed binary) for
+  `herdr plugin link`. It leaves a folder holding another plugin or an hgm build
+  alone.
+- README: installing from crates.io, and uninstalling it.
+
 ## 0.1.0 (2026-11-14)
 
 First public version.

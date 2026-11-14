@@ -31,14 +31,14 @@ least one agent CLI. hgm is one binary plus a Herdr plugin manifest.
 
 ### 2. The plugin
 
-Pick one of three ways.
+Pick one of these ways.
 
 **From GitHub through Herdr.** Herdr fetches the tag and runs the plugin's build
 step, `cargo build --release --locked`, so this needs Rust 1.89 or later with
 `cargo` on `PATH` (for example from [rustup.rs](https://rustup.rs)):
 
 ```sh
-herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.0
+herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.1
 ```
 
 **Prebuilt archive** (no Rust needed). Download the archive for your machine,
@@ -55,29 +55,44 @@ case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)  target=x86_64-unknown-linux-gnu ;;
   *) echo "no prebuilt archive for $(uname -sm); build from a checkout" ;;
 esac
-base=https://github.com/nwiizo/herdr-goal-manager/releases/download/v0.1.0
+base=https://github.com/nwiizo/herdr-goal-manager/releases/download/v0.1.1
 mkdir -p ~/.local/share && cd ~/.local/share
-curl -fLO "$base/hgm-v0.1.0-$target.tar.gz"
+curl -fLO "$base/hgm-v0.1.1-$target.tar.gz"
 curl -fLO "$base/SHA256SUMS"
 shasum -a 256 -c SHA256SUMS --ignore-missing  # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf "hgm-v0.1.0-$target.tar.gz"
-"hgm-v0.1.0-$target/target/release/hgm" --version  # hgm 0.1.0
-herdr plugin link "$PWD/hgm-v0.1.0-$target"
+tar -xzf "hgm-v0.1.1-$target.tar.gz"
+"hgm-v0.1.1-$target/target/release/hgm" --version  # hgm 0.1.1
+herdr plugin link "$PWD/hgm-v0.1.1-$target"
 ```
 
 On macOS, Gatekeeper may block an archive downloaded with a browser; download it
 with `curl` as above, or clear the attribute with
-`xattr -dr com.apple.quarantine "hgm-v0.1.0-$target"`.
+`xattr -dr com.apple.quarantine "hgm-v0.1.1-$target"`.
 
 **From a checkout** (Rust 1.89 or later):
 
 ```sh
-git clone --branch v0.1.0 https://github.com/nwiizo/herdr-goal-manager
+git clone --branch v0.1.1 https://github.com/nwiizo/herdr-goal-manager
 cd herdr-goal-manager
 cargo build --release --locked
-target/release/hgm --version  # hgm 0.1.0
+target/release/hgm --version  # hgm 0.1.1
 herdr plugin link "$PWD"
 ```
+
+**From crates.io**, if the ways above do not work for you (Rust 1.89 or
+later). `cargo install` installs only the `hgm` binary; `hgm plugin-folder`
+then makes a plugin folder around it (the manifest and a link to the binary,
+by default in `~/.local/share/herdr-goal-manager/plugin`) for Herdr to link:
+
+```sh
+cargo install herdr-goal-manager --locked
+hgm --version  # hgm 0.1.1
+hgm plugin-folder
+herdr plugin link ~/.local/share/herdr-goal-manager/plugin
+```
+
+A later `cargo install herdr-goal-manager --locked` upgrades the plugin too,
+since the folder links to the installed binary.
 
 Check that `herdr plugin list` shows `herdr-goal-manager` as enabled.
 
@@ -118,15 +133,16 @@ To run `hgm` in your own shell as well (`hgm overview`, `hgm log`), link the
 plugin's `target/release/hgm` onto your `PATH`: inside the archive or checkout
 folder, or for a GitHub install under
 `~/.config/herdr/plugins/github-installations/`. For the archive above:
-`ln -s ~/.local/share/hgm-v0.1.0-$target/target/release/hgm ~/.local/bin/hgm`
+`ln -s ~/.local/share/hgm-v0.1.1-$target/target/release/hgm ~/.local/bin/hgm`
 (any folder on your `PATH`). The managers do not need it.
 
 ### Uninstall
 
 Remove the shortcut, then run `herdr plugin uninstall herdr-goal-manager` (if
 installed from GitHub) or `herdr plugin unlink herdr-goal-manager` (if linked).
-Goal records stay in hgm's private state (see Inspect and recover) until you
-delete them.
+For a crates.io install, also run `cargo uninstall herdr-goal-manager` and delete
+the plugin folder. Goal records stay in hgm's private state (see Inspect and
+recover) until you delete them.
 
 ## The manager
 

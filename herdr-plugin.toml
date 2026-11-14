@@ -1,6 +1,6 @@
 id = "herdr-goal-manager"
 name = "Goal Manager"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.5"
 description = "Talk through useful outcomes, delegate to the original tab, and follow work through."
 platforms = ["linux", "macos"]
