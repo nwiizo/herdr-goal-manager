@@ -9,27 +9,74 @@ This is an experimental local tool. It has bounded monitoring and a durable
 handoff protocol; it does not provide a complete software-factory/PR service.
 See [verification and limits](docs/verification.md) before unattended use.
 
-## Start a conversation
+## Install
 
-Install with Herdr 0.9.5+ on macOS or Linux. The plugin install builds from
-source (Rust 1.89+):
+You need macOS or Linux, [Herdr](https://herdr.dev) 0.9.5 or later, and at
+least one agent CLI. hgm is one binary plus a Herdr plugin manifest.
+
+### 1. Herdr and an agent CLI
+
+- Install Herdr from [herdr.dev](https://herdr.dev), start it with `herdr`, and
+  check `herdr --version` (0.9.5 or later). Goal Manager runs in Herdr tabs.
+- Install at least one agent CLI, sign in, and start it once in a terminal so
+  its own first-run questions (sign-in, folder trust) are answered:
+  [Claude Code](https://github.com/anthropics/claude-code) (`claude`),
+  [Codex](https://github.com/openai/codex) (`codex`) or
+  [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`).
+
+### 2. The plugin
+
+Pick one of three ways.
+
+**From GitHub through Herdr.** Herdr fetches the tag and runs the plugin's build
+step, `cargo build --release --locked`, so this needs Rust 1.89 or later with
+`cargo` on `PATH` (for example from [rustup.rs](https://rustup.rs)):
 
 ```sh
 herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.0
 ```
 
-Or download `hgm-v0.1.0-<target>.tar.gz` (aarch64 or x86_64, macOS or Linux)
-from the GitHub release, check it against `SHA256SUMS`, extract it, and link it:
+**Prebuilt archive** (no Rust needed). Download the archive for your machine,
+check it, and extract it into a folder that stays: Herdr links to that folder.
 
 ```sh
-shasum -a 256 -c SHA256SUMS --ignore-missing
-tar -xzf hgm-v0.1.0-<target>.tar.gz
-herdr plugin link "$PWD/hgm-v0.1.0-<target>"
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  target=aarch64-apple-darwin ;;
+  Darwin-x86_64) target=x86_64-apple-darwin ;;
+  Linux-aarch64) target=aarch64-unknown-linux-gnu ;;
+  Linux-x86_64)  target=x86_64-unknown-linux-gnu ;;
+  *) echo "no prebuilt archive for $(uname -sm); build from a checkout" ;;
+esac
+base=https://github.com/nwiizo/herdr-goal-manager/releases/download/v0.1.0
+mkdir -p ~/.local/share && cd ~/.local/share
+curl -fLO "$base/hgm-v0.1.0-$target.tar.gz"
+curl -fLO "$base/SHA256SUMS"
+shasum -a 256 -c SHA256SUMS --ignore-missing  # Linux: sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf "hgm-v0.1.0-$target.tar.gz"
+"hgm-v0.1.0-$target/target/release/hgm" --version  # hgm 0.1.0
+herdr plugin link "$PWD/hgm-v0.1.0-$target"
 ```
 
-From a checkout: `cargo build --release --locked && herdr plugin link "$PWD"`.
+On macOS, Gatekeeper may block an archive downloaded with a browser; download it
+with `curl` as above, or clear the attribute with
+`xattr -dr com.apple.quarantine "hgm-v0.1.0-$target"`.
 
-Add an unused shortcut to Herdr's configuration:
+**From a checkout** (Rust 1.89 or later):
+
+```sh
+git clone https://github.com/nwiizo/herdr-goal-manager
+cd herdr-goal-manager
+cargo build --release --locked
+herdr plugin link "$PWD"
+```
+
+Check that `herdr plugin list` shows `herdr-goal-manager` as enabled.
+
+### 3. A shortcut
+
+Goal Manager opens through a key bound to the plugin's `open` action. Add this to
+Herdr's config, `~/.config/herdr/config.toml` (or the file `HERDR_CONFIG_PATH`
+names), and pick another key if `prefix+ctrl+g` is taken:
 
 ```toml
 [[keys.command]]
@@ -39,10 +86,37 @@ command = "herdr-goal-manager.open"
 description = "open goal manager for this folder"
 ```
 
-Validate with `herdr config check`. With `prefix=ctrl+q`, press **Ctrl+Q, Ctrl+G**
-from the tab whose agent should receive work. The manager opens its own tab and
-starts an ordinary agent conversation. Describe the problem or ask for concrete
-work. The agent keeps the goal records; you do not need to write YAML.
+Validate it with `herdr config check` and apply it with
+`herdr server reload-config` (or **prefix, Shift+R**). The shortcut is then
+**prefix, Ctrl+G**: Herdr's prefix key (`prefix` in its config), then Ctrl+G.
+
+### 4. First run
+
+1. In Herdr, open a tab in the folder you work in and start your agent there
+   (`claude`, `codex` or `copilot`). This tab is main: the agent that does the
+   work.
+2. Press the shortcut from that tab. A Goal Manager tab opens with the same
+   agent and asks what you want to move forward. If its provider asks whether to
+   trust the folder, answer it in that tab.
+3. Describe the problem or the result you want. Small requests go straight to
+   main; for larger work the manager writes a contract, shows it to you and
+   sends the work once you agree. It keeps the goal records (no YAML to write)
+   and leaves acceptance to you.
+
+Pressing the shortcut again from the same tab switches to its running manager.
+To run `hgm` in your own shell as well (`hgm overview`, `hgm log`), link the
+binary onto your `PATH`, for example
+`ln -s ~/.local/share/hgm-v0.1.0-$target/target/release/hgm ~/.local/bin/hgm`;
+the managers do not need it.
+
+### Uninstall
+
+Remove the shortcut, then run `herdr plugin uninstall herdr-goal-manager` (if
+installed from GitHub) or `herdr plugin unlink herdr-goal-manager` (if linked).
+Goal records stay in hgm's private state (see Inspect and recover) until you
+delete them.
+
+## The manager
 
 The manager uses the same agent as the original tab; when that tab runs no known
 agent it uses `HGM_AGENT`, the config's `agent`, or Codex. The CLI also supports:
@@ -218,12 +292,15 @@ board; it is not required for conversation.
 
 ## Upgrade
 
-A running Goal watch continues in a new build once the build file is replaced
-(written to a temporary file and renamed into place). Managers and roles keep
+Update a GitHub install with `herdr plugin update`; for an archive, extract the
+new one and run `herdr plugin link` on its folder; for a checkout, pull and
+rebuild. A running Goal watch continues in the new build when the binary it runs
+is replaced at the same path (written to a temporary file and renamed into
+place); otherwise rearm it with `hgm supervise GOAL_ID`. Managers and roles keep
 the code and instructions they started with; restart them to pick up a new
 guide:
 
-- Reopen Goal Manager (**Ctrl+Q, Ctrl+G**) after closing the old one, so the
+- Reopen Goal Manager with the shortcut after closing the old one, so the
   manager receives the new guide and command reference.
 - Restart helper roles (`hgm role stop NAME`, then `hgm role start ...`) so they
   receive updated role guides.
