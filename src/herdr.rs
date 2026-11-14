@@ -79,6 +79,50 @@ pub(crate) async fn open_panel(entrypoint: &str, state_root: &Path) -> Result<()
     call(&args).await
 }
 
+/// The plugin manifest this build ships, for a plugin folder around an
+/// installed binary (see [`plugin_folder`]).
+const PLUGIN_MANIFEST: &str = include_str!("../herdr-plugin.toml");
+
+/// Makes `dir` a Herdr plugin folder for this binary, so an `hgm` installed
+/// without the plugin (for example from crates.io) can be added with
+/// `herdr plugin link`: it writes the manifest and links `target/release/hgm`
+/// to this executable, so upgrading the binary upgrades the plugin. A folder
+/// that holds another plugin's manifest, or an hgm build as a regular file
+/// (an archive or a checkout), is left alone.
+pub(crate) fn plugin_folder(dir: &Path) -> Result<serde_json::Value> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let manifest = dir.join("herdr-plugin.toml");
+    if let Ok(existing) = std::fs::read_to_string(&manifest) {
+        ensure!(
+            existing.contains("id = \"herdr-goal-manager\""),
+            "{} belongs to another plugin; choose another folder with --dir",
+            manifest.display()
+        );
+    }
+    let release = dir.join("target/release");
+    let binary = release.join("hgm");
+    if let Ok(metadata) = std::fs::symlink_metadata(&binary) {
+        ensure!(
+            metadata.file_type().is_symlink(),
+            "{} is an hgm build, not a link; that folder is already a plugin (link it as it is) or choose another folder with --dir",
+            binary.display()
+        );
+    }
+    std::fs::create_dir_all(&release).with_context(|| format!("create {}", release.display()))?;
+    // Replace any earlier link by rename, so the plugin never sees no binary.
+    let temporary = release.join(format!(".hgm-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    std::os::unix::fs::symlink(&executable, &temporary)?;
+    std::fs::rename(&temporary, &binary)?;
+    std::fs::write(&manifest, PLUGIN_MANIFEST)
+        .with_context(|| format!("write {}", manifest.display()))?;
+    Ok(serde_json::json!({
+        "folder": dir,
+        "binary": executable,
+        "link": format!("herdr plugin link {}", crate::manager::quote(dir.as_os_str())),
+    }))
+}
+
 /// Herdr shows an unnamed tab by its number. A tab the user named keeps its name.
 fn unnamed(label: &str) -> bool {
     let label = label.trim();

@@ -291,6 +291,15 @@ pub(crate) enum Action {
     Panel,
     /// Open the Herdr plugin panel for the invoking workspace
     HerdrOpen,
+    /// Make a Herdr plugin folder for this hgm (for an install from crates.io):
+    /// writes herdr-plugin.toml and links target/release/hgm to this binary;
+    /// then run `herdr plugin link FOLDER`
+    PluginFolder {
+        /// Folder to set up (default: $XDG_DATA_HOME/herdr-goal-manager/plugin,
+        /// or ~/.local/share/herdr-goal-manager/plugin)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     #[command(hide = true)]
     HerdrRun,
 }
@@ -358,6 +367,16 @@ fn visible_goals(store: &Store, all: bool) -> Result<Vec<Goal>> {
     Ok(goals)
 }
 
+/// Where `plugin-folder` puts the plugin by default: under the user's data
+/// folder, next to nothing else hgm writes.
+fn default_plugin_folder() -> Result<PathBuf> {
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| PathBuf::from(d).is_absolute())
+    {
+        return Ok(PathBuf::from(data).join("herdr-goal-manager/plugin"));
+    }
+    let home = std::env::var_os("HOME").context("set HOME or pass --dir")?;
+    Ok(PathBuf::from(home).join(".local/share/herdr-goal-manager/plugin"))
+}
 pub(crate) fn default_state_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("XDG_STATE_HOME") {
         ensure!(
@@ -394,6 +413,24 @@ impl Cli {
                 "panel"
             };
             return crate::herdr::open_panel(entrypoint, &self.state_root()?).await;
+        }
+        if let Action::PluginFolder { dir } = action {
+            let folder = match dir {
+                Some(dir) if dir.is_absolute() => dir.clone(),
+                Some(dir) => std::env::current_dir()?.join(dir),
+                None => default_plugin_folder()?,
+            };
+            let result = crate::herdr::plugin_folder(&folder)?;
+            if self.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Herdr plugin folder: {}\nAdd it to Herdr with: {}",
+                    folder.display(),
+                    result["link"].as_str().unwrap_or_default()
+                );
+            }
+            return Ok(());
         }
         let store = self.store()?;
         // Helper roles run hgm only to read the contract and report back.
@@ -819,7 +856,7 @@ impl Cli {
             }
             Action::Panel => crate::herdr::panel(&store).await?,
             Action::HerdrRun => crate::herdr::run_pane(&store).await?,
-            Action::HerdrOpen | Action::HerdrBoard => {
+            Action::HerdrOpen | Action::HerdrBoard | Action::PluginFolder { .. } => {
                 unreachable!("handled before workspace resolution")
             }
         }

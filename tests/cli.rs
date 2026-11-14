@@ -617,3 +617,52 @@ fn contracts_enforce_length_and_autonomy_within_verification() {
     );
     sandbox.success(&["confirm", &ask, "--evidence", "User: go"]);
 }
+
+#[test]
+fn a_plugin_folder_links_this_binary_and_leaves_other_builds_alone() {
+    let sandbox = Sandbox::new();
+    let setup = |folder: &std::path::Path| {
+        sandbox
+            .command(&["plugin-folder", "--dir", folder.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
+    // An hgm installed on its own (from crates.io) becomes a linkable plugin.
+    let folder = sandbox.root.path().join("plugin folder");
+    for _ in 0..2 {
+        let output = setup(&folder);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let manifest = std::fs::read_to_string(folder.join("herdr-plugin.toml")).unwrap();
+    assert!(manifest.contains("id = \"herdr-goal-manager\""));
+    assert!(manifest.contains("./target/release/hgm"));
+    let binary = folder.join("target/release/hgm");
+    assert!(
+        std::fs::symlink_metadata(&binary)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::canonicalize(&binary).unwrap(),
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_hgm")).unwrap()
+    );
+    // A folder holding an hgm build, or another plugin, is left alone.
+    let built = sandbox.root.path().join("built");
+    std::fs::create_dir_all(built.join("target/release")).unwrap();
+    std::fs::write(built.join("target/release/hgm"), "build").unwrap();
+    assert!(!setup(&built).status.success());
+    assert_eq!(
+        std::fs::read_to_string(built.join("target/release/hgm")).unwrap(),
+        "build"
+    );
+    let other = sandbox.root.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("herdr-plugin.toml"), "id = \"other\"\n").unwrap();
+    assert!(!setup(&other).status.success());
+    assert!(!other.join("target").exists());
+}
