@@ -79,6 +79,19 @@ counting as a repeated tool call (only lines that name the command count); and
 the tab showing the whole budget before the first assignment, the next patrol
 for a settled agent, and a pending wake apart from a hold.
 
+## crates.io release (2026-11-14)
+
+Version 0.1.1 (tag `v0.1.1`, commit `73a2d13`) was published with
+`cargo publish --locked`: 48 files, 620.5 KiB (167.5 KiB compressed), and the
+packaged crate built before upload. Cargo warned that `package.homepage`
+repeats `package.repository`.
+
+| Check | Observed |
+| --- | --- |
+| `cargo search herdr-goal-manager` | `herdr-goal-manager = "0.1.1"` |
+| `cargo install herdr-goal-manager --locked --root TMP` | Built the release profile in 20 seconds and installed `hgm`; `hgm --version` printed `hgm 0.1.1`, `--help` ran. |
+| `hgm plugin-folder --dir TMP/plugin` | Wrote `herdr-plugin.toml` (version 0.1.1, actions `open` and `board`) and linked `target/release/hgm` to the installed binary; the link printed `hgm 0.1.1`. `herdr plugin link` was not run, so the existing Herdr plugin stayed in place. |
+
 ## Published release (2026-11-14)
 
 Tag `v0.1.0` (commit `3ed45a1`) on the public repository. CI on main passed on
