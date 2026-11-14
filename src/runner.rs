@@ -186,7 +186,10 @@ async fn run_inner(
                 store,
                 &goal.id,
                 GoalStatus::NeedsInput,
-                "Acceptance checks failed. No repair runner is configured; inspect evidence, fix the issue, then resume.",
+                &failure_summary(
+                    &goal,
+                    "Acceptance checks failed. No repair runner is configured; inspect evidence, fix the issue, then resume.",
+                ),
             );
         };
         if goal.repairs.len() >= options.max_repairs {
@@ -194,7 +197,10 @@ async fn run_inner(
                 store,
                 &goal.id,
                 GoalStatus::NeedsInput,
-                "Acceptance checks failed and the repair limit is exhausted.",
+                &failure_summary(
+                    &goal,
+                    "Acceptance checks failed and the repair limit is exhausted.",
+                ),
             );
         }
         let command = goal.spec.runners[repair].clone();
@@ -383,6 +389,41 @@ fn stop(store: &Store, id: &str) -> Result<Goal> {
         apply_stop(goal);
         Ok(())
     })
+}
+/// The summary of a failed verification. A check whose environment denied it
+/// access (a sandbox, for example) produced no result about the work, so it is
+/// named apart from checks that failed on their own, which `failure` describes.
+fn failure_summary(goal: &Goal, failure: &str) -> String {
+    const DENIED: &str = "Operation not permitted";
+    let (denied, failed): (Vec<&CheckResult>, Vec<&CheckResult>) = goal
+        .verifications
+        .last()
+        .map(|v| v.results.iter())
+        .into_iter()
+        .flatten()
+        .filter(|check| check.attempt.status == AttemptStatus::Failed)
+        .partition(|check| check.detail.contains(DENIED));
+    if denied.is_empty() {
+        return failure.into();
+    }
+    let names = |checks: &[&CheckResult]| {
+        checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut summary = format!(
+        "The environment denied check {} access ({DENIED}): this is not a check result. Run the checks again where they can write, for example outside a sandbox, then resume.",
+        names(&denied)
+    );
+    if !failed.is_empty() {
+        summary.push_str(&format!(
+            " Check {} failed on its own: {failure}",
+            names(&failed)
+        ));
+    }
+    summary
 }
 fn finish(store: &Store, id: &str, status: GoalStatus, message: &str) -> Result<Goal> {
     store.update(id, |goal| {

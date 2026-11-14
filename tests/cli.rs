@@ -340,6 +340,41 @@ fn checks_timeout_and_record_the_failure() {
 }
 
 #[test]
+fn a_check_the_environment_denied_is_not_reported_as_a_check_result() {
+    let sandbox = Sandbox::new();
+    let denied = "echo 'error: failed to open: target/debug/.cargo-build-lock: Operation not permitted (os error 1)' >&2; exit 101";
+    let goal = |checks: Value| {
+        let id = sandbox.add(json!({
+            "objective":"Build the report", "acceptance":["It builds"],
+            "runners":{"work":{"program":"true"}},
+            "tasks":[{"id":"work","instruction":"Finish","runner":"work"}],
+            "checks":checks
+        }));
+        assert!(!sandbox.call(&["run", &id]).status.success());
+        let goal = sandbox.show(&id);
+        assert_eq!(goal["status"], "needs_input");
+        goal["message"].as_str().unwrap().to_string()
+    };
+    let message = goal(json!([{"name":"build","command":denied}]));
+    assert!(
+        message.contains("environment denied check build access")
+            && message.contains("not a check result")
+            && !message.contains("fix the issue"),
+        "{message}"
+    );
+    let message = goal(json!([
+        {"name":"build","command":denied},
+        {"name":"lint","command":"echo 'unused import' >&2; exit 1"}
+    ]));
+    assert!(
+        message.contains("denied check build access")
+            && message.contains("Check lint failed on its own")
+            && message.contains("fix the issue"),
+        "{message}"
+    );
+}
+
+#[test]
 fn brief_survives_reopening_without_creating_a_goal() {
     let sandbox = Sandbox::new();
     let brief = sandbox.workspace.join("brief.md");
