@@ -164,9 +164,11 @@ fn print_rows(
 fn text(row: &serde_json::Value, key: &str) -> String {
     row[key].as_str().unwrap_or_default().to_string()
 }
-pub(crate) fn print_status(goals: &[Goal], json_output: bool) -> Result<()> {
+/// Prints status rows; a row with `run_class` (a goal taken from the factory
+/// queue) also shows how it ran, `pending` while nothing decides it.
+pub(crate) fn print_status_rows(rows: &[serde_json::Value], json_output: bool) -> Result<()> {
     print_rows(
-        &status_rows(goals),
+        rows,
         json_output,
         "No tracked goals. Start hgm and talk about what you want to move forward.",
         |row| {
@@ -174,8 +176,34 @@ pub(crate) fn print_status(goals: &[Goal], json_output: bool) -> Result<()> {
                 .as_str()
                 .map(|reason| format!("\n  Waiting for you: {reason}"))
                 .unwrap_or_default();
+            let run = row
+                .get("run_class")
+                .map(|class| format!(" · run: {}", class.as_str().unwrap_or("pending")))
+                .unwrap_or_default();
+            let idle = row
+                .get("idle")
+                .map(|idle| {
+                    format!(
+                        "\n  {} idle {} short of completion",
+                        idle["role"].as_str().unwrap_or("main"),
+                        crate::watch_view::duration(idle["secs"].as_i64().unwrap_or(0))
+                    )
+                })
+                .unwrap_or_default();
+            let native = row
+                .get("native_goal")
+                .map(|native| format!("\n  native goal: {}", crate::cli::native_text(native)))
+                .unwrap_or_default();
+            let manager = row
+                .get("manager_goal")
+                .map(|manager| format!("\n  manager goal: {}", crate::manager_goal::text(manager)))
+                .unwrap_or_default();
+            let review = row
+                .get("review")
+                .map(|review| format!("\n  review: {}", crate::packet::review_line(review)))
+                .unwrap_or_default();
             format!(
-                "{} — {}\n  Next: {} · {}/{} tasks · {}{waiting}",
+                "{} — {}\n  Next: {} · {}/{} tasks · {}{run}{idle}{native}{manager}{review}{waiting}",
                 text(row, "objective"),
                 text(row, "status"),
                 text(row, "next_action"),
@@ -198,8 +226,9 @@ pub(crate) fn inbox_rows(store: &Store, goals: &[Goal]) -> Result<Vec<serde_json
         if matches!(goal.status, GoalStatus::Completed | GoalStatus::Cancelled) {
             continue;
         }
+        // An idle worker is listed from its watch while the stretch lasts.
         let blocking = store.events(&goal.id)?.pop().filter(|event| {
-            event.kind == "attention"
+            (event.kind == "attention" && event.detail["cause"] != crate::watch::IDLE_NOTICE)
                 || (event.kind == "watch_ended" && event.detail["notify"] == true)
         });
         let message = || goal.message.clone().unwrap_or_default();
@@ -238,21 +267,63 @@ pub(crate) fn inbox_rows(store: &Store, goals: &[Goal]) -> Result<Vec<serde_json
     }
     Ok(rows)
 }
-pub(crate) fn print_inbox(store: &Store, goals: &[Goal], json_output: bool) -> Result<()> {
-    print_rows(
-        &inbox_rows(store, goals)?,
-        json_output,
-        "Nothing needs you right now.",
-        |row| {
-            format!(
-                "[{}] {} — {}\n  {}",
-                text(row, "kind"),
-                text(row, "objective"),
-                text(row, "reason"),
-                text(row, "id"),
-            )
+pub(crate) fn print_inbox_rows(rows: &[serde_json::Value], json_output: bool) -> Result<()> {
+    print_rows(rows, json_output, "Nothing needs you right now.", |row| {
+        format!(
+            "[{}] {} — {}\n  {}",
+            text(row, "kind"),
+            text(row, "objective"),
+            text(row, "reason"),
+            text(row, "id"),
+        )
+    })
+}
+
+/// The short result of add, confirm, complete, run and resume: the goal, its
+/// state and the next command, plus the goal's message when it has one (a
+/// refusal naming its next steps). The whole goal is `hgm show ID` or
+/// `--verbose` away; `--json` is unchanged.
+pub(crate) fn print_short(goal: &Goal) {
+    let status = serde_json::to_value(goal.status)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    println!("{}  {status}\n  Next: {}", goal.id, next_step(goal));
+    if let Some(message) = goal.message.as_deref().filter(|m| !m.is_empty()) {
+        println!("  {message}");
+    }
+}
+/// The command that moves `goal` on from where it is.
+fn next_step(goal: &Goal) -> String {
+    use crate::model::GoalStatus;
+    let id = &goal.id;
+    let open_task = goal
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(i, t)| t.spec.runner.is_none() && !t.succeeded() && goal.dependencies_done(*i))
+        .map(|(_, t)| t.spec.id.clone());
+    match goal.status {
+        GoalStatus::Completed | GoalStatus::Cancelled => "nothing; the goal is finished".into(),
+        GoalStatus::ReadyForReview => format!(
+            "review with hgm packet {id}, then hgm accept {id} --evidence TEXT or hgm revise {id} --feedback TEXT"
+        ),
+        GoalStatus::Paused if goal.waiting.is_some() => {
+            format!("answer what it waits for (hgm show {id}), then hgm resume {id}")
+        }
+        GoalStatus::Paused => format!("hgm resume {id}"),
+        GoalStatus::Running => format!("inspect the run with hgm show {id}"),
+        _ if goal.confirmed.is_none() => {
+            format!("record the user's agreement with hgm confirm {id} --evidence TEXT")
+        }
+        _ => match open_task {
+            Some(task) => format!(
+                "send task {task} with hgm send --goal {id} --task {task} TEXT; when it is done, hgm complete {id} {task} --evidence TEXT"
+            ),
+            None if goal.status == GoalStatus::Ready => format!("hgm run {id}"),
+            None => format!("hgm resume {id}"),
         },
-    )
+    }
 }
 
 #[cfg(test)]

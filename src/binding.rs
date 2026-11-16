@@ -341,6 +341,23 @@ pub(crate) async fn screen(pane: &str) -> Result<String> {
 }
 /// The last `lines` visible rows of `pane` as text. Read with styles, so a
 /// faint input suggestion is not taken for a draft (see `plain_screen`).
+/// Up to `lines` recent lines of `pane` from Herdr's scrollback, soft wraps
+/// joined; as many as Herdr has when it holds fewer.
+pub(crate) async fn recent_lines(pane: &str, lines: u32) -> Result<String> {
+    let ansi = herdr::query(&args(&[
+        "agent",
+        "read",
+        pane,
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        &lines.to_string(),
+        "--format",
+        "ansi",
+    ]))
+    .await?;
+    Ok(crate::signals::plain_screen(&ansi))
+}
 pub(crate) async fn screen_lines(pane: &str, lines: u32) -> Result<String> {
     let ansi = herdr::query(&args(&[
         "agent",

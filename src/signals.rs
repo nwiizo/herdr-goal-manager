@@ -306,6 +306,214 @@ fn composer<'a>(screen: &'a str, agent: &str) -> Option<&'a str> {
     }
     None
 }
+/// Glyphs Claude Code's status line cycles through while a turn runs.
+const CLAUDE_SPINNER: [char; 7] = ['✻', '✽', '✶', '✳', '✢', '·', '*'];
+/// Whether a line changes by itself while a turn runs, whatever the work does:
+/// a spinner or status line with elapsed time and token counts, a tip, an
+/// interrupt hint, or a retry counter. Claude Code, Codex and Copilot each
+/// have their own status line; an unknown provider gets the shared rules.
+fn volatile(line: &str, agent: &str) -> bool {
+    // `◎ /goal active (12s)`: the native goal's own timer, seen on Claude Code.
+    const SHARED: [&str; 8] = [
+        "tip:",
+        "esc to interrupt",
+        "ctrl+c interrupt",
+        "esc to cancel",
+        " tokens",
+        "retrying",
+        "reconnecting",
+        "/goal active",
+    ];
+    let trimmed = line.trim();
+    let lower = trimmed.to_lowercase();
+    if SHARED.iter().any(|phrase| lower.contains(phrase)) {
+        return true;
+    }
+    let elapsed = || {
+        trimmed.split(|c: char| !c.is_alphanumeric()).any(|word| {
+            word.len() > 1
+                && matches!(word.chars().last(), Some('s' | 'm' | 'h'))
+                && word[..word.len() - 1].chars().all(|c| c.is_ascii_digit())
+        })
+    };
+    match agent {
+        // `✽ Nebulizing… (55m 22s · ↓ 31.4k tokens · thinking …)`
+        "claude" => {
+            trimmed
+                .chars()
+                .next()
+                .is_some_and(|c| CLAUDE_SPINNER.contains(&c))
+                && (trimmed.contains('…') || elapsed())
+        }
+        // `• Working (1m 02s • esc to interrupt)`
+        "codex" => (trimmed.starts_with('•') || trimmed.starts_with('◦')) && elapsed(),
+        // `◎ Running bash · 53s · 1.2 KiB ctrl+c interrupt`
+        "copilot" => (trimmed.starts_with('◎') || trimmed.starts_with('∙')) && elapsed(),
+        _ => false,
+    }
+}
+/// The screen as evidence of progress: the transcript above the input line
+/// without the lines that change by themselves while a turn runs. A working
+/// agent whose progress view stays the same shows no progress, however its
+/// timers move; output lines that grow are progress.
+pub(crate) fn progress_view(screen: &str, agent: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    let input = lines.iter().rposition(|line| {
+        let line = line.trim_start();
+        line.starts_with('❯') || line.starts_with('›') || line.starts_with('╻')
+    });
+    lines[..input.unwrap_or(lines.len())]
+        .iter()
+        .filter(|line| !line.trim().is_empty() && !volatile(line, agent))
+        // A running tool's bullet blinks (`⏺ Counting…`, then `  Counting…`).
+        .map(|line| without_elapsed(line.trim().trim_start_matches(['⏺', ' '])))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// `line` without a trailing elapsed time such as ` · 5m 2s`. Claude Code
+/// 2.1.325 ends a running tool's line with it (`⏺ Counting files … in
+/// foreground · 5m 2s`, 2026-11-16): the line stays evidence, its clock does not.
+fn without_elapsed(line: &str) -> &str {
+    let Some((head, tail)) = line.rsplit_once(" · ") else {
+        return line;
+    };
+    let clock = tail.split_whitespace().all(|word| {
+        word.len() > 1
+            && matches!(word.chars().last(), Some('s' | 'm' | 'h'))
+            && word[..word.len() - 1].chars().all(|c| c.is_ascii_digit())
+    });
+    if clock && !tail.trim().is_empty() {
+        head
+    } else {
+        line
+    }
+}
+/// A provider's retry notice on screen, such as `API error · Retrying in 0s ·
+/// attempt 1/10`: the likely cause when a working agent shows no progress.
+pub(crate) fn retry_line(screen: &str) -> Option<String> {
+    screen
+        .lines()
+        .rev()
+        .take(16)
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("retrying") || lower.contains("reconnecting")
+        })
+        .map(|line| {
+            line.trim_start_matches(|c: char| CLAUDE_SPINNER.contains(&c) || c.is_whitespace())
+                .chars()
+                .take(120)
+                .collect()
+        })
+}
+/// What Claude Code's native goal (`/goal`) shows on screen, from its
+/// documentation (code.claude.com/docs/en/goal, Claude Code 2.1.269+). The
+/// met and impossible wording is not quoted there, so those two are matched
+/// loosely; all of it awaits a native check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeGoal {
+    /// `◎ /goal active`: the goal is set and drives the worker.
+    Active,
+    /// `Goal still active …`: Claude Code retries a transient error itself.
+    Retrying(String),
+    /// The evaluator found the condition met.
+    Met(String),
+    /// The evaluator judged the condition impossible.
+    Impossible(String),
+    /// `Goal paused …`: the goal stays set but waits.
+    Paused(String),
+    /// `Goal cleared after an unrecoverable error … Run /goal again to continue`.
+    ErrorCleared(String),
+    /// `Goal cleared:` or `No goal set` after `/goal clear`.
+    Cleared(String),
+    /// `/goal` is not offered (hooks disabled, an older version).
+    Unavailable(String),
+}
+/// The latest native-goal notice in the last lines of `screen`.
+pub(crate) fn native_goal(screen: &str) -> Option<NativeGoal> {
+    // `◎ /goal active (42s)` sits above the input line and stayed there, its
+    // timer stopped, after `Goal paused` (Claude Code 2.1.325): it only counts
+    // when no outcome follows the newest `Goal set:` in the transcript.
+    let mut indicator = false;
+    for line in screen.lines().rev().take(20).map(str::trim) {
+        let lower = line.to_lowercase();
+        let quoted = || line.chars().take(200).collect::<String>();
+        if line.contains("/goal active") {
+            indicator = true;
+            continue;
+        }
+        let found = if lower.contains("goal set:") {
+            NativeGoal::Active
+        } else if lower.contains("goal cleared after an unrecoverable error") {
+            NativeGoal::ErrorCleared(quoted())
+        } else if lower.starts_with("goal paused") || lower.contains(" goal paused") {
+            NativeGoal::Paused(quoted())
+        } else if lower.contains("goal still active") {
+            NativeGoal::Retrying(quoted())
+        } else if lower.contains("goal cleared:") || lower.contains("no goal set") {
+            NativeGoal::Cleared(quoted())
+        } else if lower.contains("unknown command: /goal")
+            || lower.contains("/goal is not available")
+            || lower.contains("/goal is unavailable")
+            || (lower.contains("/goal") && lower.contains("hooks") && lower.contains("disabled"))
+        {
+            NativeGoal::Unavailable(quoted())
+        } else if lower.contains("goal achieved") || lower.contains("goal met") {
+            NativeGoal::Met(quoted())
+        } else if lower.contains("goal failed") || lower.contains("goal impossible") {
+            NativeGoal::Impossible(quoted())
+        } else {
+            continue;
+        };
+        return Some(found);
+    }
+    indicator.then_some(NativeGoal::Active)
+}
+/// Lines an agent printed itself: quoted text (a wake, a tool's output, a
+/// typed message) is indented under its marker, so a goal notice quoted from
+/// another agent is not read as this one's.
+pub(crate) fn own_lines(screen: &str) -> String {
+    screen
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// Whether Claude Code shows `◎ /goal active` in the lines right above its
+/// input line, where it keeps the indicator while a goal is set (also after
+/// `Goal paused`, with its clock stopped).
+pub(crate) fn goal_indicator_shown(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let input = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('❯'))
+        .unwrap_or(lines.len());
+    lines[input.saturating_sub(4)..input]
+        .iter()
+        .any(|line| line.contains("/goal active"))
+}
+/// How a goal that ended unseen ended: the newest outcome Claude Code printed
+/// itself, `Goal set:` echoes aside. A goal queued during a turn and met at the
+/// stop that ran it prints its outcome above the echoed `Goal set:` (seen
+/// natively, 2026-11-16), where reading from the bottom finds the set first.
+/// Paused and unavailable keep or never had a goal, so they name nothing here.
+pub(crate) fn unseen_outcome(screen: &str) -> Option<NativeGoal> {
+    let own = own_lines(screen);
+    let earlier: Vec<&str> = own
+        .lines()
+        .filter(|line| !line.contains("Goal set:"))
+        .collect();
+    native_goal(&earlier.join("\n")).filter(|notice| {
+        matches!(
+            notice,
+            NativeGoal::Met(_)
+                | NativeGoal::Impossible(_)
+                | NativeGoal::ErrorCleared(_)
+                | NativeGoal::Cleared(_)
+        )
+    })
+}
 /// Whether the screen shows a turn still running where Herdr's state may not:
 /// Herdr 0.9.5 lists Copilot 1.0.110 as `done` while it runs a tool, and
 /// Copilot's bottom status line then offers `ctrl+c interrupt`.
@@ -585,5 +793,203 @@ mod tests {
         // Faint text elsewhere stays: only the input line drops it.
         assert_eq!(plain_screen("\x1b[2m  ⎿ output\x1b[0m"), "  ⎿ output");
         assert_eq!(plain_screen("\x1b]0;title\x07\x1b(B❯ 1. Yes"), "❯ 1. Yes");
+    }
+
+    /// The transcript main showed from 10:49 on 2026-11-15, above its status line.
+    const STUCK_TOP: &str = "⏺ Running unit tests after the gate changes\n  ⎿  $ cargo test --locked --bin hgm 2>&1 | grep -E \"test\n     result|FAILED|panicked|^error\" -A8 | head -60\n\n";
+
+    #[test]
+    fn timers_token_counts_tips_and_retries_are_not_progress() {
+        let retrying = |attempt: u32, wait: u32| {
+            format!("{STUCK_TOP}✻ API error · Retrying in {wait}s · attempt {attempt}/10\n")
+        };
+        let thinking = |time: &str, tokens: &str| {
+            format!(
+                "{STUCK_TOP}✽ Nebulizing… ({time} · ↓ {tokens} tokens · thinking with xhigh effort)\n  ⎿  Tip: Use /clear to start fresh when switching topics and free up context\n"
+            )
+        };
+        let view = progress_view(&retrying(1, 0), "claude");
+        assert_eq!(view, progress_view(&retrying(4, 8), "claude"));
+        assert_eq!(view, progress_view(&thinking("1m 02s", "1.2k"), "claude"));
+        assert_eq!(view, progress_view(&thinking("55m 22s", "31.4k"), "claude"));
+        assert!(view.contains("Running unit tests"), "{view}");
+        // New output is progress.
+        let more = format!("{}  ⎿  test result: ok. 59 passed\n", thinking("2m", "2k"));
+        assert_ne!(view, progress_view(&more, "claude"));
+        // Codex and Copilot status lines, and the input line, are not progress.
+        let codex = |t: &str| format!("• Ran cargo test\n• Working ({t} • esc to interrupt)\n› ");
+        assert_eq!(
+            progress_view(&codex("12s"), "codex"),
+            progress_view(&codex("1m 40s"), "codex")
+        );
+        let copilot = |t: &str| {
+            format!("○ Shell cargo test\n◎ Running bash · {t} · 1.2 KiB ctrl+c interrupt\n")
+        };
+        assert_eq!(
+            progress_view(&copilot("5s"), "copilot"),
+            progress_view(&copilot("53s"), "copilot")
+        );
+        assert_eq!(
+            progress_view("done\n❯ draft", "claude"),
+            progress_view("done\n❯ ", "claude")
+        );
+    }
+
+    #[test]
+    fn a_retry_notice_is_named_as_the_cause() {
+        let screen = format!("{STUCK_TOP}✻ API error · Retrying in 0s · attempt 1/10\n");
+        assert_eq!(
+            retry_line(&screen).as_deref(),
+            Some("API error · Retrying in 0s · attempt 1/10")
+        );
+        assert_eq!(
+            retry_line(&format!("{STUCK_TOP}✽ Nebulizing… (55m 22s)\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_enotfound_turn_end_of_12_49_is_a_provider_error() {
+        let live = json!({"agent":"claude","agent_status":"idle"});
+        let screen =
+            "⏺ Writing the plan\n  ⎿  API Error: Can't reach the API server (ENOTFOUND)\n\n❯ ";
+        assert!(matches!(
+            stop_reason(&live, screen),
+            Some(Stop::ProviderError(_))
+        ));
+    }
+
+    #[test]
+    fn native_goal_notices_are_read_from_the_screen() {
+        use NativeGoal as N;
+        let read = |line: &str| native_goal(&format!("⏺ Working\n{line}\n❯ "));
+        // Quoted in Claude Code's documentation.
+        assert_eq!(read("◎ /goal active · 4m"), Some(N::Active));
+        assert!(matches!(
+            read("Goal still active: retrying in 30s (overloaded)"),
+            Some(N::Retrying(_))
+        ));
+        assert!(matches!(
+            read("Goal paused: usage limit reached"),
+            Some(N::Paused(_))
+        ));
+        assert!(matches!(
+            read(
+                "Goal cleared after an unrecoverable error (credit balance). Run /goal again to continue"
+            ),
+            Some(N::ErrorCleared(_))
+        ));
+        assert!(matches!(
+            read("Goal cleared: all tests pass"),
+            Some(N::Cleared(_))
+        ));
+        assert!(matches!(read("No goal set"), Some(N::Cleared(_))));
+        // Assumed wording, pending a native check.
+        assert!(matches!(
+            read("✓ Goal achieved: all tests pass"),
+            Some(N::Met(_))
+        ));
+        assert!(matches!(
+            read("✗ Goal failed: the API was removed"),
+            Some(N::Impossible(_))
+        ));
+        assert!(matches!(
+            read("Unknown command: /goal"),
+            Some(N::Unavailable(_))
+        ));
+        assert_eq!(read("all quiet"), None);
+    }
+
+    /// Observed on a real Claude Code with `/goal` (2026-11-15).
+    const OBSERVED_ACTIVE: &str = "◎ /goal active (12s)";
+    const OBSERVED_MET: &str = "✔ Goal achieved (59s · 1 turn · 1.9k tokens)";
+
+    #[test]
+    fn the_native_goal_lines_observed_on_claude_code_are_read() {
+        let screen = |line: &str| format!("⏺ Ran the tests\n{line}\n❯ ");
+        assert_eq!(
+            native_goal(&screen(OBSERVED_ACTIVE)),
+            Some(NativeGoal::Active)
+        );
+        assert_eq!(
+            native_goal(&screen(OBSERVED_MET)),
+            Some(NativeGoal::Met(OBSERVED_MET.into()))
+        );
+        // The active line's timer is not progress, so a goal that drives a
+        // stuck worker is still noticed.
+        let working = |t: &str| format!("⏺ Ran the tests\n◎ /goal active ({t})\n");
+        assert_eq!(
+            progress_view(&working("12s"), "claude"),
+            progress_view(&working("4m 48s"), "claude")
+        );
+    }
+
+    #[test]
+    fn a_running_tools_clock_is_not_progress() {
+        // Claude Code 2.1.325, a silent `find /` five minutes in (2026-11-16).
+        let screen = |tool: &str, spinner: &str| {
+            format!(
+                "⏺ Counting files matching hgm-never-exists-* across root in foreground · {tool}\n     (ctrl+b to run in background)\n· Cerebrating… ({spinner} · ↓ 247 tokens)\n────\n❯ \n"
+            )
+        };
+        assert_eq!(
+            progress_view(&screen("5m 2s", "5m 5s"), "claude"),
+            progress_view(&screen("5m 9s", "5m 12s").replacen("⏺ ", "  ", 1), "claude")
+        );
+        assert!(progress_view(&screen("12s", "14s"), "claude").contains("Counting files"));
+        // Another tool is progress; a middle dot inside ordinary text stays.
+        assert_ne!(
+            progress_view(&screen("5m 2s", "5m 5s"), "claude"),
+            progress_view(
+                &screen("5m 2s", "5m 5s").replace("Counting files", "Listing files"),
+                "claude"
+            )
+        );
+        assert_eq!(without_elapsed("a · b"), "a · b");
+        assert_eq!(without_elapsed("Ran tests · 1h 3m"), "Ran tests");
+    }
+
+    #[test]
+    fn an_outcome_printed_above_a_queued_goal_set_is_found() {
+        // Natively (2026-11-16) a queued goal met at the stop that ran it.
+        let screen = "⏺ 待機\n✔ Goal achieved (4s · 1 turn · 647 tokens)\n✻ Sautéed for 5s · done 3:05 AM\n❯ Goal set: hgm Goal Manager (03:05:34): done when\n⏺ 待機\n────\n❯ \n";
+        assert_eq!(native_goal(screen), Some(NativeGoal::Active), "bottom-up");
+        assert_eq!(
+            unseen_outcome(screen),
+            Some(NativeGoal::Met(
+                "✔ Goal achieved (4s · 1 turn · 647 tokens)".into()
+            ))
+        );
+        assert!(!goal_indicator_shown(screen));
+        // A paused goal names nothing: it keeps its goal and its indicator.
+        let paused = "⏺ Goal paused · goal checks kept finding it unmet\n    ◎ /goal active (59s)\n────\n❯ \n";
+        assert_eq!(unseen_outcome(paused), None);
+        assert!(goal_indicator_shown(paused));
+        // Quoted (indented) outcomes are not this agent's.
+        assert_eq!(unseen_outcome("  ✔ Goal achieved (9s)\n❯ "), None);
+    }
+
+    #[test]
+    fn the_active_indicator_left_after_a_pause_does_not_hide_the_outcome() {
+        // Claude Code 2.1.325 (2026-11-15): after nine blocked stops the goal
+        // paused, and the indicator above the input line stayed at 59s.
+        const PAUSED: &str = "⏺ Goal paused · goal checks kept finding it unmet this turn · send a message to continue";
+        let paused = format!(
+            "  ⎿  Goal set: hgm goal g-1 task work: the assigned work is done\n◯ Goal not yet met… continuing\n{PAUSED}\n✻ Cogitated for 41s · done 11:36 PM\n    ◎ /goal active (59s)\n────\n❯ \n────\n"
+        );
+        assert_eq!(
+            native_goal(&paused),
+            Some(NativeGoal::Paused(PAUSED.into()))
+        );
+        // A goal set after an earlier outcome is active again, and the
+        // indicator alone still reads as active.
+        let again = format!(
+            "{OBSERVED_MET}\n❯ /goal hgm goal g-1 task next\n  ⎿  Goal set: hgm goal g-1 task next\n✻ Working…\n    {OBSERVED_ACTIVE}\n❯ \n"
+        );
+        assert_eq!(native_goal(&again), Some(NativeGoal::Active));
+        assert_eq!(
+            native_goal(&format!("⏺ Working\n{OBSERVED_ACTIVE}\n❯ ")),
+            Some(NativeGoal::Active)
+        );
     }
 }

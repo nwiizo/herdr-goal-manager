@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Transfer {
@@ -216,6 +216,8 @@ fn session_variable(provider: &str) -> Option<&'static str> {
 
 /// Reserve the request before delivery; a transport error never causes a replay.
 pub(crate) async fn request(store: &Store) -> Result<Value> {
+    // The worker must stop driving itself before it hands over.
+    crate::native_goal::clear_for(store, None, "before a handoff").await?;
     let context = supervision::session(store)?;
     let _lease = supervision::wait_operation_lease(store, &context.key()).await?;
     if record_path(store, &context.key())?.exists() {
@@ -225,7 +227,7 @@ pub(crate) async fn request(store: &Store) -> Result<Value> {
             "handoff already exists; use restart to reconcile it"
         );
     }
-    let observation = supervision::target(store, None, None).await?;
+    let observation = supervision::target(store, None, None, None).await?;
     if let Some(refusal) = supervision::refusal(
         &observation["live"],
         observation["screen"].as_str().unwrap_or(""),
@@ -261,12 +263,7 @@ pub(crate) async fn request(store: &Store) -> Result<Value> {
     };
     persist(store, &context.key(), &transfer)?;
     let ready = json!({"transfer":transfer.id,"session":transfer.predecessor.session.as_ref().and_then(|s|s["value"].as_str()),"safe_to_restart":true});
-    let prompt = format!(
-        "Goal Manager handoff request. Do not compact. Stop new assignments and reach a safe boundary. Save a complete handoff at {} containing the goal, current instructions and permissions, scope, verified results and paths, pending work, failed approaches, live workers and the next action. Finish any process/subagent that depends on this CLI, or report why restart is unsafe. Only when the document is saved and no work depends on this CLI, atomically write {} to {}. Then finish this turn; Goal Manager will restart this same tab. Do not exit yourself.",
-        transfer.document.display(),
-        ready,
-        transfer.ready.display()
-    );
+    let prompt = handoff_prompt(&transfer.document, &ready, &transfer.ready);
     herdr::query(&[
         "agent".into(),
         "prompt".into(),
@@ -289,6 +286,16 @@ pub(crate) async fn request(store: &Store) -> Result<Value> {
         );
     }
     Ok(serde_json::to_value(transfer)?)
+}
+/// The handoff request typed into the original agent: where to save the
+/// document, which receipt to write once nothing depends on the CLI.
+pub(crate) fn handoff_prompt(document: &Path, ready: &Value, ready_path: &Path) -> String {
+    format!(
+        "Goal Manager handoff request. Do not compact. Stop new assignments and reach a safe boundary. Save a complete handoff at {} containing the goal, current instructions and permissions, scope, verified results and paths, pending work, failed approaches, live workers and the next action. Finish any process/subagent that depends on this CLI, or report why restart is unsafe. Only when the document is saved and no work depends on this CLI, atomically write {} to {}. Then finish this turn; Goal Manager will restart this same tab. Do not exit yourself.",
+        document.display(),
+        ready,
+        ready_path.display()
+    )
 }
 fn document_digest(transfer: &Transfer) -> Result<String> {
     let metadata =

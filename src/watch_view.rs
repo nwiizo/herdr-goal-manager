@@ -46,6 +46,14 @@ pub(crate) struct WatchView {
     pub(crate) next_check_secs: Option<i64>,
     /// Patrol interval in minutes; zero when the goal has no patrol.
     pub(crate) patrol_minutes: u32,
+    /// Seconds the worker has sat settled short of completion, while it does.
+    pub(crate) idle_secs: Option<i64>,
+    /// Seconds settled short of completion before the person is told.
+    pub(crate) idle_notice_secs: u64,
+    /// The native goal hgm set on the worker and its last outcome, if any.
+    pub(crate) native_goal: Option<String>,
+    /// The native goal hgm set on the Goal Manager and its last outcome, if any.
+    pub(crate) manager_goal: Option<String>,
     /// Minutes of time budget left; negative means the budget is exceeded.
     pub(crate) time_left_minutes: Option<i64>,
     /// Assignments used and allowed.
@@ -172,6 +180,20 @@ where
         Some(observation) => format!("last observation: {}", single_line(observation)),
         None => "last observation: none yet".into(),
     });
+    if let Some(idle) = view.idle_secs {
+        lines.push(format!(
+            "{} idle {} short of completion (you are told at {})",
+            single_line(&view.role),
+            duration(idle),
+            duration(view.idle_notice_secs as i64)
+        ));
+    }
+    if let Some(native) = &view.native_goal {
+        lines.push(format!("native /goal: {}", single_line(native)));
+    }
+    if let Some(manager) = &view.manager_goal {
+        lines.push(format!("manager /goal: {}", single_line(manager)));
+    }
     if let Some(reason) = &view.held_reason {
         lines.push(format!("held: {}", single_line(reason)));
     } else if let Some(reason) = &view.pending_reason {
@@ -327,7 +349,7 @@ fn next_check(secs: i64) -> String {
 }
 
 /// Formats a non-negative span as "45s", "4m 10s" or "1h 30m".
-fn duration(secs: i64) -> String {
+pub(crate) fn duration(secs: i64) -> String {
     let (hours, minutes, seconds) = (secs / 3600, secs % 3600 / 60, secs % 60);
     match (hours, minutes, seconds) {
         (0, 0, s) => format!("{s}s"),
@@ -424,6 +446,10 @@ mod tests {
             wakes_max: 8,
             next_check_secs: Some(250),
             patrol_minutes: 5,
+            idle_secs: None,
+            idle_notice_secs: 180,
+            native_goal: None,
+            manager_goal: None,
             time_left_minutes: Some(90),
             assignments: Some((1, 5)),
             events: (0..7)

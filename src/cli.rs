@@ -26,6 +26,9 @@ pub(crate) struct Cli {
     /// Emit machine-readable JSON
     #[arg(long, global = true)]
     pub json: bool,
+    /// add, confirm, complete, run and resume print the whole goal, not the short result
+    #[arg(long, global = true)]
+    pub verbose: bool,
     #[command(subcommand)]
     pub action: Option<Action>,
 }
@@ -55,11 +58,24 @@ pub(crate) enum Action {
         #[arg(long)]
         guide: bool,
     },
+    /// Attention accounting per goal, from the timelines: wakes and how many
+    /// led to an action, idle time, notices, review wait, corrections, refusals
+    Attention {
+        /// Include goals registered from other tabs of this folder
+        #[arg(long)]
+        all: bool,
+        /// Include completed and cancelled goals (always included in --json)
+        #[arg(long)]
+        finished: bool,
+    },
     /// Show this tab's outcomes and the next useful action
     Status {
         /// Include goals registered from other tabs of this folder
         #[arg(long)]
         all: bool,
+        /// Include completed and cancelled goals (always included in --json)
+        #[arg(long)]
+        finished: bool,
     },
     /// Show what happened: a goal's timeline, or this tab's goals merged
     Log {
@@ -77,10 +93,15 @@ pub(crate) enum Action {
         /// Rebind to the agent session the user started in the pinned tab; EVIDENCE says why it continues the work
         #[arg(long, value_name = "EVIDENCE", conflicts_with = "start")]
         adopt: Option<String>,
+        /// Return up to this many recent lines from Herdr's scrollback (1-5000)
+        /// instead of the visible screen
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=5000))]
+        lines: Option<u32>,
     },
     /// Send an assignment to the original agent, preserving the selected target
     Send {
-        text: String,
+        #[arg(required_unless_present = "withdraw")]
+        text: Option<String>,
         /// Record the assignment on this goal and start monitoring it
         #[arg(long)]
         goal: Option<String>,
@@ -103,6 +124,16 @@ pub(crate) enum Action {
         /// Recipient: main (the original tab) or a pinned role such as impl
         #[arg(long, default_value = "main")]
         to: String,
+        /// Queue it as a next step instead: the watch delivers one each time the
+        /// recipient settles, in order (up to 5 per role)
+        #[arg(long, requires = "goal", conflicts_with = "interrupt")]
+        prepare: bool,
+        /// Withdraw the steps prepared for the recipient (--to): all, or one with --step
+        #[arg(long, conflicts_with_all = ["text", "goal", "prepare"])]
+        withdraw: bool,
+        /// With --withdraw: the place of the one step to withdraw (1 is next)
+        #[arg(long, requires = "withdraw", value_parser = clap::value_parser!(u32).range(1..))]
+        step: Option<u32>,
     },
     /// Ask the worker to restate the goal in five lines (when a wake says a goal
     /// check is due); the reply re-anchors it and is not evidence
@@ -161,21 +192,50 @@ pub(crate) enum Action {
         #[arg(long, default_value = "-")]
         findings: PathBuf,
     },
-    /// (impl role) Report progress, completion or a question to the manager
+    /// (worker) Report progress, completion or a question to the manager, as
+    /// text or a file; kept in full on the timeline, in log and the packet
     Report {
         id: String,
+        /// The report (up to 3,000 words), or use --file
+        #[arg(required_unless_present = "file")]
+        text: Option<String>,
+        /// Read the report from this file instead
+        #[arg(long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// (worker) Record a choice made inside the contract and why, on the goal's
+    /// timeline; it completes nothing
+    Decision {
+        id: String,
+        /// What was chosen (up to 150 words)
+        text: String,
+        /// Why (up to 150 words)
+        #[arg(long)]
+        why: String,
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// (worker) Record a finding that should not block the work, to take up later
+    FollowUp {
+        id: String,
+        /// The finding (up to 150 words)
         text: String,
         #[arg(long)]
         task: Option<String>,
     },
+    /// One summary for review: acceptance, latest checks, counts, decisions,
+    /// follow-ups, verdicts and what is not verified; it accepts nothing
+    Packet { id: String },
     /// Record the user's agreement to a goal's loop contract before assigning work
     Confirm {
         id: String,
         #[arg(long)]
         evidence: String,
     },
-    /// What needs a human now: reviews, questions, approvals, spent budgets
-    /// Record a reviewed plan so implementation assignments may start (loop.plan_first)
+    /// Record a reviewed plan so implementation assignments may start
+    /// (loop.plan_first); without --task, the one task whose plan is pending
     ApprovePlan {
         id: String,
         #[arg(long)]
@@ -184,6 +244,7 @@ pub(crate) enum Action {
         #[arg(long)]
         evidence: String,
     },
+    /// What needs a human now: reviews, questions, approvals, spent budgets, idle workers
     Inbox {
         #[arg(long)]
         all: bool,
@@ -203,21 +264,38 @@ pub(crate) enum Action {
         /// Worker to observe: main or a pinned role
         #[arg(long, default_value = "main")]
         role: String,
-        /// Seconds without change before a wake (default 300 or config watch.idle_secs)
+        /// Seconds without change before a wake (default 180 or config watch.idle_secs)
         #[arg(long, value_parser=clap::value_parser!(u64).range(10..=86400))]
         idle_secs: Option<u64>,
-        /// Seconds between wakes (default 300 or config watch.cooldown_secs)
+        /// Seconds between patrol and unchanged-screen wakes; a stop after new
+        /// work skips it (default 180 or config watch.cooldown_secs)
         #[arg(long, value_parser=clap::value_parser!(u64).range(10..=86400))]
         cooldown_secs: Option<u64>,
-        /// Wakes per goal (default 100 or config watch.max_wakes)
-        #[arg(long, value_parser=clap::value_parser!(u32).range(1..=100))]
+        /// Wakes per goal (default 160 or config watch.max_wakes)
+        #[arg(long, value_parser=clap::value_parser!(u32).range(1..=500))]
         max_wakes: Option<u32>,
+        /// Seconds the worker may sit settled short of completion before you
+        /// are told (default 180 or config watch.idle_notice_secs)
+        #[arg(long, value_parser=clap::value_parser!(u64).range(10..=86400))]
+        idle_notice_secs: Option<u64>,
+        /// Minutes between patrols of a working agent, overriding the goal's
+        /// loop.patrol_minutes for this watch; 0 disables
+        #[arg(long, value_parser=clap::value_parser!(u32).range(0..=1440))]
+        patrol_minutes: Option<u32>,
     },
     /// Pause automatic wakeups while waiting for a human decision
     Wait {
         id: String,
         #[arg(long)]
         reason: String,
+    },
+    /// (Goal Manager) Wait for this manager's next wake. Run it in the
+    /// background at the end of a turn: the watch hands the wake to it instead
+    /// of typing it, and it prints the wake, or why none came, and exits
+    Await {
+        /// Seconds to wait before it returns without a wake
+        #[arg(long, default_value_t = crate::wake_await::DEFAULT_TIMEOUT_SECS, value_parser=clap::value_parser!(u64).range(1..=86400))]
+        timeout: u64,
     },
     /// Ask the original agent for a durable handoff at a safe boundary
     Handoff,
@@ -261,11 +339,21 @@ pub(crate) enum Action {
         criterion: Vec<String>,
         #[arg(long)]
         check: Vec<String>,
+        /// Report the contract's problems and words per field without registering it
+        #[arg(long, conflicts_with = "replace")]
+        validate: bool,
+        /// Replace the contract of this unconfirmed goal instead of registering
+        /// a new one (same id and timeline; a confirmed goal is never replaced)
+        #[arg(long, value_name = "GOAL")]
+        replace: Option<String>,
     },
     /// List this tab's goals in the selected workspace
     List {
         #[arg(long)]
         all: bool,
+        /// Include completed and cancelled goals (always included in --json)
+        #[arg(long)]
+        finished: bool,
     },
     /// Inspect acceptance criteria, tasks, attempts, and verification evidence
     Show { id: String },
@@ -291,6 +379,11 @@ pub(crate) enum Action {
         id: String,
         #[arg(long)]
         evidence: String,
+    },
+    /// Factory mode work queue of agreed contracts (needs factory.enabled)
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
     },
     /// Open the interactive goal panel (also works outside Herdr)
     Panel,
@@ -336,21 +429,35 @@ fn overview(store: &Store, all: bool, json: bool) -> Result<()> {
         .collect();
     lessons.sort_by_key(|g| std::cmp::Reverse(g.recorded_at));
     let lessons: Vec<&str> = lessons.iter().take(5).map(|g| g.note.as_str()).collect();
+    let factory = crate::factory::Factory::load(store)?;
+    let needs_you = inbox_rows(store, &goals, factory.as_ref())?;
+    let rows = status_rows(store, &goals, factory.as_ref())?;
+    // Queued work behind an open gate waits for the manager, not the person.
+    let queue = match &factory {
+        Some(factory) => factory.ready_line()?,
+        None => None,
+    };
     if json {
-        let overview = serde_json::json!({
+        let mut overview = serde_json::json!({
             "brief": brief,
-            "needs_you": crate::view::inbox_rows(store, &goals)?,
-            "goals": crate::view::status_rows(&goals),
+            "needs_you": needs_you,
+            "goals": rows,
             "lessons": lessons,
         });
+        if let Some(queue) = queue {
+            overview["queue"] = queue.into();
+        }
         println!("{}", serde_json::to_string_pretty(&overview)?);
         return Ok(());
     }
     let brief = if brief.is_empty() { "(none)" } else { &brief };
     println!("# Brief\n{brief}\n\n# Needs you");
-    crate::view::print_inbox(store, &goals, false)?;
+    crate::view::print_inbox_rows(&needs_you, false)?;
     println!("\n# Goals");
-    crate::view::print_status(&goals, false)?;
+    crate::view::print_status_rows(&rows, false)?;
+    if let Some(queue) = queue {
+        println!("\n# Queue\n{queue}");
+    }
     if !lessons.is_empty() {
         println!("\n# Lessons (candidate AGENTS.md rules)");
         for lesson in lessons {
@@ -358,6 +465,177 @@ fn overview(store: &Store, all: bool, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+/// `hgm show`: the goal, plus its queue item and run class when it was taken
+/// from the factory queue while factory mode is on.
+fn show(store: &Store, goal: &Goal, json: bool) -> Result<()> {
+    let factory = crate::factory::Factory::load(store)?;
+    let described = factory.map(|f| f.describe(&goal.id)).transpose()?.flatten();
+    let native = native_view(store, &goal.id)?;
+    let manager = crate::watch::manager_goals(store)?
+        .remove(&goal.id)
+        .map(|state| state.view());
+    let events = store.events(&goal.id)?;
+    let mut fingerprints = crate::fingerprint::Fingerprints::default();
+    let reviews = crate::roles::review_states(goal, &events, &mut fingerprints);
+    // A check that passed on an earlier state of the work dir verifies
+    // nothing now. Results kept before fingerprints (unknown) appear only in
+    // the packet, so older goals print as before.
+    let earlier: Vec<String> = crate::packet::check_states(goal, &events, &mut fingerprints)
+        .iter()
+        .filter(|c| c["result"] == "passed" && c["state"] == "stale")
+        .filter_map(crate::packet::check_unverified)
+        .collect();
+    if described.is_none()
+        && native.is_none()
+        && manager.is_none()
+        && reviews.is_empty()
+        && earlier.is_empty()
+    {
+        return print_goal(goal, store, json);
+    }
+    if json {
+        let mut value = serde_json::to_value(goal)?;
+        if let Some(described) = described {
+            value["factory"] = described;
+        }
+        if let Some(native) = native {
+            value["native_goal"] = native;
+        }
+        if let Some(manager) = &manager {
+            value["manager_goal"] = manager.clone();
+        }
+        if !reviews.is_empty() {
+            value["reviews"] = reviews.into();
+        }
+        if !earlier.is_empty() {
+            value["not_verified"] = earlier.into();
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    print_goal(goal, store, false)?;
+    if let Some(described) = described {
+        let reasons: Vec<&str> = described["run_class_reasons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        println!(
+            "Queue item: {}\nRun class: {}{}",
+            described["item"].as_str().unwrap_or_default(),
+            described["run_class"].as_str().unwrap_or("pending"),
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join("; "))
+            }
+        );
+    }
+    if let Some(native) = native {
+        println!("Native goal: {}", native_text(&native));
+    }
+    if let Some(manager) = &manager {
+        println!("Manager goal: {}", crate::manager_goal::text(manager));
+    }
+    if !reviews.is_empty() {
+        println!("Reviews:");
+        for review in &reviews {
+            println!("  {}", crate::packet::review_line(review));
+        }
+    }
+    if !earlier.is_empty() {
+        println!("Not verified:");
+        for line in &earlier {
+            println!("  {line}");
+        }
+    }
+    Ok(())
+}
+/// The native goal hgm set for `goal`, with whether it is set and its last
+/// recorded outcome, while a watch keeps it.
+fn native_view(store: &Store, goal: &str) -> Result<Option<serde_json::Value>> {
+    Ok(crate::watch::native_goals(store)?.get(goal).map(|state| {
+        serde_json::json!({"set": state.is_set(), "outcome": state.outcome, "task": state.task})
+    }))
+}
+pub(crate) fn native_text(native: &serde_json::Value) -> String {
+    match (native["set"].as_bool(), native["outcome"].as_str()) {
+        (Some(true), None) => "set".into(),
+        (Some(true), Some(outcome)) => format!("set, last outcome {outcome}"),
+        (_, Some(outcome)) => format!("not set, last outcome {outcome}"),
+        _ => "not set".into(),
+    }
+}
+/// Status rows, with each factory goal's run class while factory mode is on.
+/// Also shows how long a watched worker has sat settled short of completion.
+fn status_rows(
+    store: &Store,
+    goals: &[Goal],
+    factory: Option<&crate::factory::Factory>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = crate::view::status_rows(goals);
+    if let Some(factory) = factory {
+        factory.annotate(&mut rows)?;
+    }
+    let idle = crate::watch::idle_stretches(store, chrono::Utc::now().timestamp())?;
+    let native = crate::watch::native_goals(store)?;
+    let manager = crate::watch::manager_goals(store)?;
+    let mut fingerprints = crate::fingerprint::Fingerprints::default();
+    for (row, goal) in rows.iter_mut().zip(goals) {
+        // The latest verdict, and whether the work dir still matches it.
+        let events = store.events(&goal.id)?;
+        if let Some(review) = crate::roles::review_states(goal, &events, &mut fingerprints).pop() {
+            row["review"] = review;
+        }
+        if let Some(stretch) = idle.get(&goal.id)
+            && crate::watch::short_of_completion(goal)
+        {
+            row["idle"] = serde_json::json!({"role": stretch.role, "secs": stretch.secs});
+        }
+        if let Some(state) = native.get(&goal.id) {
+            row["native_goal"] =
+                serde_json::json!({"set": state.is_set(), "outcome": state.outcome});
+        }
+        if let Some(state) = manager.get(&goal.id) {
+            row["manager_goal"] = state.view();
+        }
+        row["attention"] = crate::accounting::compute(goal, &events, chrono::Utc::now());
+    }
+    Ok(rows)
+}
+/// Inbox rows, with the factory queue's hold while factory mode is on, and a
+/// row for each watched worker the person was told sits idle short of completion.
+fn inbox_rows(
+    store: &Store,
+    goals: &[Goal],
+    factory: Option<&crate::factory::Factory>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut rows = crate::view::inbox_rows(store, goals)?;
+    let idle = crate::watch::idle_stretches(store, chrono::Utc::now().timestamp())?;
+    for goal in goals {
+        if let Some(stretch) = idle.get(&goal.id)
+            && stretch.noticed
+            && crate::watch::short_of_completion(goal)
+        {
+            rows.push(serde_json::json!({
+                "id": goal.id,
+                "objective": goal.spec.objective,
+                "kind": "worker_idle",
+                "reason": format!(
+                    "{} idle {} short of completion; no next step is prepared",
+                    stretch.role,
+                    crate::watch_view::duration(stretch.secs)
+                ),
+                "since": chrono::DateTime::from_timestamp(stretch.since, 0),
+            }));
+        }
+    }
+    if let Some(row) = factory.map(|f| f.held_row()).transpose()?.flatten() {
+        rows.push(row);
+    }
+    Ok(rows)
 }
 fn visible_goals(store: &Store, all: bool) -> Result<Vec<Goal>> {
     let owner = if all {
@@ -438,20 +716,31 @@ impl Cli {
             return Ok(());
         }
         let store = self.store()?;
-        // Helper roles run hgm only to read the contract and report back.
+        // Helper roles run hgm only to read the contract and report back; each
+        // record command also checks the role's own list.
         if let Ok(role) = std::env::var("HGM_ROLE") {
             ensure!(
                 matches!(
                     action,
-                    Action::Show { .. } | Action::Report { .. } | Action::ReviewSubmit { .. }
+                    Action::Show { .. }
+                        | Action::Report { .. }
+                        | Action::ReviewSubmit { .. }
+                        | Action::Decision { .. }
+                        | Action::FollowUp { .. }
                 ),
-                "the {role} role may only run show, report or review-submit"
+                "the {role} role may only run show, report, review-submit, decision or follow-up"
             );
         }
         match action {
             Action::Manager { agent, model } => {
-                crate::manager::launch(&store, *agent, model.as_deref(), &command_reference())
-                    .await?
+                let factory = crate::config::load(&store.workspace)?.factory_enabled();
+                crate::manager::launch(
+                    &store,
+                    *agent,
+                    model.as_deref(),
+                    &command_reference(factory),
+                )
+                .await?
             }
             Action::Brief { save } => {
                 let scope = crate::supervision::origin_terminal(&store)?;
@@ -487,8 +776,52 @@ impl Cli {
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 }
             }
-            Action::Status { all } => {
-                crate::view::print_status(&visible_goals(&store, *all)?, self.json)?
+            Action::Attention { all, finished } => {
+                let (goals, hidden) =
+                    without_finished(visible_goals(&store, *all)?, *finished || self.json);
+                let now = chrono::Utc::now();
+                let mut rows = vec![];
+                for goal in &goals {
+                    let accounting =
+                        crate::accounting::compute(goal, &store.events(&goal.id)?, now);
+                    rows.push(
+                        serde_json::json!({"id": goal.id, "objective": goal.spec.objective,
+                        "status": goal.status, "attention": accounting}),
+                    );
+                }
+                if self.json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    for row in &rows {
+                        println!(
+                            "{} — {} · {}\n  {}",
+                            row["objective"].as_str().unwrap_or_default(),
+                            row["status"].as_str().unwrap_or_default(),
+                            row["id"].as_str().unwrap_or_default(),
+                            crate::accounting::line(&row["attention"])
+                        );
+                    }
+                    if rows.is_empty() && hidden == 0 {
+                        println!("No tracked goals.");
+                    }
+                    if hidden > 0 {
+                        println!("{}", hidden_line("attention", hidden));
+                    }
+                }
+            }
+            Action::Status { all, finished } => {
+                let factory = crate::factory::Factory::load(&store)?;
+                let (goals, hidden) =
+                    without_finished(visible_goals(&store, *all)?, *finished || self.json);
+                let rows = status_rows(&store, &goals, factory.as_ref())?;
+                if rows.is_empty() && hidden > 0 {
+                    println!("{}", hidden_line("status", hidden));
+                } else {
+                    crate::view::print_status_rows(&rows, self.json)?;
+                    if hidden > 0 {
+                        println!("{}", hidden_line("status", hidden));
+                    }
+                }
             }
             Action::Log { id, since, all } => {
                 let since = since.as_deref().map(crate::events::since).transpose()?;
@@ -507,27 +840,21 @@ impl Cli {
                 } else {
                     for event in &events {
                         println!("{}", crate::events::describe(event));
+                        for line in crate::events::full_text(event)
+                            .into_iter()
+                            .flat_map(str::lines)
+                        {
+                            println!("    {line}");
+                        }
                     }
                 }
             }
             Action::Confirm { id, evidence } => {
-                let mut goal = store.load(id)?;
-                // A contract that cannot be confirmed creates no checkout.
-                goal.clone().confirm(evidence.clone(), String::new())?;
-                if goal.spec.checkout.is_some() && goal.checkout.is_none() {
-                    goal.checkout = Some(crate::checkout::prepare(&goal).await?);
+                let goal = runner::confirm_goal(&store, id, evidence).await?;
+                print_result(&goal, &store, self.json, self.verbose)?;
+                if let Some(warning) = shared_work_dir(&store, &goal)? {
+                    eprintln!("{warning}");
                 }
-                let digest = crate::contract::protected_digest(
-                    goal.work_dir()?,
-                    &goal.spec.protected_paths,
-                )?;
-                let goal = store.update(id, |g| {
-                    if g.checkout.is_none() {
-                        g.checkout = goal.checkout.clone();
-                    }
-                    g.confirm(evidence.clone(), digest)
-                })?;
-                print_goal(&goal, &store, self.json)?;
             }
             Action::Checkout {
                 action: CheckoutAction::Remove { id },
@@ -547,6 +874,11 @@ impl Cli {
                         .is_none_or(|t| goal.tasks.iter().any(|x| x.spec.id == t)),
                     "unknown task ID"
                 );
+                // Without --task, the one task whose plan awaits approval.
+                let task = match task {
+                    Some(task) => Some(task.clone()),
+                    None => crate::admission::plan_pending(&store.events(id)?, id)?,
+                };
                 store.record(
                     id,
                     "plan_approved",
@@ -555,7 +887,9 @@ impl Cli {
                 print_goal(&store.load(id)?, &store, self.json)?;
             }
             Action::Inbox { all } => {
-                crate::view::print_inbox(&store, &visible_goals(&store, *all)?, self.json)?
+                let factory = crate::factory::Factory::load(&store)?;
+                let rows = inbox_rows(&store, &visible_goals(&store, *all)?, factory.as_ref())?;
+                crate::view::print_inbox_rows(&rows, self.json)?
             }
             Action::Revise { id, feedback, task } => {
                 let mut reopened = vec![];
@@ -568,11 +902,20 @@ impl Cli {
                     println!("Reopened: {}", reopened.join(", "));
                 }
             }
-            Action::Target { start, adopt } => println!(
+            Action::Target {
+                start,
+                adopt,
+                lines,
+            } => println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &crate::supervision::target(&store, start.map(|p| p.name()), adopt.as_deref())
-                        .await?
+                    &crate::supervision::target(
+                        &store,
+                        start.map(|p| p.name()),
+                        adopt.as_deref(),
+                        *lines
+                    )
+                    .await?
                 )?
             ),
             Action::Send {
@@ -584,7 +927,17 @@ impl Cli {
                 plan,
                 interrupt,
                 to,
+                prepare,
+                withdraw,
+                step,
             } => {
+                if *withdraw {
+                    let place = step.map(|n| n as usize);
+                    let result = crate::prepared::withdraw(&store, to, place).await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    return Ok(());
+                }
+                let text = text.as_deref().context("the assignment text is missing")?;
                 let helper = crate::roles::resolve(&store, to)?;
                 let assignment = crate::supervision::Assignment {
                     goal: goal.as_deref(),
@@ -595,9 +948,13 @@ impl Cli {
                     to,
                     kind: crate::supervision::Delivery::Assignment,
                     interrupt: *interrupt,
+                    via: None,
                 };
-                let result =
-                    crate::supervision::send(&store, text, assignment, helper.as_ref()).await?;
+                let result = if *prepare {
+                    crate::prepared::prepare(&store, &assignment, text).await?
+                } else {
+                    crate::supervision::send(&store, text, assignment, helper.as_ref()).await?
+                };
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             Action::Correct {
@@ -617,6 +974,7 @@ impl Cli {
                     to,
                     kind: crate::supervision::Delivery::Correction,
                     interrupt: true,
+                    via: None,
                 };
                 let result =
                     crate::supervision::send(&store, text, assignment, helper.as_ref()).await?;
@@ -633,6 +991,7 @@ impl Cli {
                     to,
                     kind: crate::supervision::Delivery::Reanchor,
                     interrupt: true,
+                    via: None,
                 };
                 let text = text.as_deref().unwrap_or(" ");
                 let result =
@@ -689,39 +1048,90 @@ impl Cli {
                     crate::roles::submit_review(&store, id, review, *verdict, &text).await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
-            Action::Report { id, text, task } => println!(
+            Action::Report {
+                id,
+                text,
+                file,
+                task,
+            } => println!(
                 "{}",
                 serde_json::to_string_pretty(&crate::roles::report(
+                    &store,
+                    id,
+                    task.as_deref(),
+                    text.as_deref(),
+                    file.as_deref(),
+                )?)?
+            ),
+            Action::Decision {
+                id,
+                text,
+                why,
+                task,
+            } => println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::packet::decide(
+                    &store,
+                    id,
+                    task.as_deref(),
+                    text,
+                    why
+                )?)?
+            ),
+            Action::FollowUp { id, text, task } => println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::packet::follow_up(
                     &store,
                     id,
                     task.as_deref(),
                     text
                 )?)?
             ),
+            Action::Packet { id } => crate::packet::show(&store, id, self.json)?,
             Action::Supervise {
                 id,
                 role,
                 idle_secs,
                 cooldown_secs,
                 max_wakes,
+                idle_notice_secs,
+                patrol_minutes,
             } => {
-                let config = crate::config::load(&store.workspace)?;
-                let watch = crate::supervision::supervise(
+                let pacing = crate::supervision::Pacing {
+                    idle_secs: *idle_secs,
+                    cooldown_secs: *cooldown_secs,
+                    max_wakes: *max_wakes,
+                    idle_notice_secs: *idle_notice_secs,
+                    patrol_minutes: *patrol_minutes,
+                };
+                let (watch, report) = crate::supervision::supervise(
                     &store,
                     id,
                     role,
                     crate::roles::resolve(&store, role)?,
-                    idle_secs.unwrap_or(config.idle_secs()),
-                    cooldown_secs.unwrap_or(config.cooldown_secs()),
-                    max_wakes.unwrap_or(config.max_wakes()),
+                    pacing,
                 )
                 .await?;
-                println!("{}", serde_json::to_string_pretty(&watch)?);
+                let mut value = serde_json::to_value(&watch)?;
+                value["pacing"] = report;
+                println!("{}", serde_json::to_string_pretty(&value)?);
             }
             Action::Wait { id, reason } => {
                 let goal = store.update(id, |g| g.wait(reason.clone()))?;
+                crate::native_goal::clear_for(&store, Some(id), "the goal waits for the person")
+                    .await?;
                 crate::watch::release_watches(&store, id, "waiting_for_user")?;
                 print_goal(&goal, &store, self.json)?
+            }
+            Action::Await { timeout } => {
+                let result =
+                    crate::wake_await::wait(&store, std::time::Duration::from_secs(*timeout))
+                        .await?;
+                if self.json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("{}", crate::wake_await::text(&result));
+                }
             }
             Action::Handoff => println!("{}", crate::handoff::request(&store).await?),
             Action::Restart => println!("{}", crate::handoff::advance(&store).await?),
@@ -784,6 +1194,8 @@ impl Cli {
                 file,
                 criterion,
                 check,
+                validate,
+                replace,
             } => {
                 let raw: serde_json::Value = if let Some(file) = file {
                     serde_norway::from_str(
@@ -805,27 +1217,45 @@ impl Cli {
                         "checks": checks,
                     })
                 };
-                let spec = crate::config::goal_spec(&store.workspace, raw)?;
-                let owner = crate::supervision::origin_terminal(&store)?;
-                let goal = store.add(spec, owner)?;
-                print_goal(&goal, &store, self.json)?;
+                if *validate {
+                    return validate_contract(&store, raw, self.json);
+                }
+                // Contract validation states what is wrong; this names the next step.
+                const FIX: &str = "nothing was registered: fix the contract and check it with hgm add --file PATH --validate";
+                let spec = crate::config::goal_spec(&store.workspace, raw).context(FIX)?;
+                let goal = match replace {
+                    Some(id) => store.replace_contract(id, spec)?,
+                    None => {
+                        let owner = crate::supervision::origin_terminal(&store)?;
+                        store.add(spec, owner).context(FIX)?
+                    }
+                };
+                print_result(&goal, &store, self.json, self.verbose)?;
             }
-            Action::List { all } => {
-                let goals = visible_goals(&store, *all)?;
+            Action::List { all, finished } => {
+                let (goals, hidden) =
+                    without_finished(visible_goals(&store, *all)?, *finished || self.json);
                 if self.json {
                     println!("{}", serde_json::to_string_pretty(&goals)?);
                 } else {
-                    print_list(&goals);
+                    if !goals.is_empty() || hidden == 0 {
+                        print_list(&goals);
+                    }
+                    if hidden > 0 {
+                        println!("{}", hidden_line("list", hidden));
+                    }
                 }
             }
-            Action::Show { id } => print_goal(&store.load(id)?, &store, self.json)?,
+            Action::Show { id } => show(&store, &store.load(id)?, self.json)?,
             Action::Pause { id } => {
                 let goal = store.update(id, |g| g.request(Control::Pause))?;
+                crate::native_goal::clear_for(&store, Some(id), "the goal is paused").await?;
                 crate::watch::release_watches(&store, id, "stopped_by_goal")?;
                 print_goal(&goal, &store, self.json)?
             }
             Action::Cancel { id } => {
                 let goal = store.update(id, |g| g.request(Control::Cancel))?;
+                crate::native_goal::clear_for(&store, Some(id), "the goal is cancelled").await?;
                 crate::watch::release_watches(&store, id, "stopped_by_goal")?;
                 print_goal(&goal, &store, self.json)?
             }
@@ -834,13 +1264,18 @@ impl Cli {
                 &store,
                 self.json,
             )?,
-            Action::Complete { id, task, evidence } => print_goal(
+            Action::Complete { id, task, evidence } => print_result(
                 &store.update(id, |g| g.complete_manual(task, evidence.clone()))?,
                 &store,
                 self.json,
+                self.verbose,
             )?,
             Action::Accept { id, evidence } => {
                 let goal = runner::accept(&store, id, evidence, &CommandExecutor).await?;
+                if goal.status == GoalStatus::Completed {
+                    crate::native_goal::clear_for(&store, Some(id), "the goal is completed")
+                        .await?;
+                }
                 print_goal(&goal, &store, self.json)?;
                 ensure!(
                     goal.status == GoalStatus::Completed,
@@ -863,7 +1298,15 @@ impl Cli {
                 .await;
                 match result {
                     Ok(goal) => {
-                        print_goal(&goal, &store, self.json)?;
+                        if goal.status == GoalStatus::ReadyForReview {
+                            crate::native_goal::clear_for(
+                                &store,
+                                Some(&goal.id),
+                                "the goal is ready for review",
+                            )
+                            .await?;
+                        }
+                        print_result(&goal, &store, self.json, self.verbose)?;
                         ensure!(
                             goal.status == GoalStatus::ReadyForReview,
                             "goal needs attention: {:?}; inspect with hgm show {}",
@@ -873,12 +1316,13 @@ impl Cli {
                     }
                     Err(error) => {
                         if let Ok(goal) = store.load(&args.id) {
-                            print_goal(&goal, &store, self.json)?;
+                            print_result(&goal, &store, self.json, self.verbose)?;
                         }
                         return Err(error);
                     }
                 }
             }
+            Action::Queue { action } => queue(&store, action, self.json).await?,
             Action::Panel => crate::herdr::panel(&store).await?,
             Action::HerdrRun => crate::herdr::run_pane(&store).await?,
             Action::HerdrOpen | Action::HerdrBoard | Action::PluginFolder { .. } => {
@@ -891,50 +1335,232 @@ impl Cli {
 
 /// Manager-facing commands with exact arguments, generated from this build's
 /// CLI so the agent acts directly instead of rediscovering them with --help.
-pub(crate) fn command_reference() -> String {
-    const NOT_FOR_MANAGER: [&str; 5] =
-        ["manager", "panel", "herdr-open", "herdr-board", "herdr-run"];
+/// The factory queue commands are listed only where factory mode is on, so
+/// the reference stays the same for everyone else.
+pub(crate) fn command_reference(factory: bool) -> String {
+    const NOT_FOR_MANAGER: [&str; 6] = [
+        "manager",
+        "panel",
+        "herdr-open",
+        "herdr-board",
+        "herdr-run",
+        "queue",
+    ];
     let mut lines = vec![
         "## hgm command reference".to_string(),
         "Complete for this build. Run these directly; do not run --help to rediscover them. Add --json for machine-readable output.".into(),
+        "Native goal: the watch sets and clears /goal itself, on a Claude Code main under autonomy auto per loop.native_goal (assignment, settle or false), and on a Claude Code Goal Manager while a confirmed goal of the tab is in progress (config manager.native_goal: false turns that off). There is no command for it, never type /goal, and its verdict is an observation, not evidence.".into(),
     ];
-    for command in Cli::command().get_subcommands() {
+    let cli = Cli::command();
+    for command in cli.get_subcommands() {
         let name = command.get_name();
         if command.is_hide_set() || NOT_FOR_MANAGER.contains(&name) {
             continue;
         }
-        let mut usage = format!("hgm {name}");
-        for arg in command.get_arguments() {
-            if arg.is_global_set() || arg.is_hide_set() {
-                continue;
-            }
-            let value = arg
-                .get_value_names()
-                .and_then(|names| names.first())
-                .map(ToString::to_string)
-                .unwrap_or_else(|| arg.get_id().as_str().to_uppercase());
-            let mut piece = match arg.get_long() {
-                None => format!("<{value}>"),
-                Some(long) if arg.get_action().takes_values() => format!("--{long} <{value}>"),
-                Some(long) => format!("--{long}"),
-            };
-            if matches!(arg.get_action(), clap::ArgAction::Append) {
-                piece.push_str("...");
-            }
-            usage.push(' ');
-            usage.push_str(&if arg.is_required_set() {
-                piece
-            } else {
-                format!("[{piece}]")
-            });
+        lines.push(reference_line(&format!("hgm {name}"), command));
+    }
+    if factory && let Some(queue) = cli.find_subcommand("queue") {
+        for command in queue.get_subcommands() {
+            lines.push(reference_line(
+                &format!("hgm queue {}", command.get_name()),
+                command,
+            ));
         }
-        let about = command
-            .get_about()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        lines.push(format!("- `{usage}` — {about}"));
     }
     lines.join("\n")
+}
+/// One reference line: the command with its arguments, then what it does.
+fn reference_line(prefix: &str, command: &clap::Command) -> String {
+    let mut usage = prefix.to_string();
+    for arg in command.get_arguments() {
+        if arg.is_global_set() || arg.is_hide_set() {
+            continue;
+        }
+        let value = arg
+            .get_value_names()
+            .and_then(|names| names.first())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| arg.get_id().as_str().to_uppercase());
+        let mut piece = match arg.get_long() {
+            None => format!("<{value}>"),
+            Some(long) if arg.get_action().takes_values() => format!("--{long} <{value}>"),
+            Some(long) => format!("--{long}"),
+        };
+        if matches!(arg.get_action(), clap::ArgAction::Append) {
+            piece.push_str("...");
+        }
+        usage.push(' ');
+        usage.push_str(&if arg.is_required_set() {
+            piece
+        } else {
+            format!("[{piece}]")
+        });
+    }
+    let about = command
+        .get_about()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    format!("- `{usage}` — {about}")
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum QueueAction {
+    /// Queue a user-authored contract with the user's agreement to run it
+    Add {
+        #[arg(long)]
+        file: PathBuf,
+        /// The user's words agreeing to run this contract
+        #[arg(long)]
+        evidence: String,
+    },
+    /// List queued items with their state, agreement age and history
+    List {
+        /// Include removed items
+        #[arg(long)]
+        all: bool,
+    },
+    /// Hold a queued item back from dispatch; its history stays
+    Park {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Return a parked item to the queue
+    Unpark { id: String },
+    /// Take a queued, parked or failed item off the queue; its history stays
+    Remove { id: String },
+    /// Turn the oldest queued item into a confirmed goal, unless results
+    /// awaiting review or goals in progress reach the factory limits
+    Next,
+}
+
+/// Runs a factory queue command; each change holds the queue lock and first
+/// settles any claim a stopped dispatch left.
+async fn queue(store: &Store, action: &QueueAction, json: bool) -> Result<()> {
+    let config = crate::config::load(&store.workspace)?;
+    config.require_factory()?;
+    let queue = crate::queue::Queue::open(store)?;
+    let now = chrono::Utc::now();
+    if let QueueAction::List { all } = action {
+        let views = queue
+            .statuses()?
+            .iter()
+            .filter(|s| *all || s.state != crate::queue::State::Removed)
+            .map(|s| queue.view(s, now))
+            .collect::<Result<Vec<_>>>()?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&views)?);
+        } else if views.is_empty() {
+            println!(
+                "The queue is empty. Queue an agreed contract with hgm queue add --file CONTRACT --evidence TEXT."
+            );
+        } else {
+            views.iter().for_each(print_queue_item);
+        }
+        return Ok(());
+    }
+    let locked = queue.lock()?;
+    for note in locked.recover().await? {
+        eprintln!("{note}");
+    }
+    if let QueueAction::Next = action {
+        if let Some((reason, _)) = crate::factory::Gate::new(&store.list()?, &config).held() {
+            anyhow::bail!("hgm queue next refused: {reason}");
+        }
+        let next = locked
+            .statuses()?
+            .into_iter()
+            .find(|s| s.state == crate::queue::State::Queued)
+            .context("no queued item to dispatch; queue an agreed contract with hgm queue add")?;
+        // The goal belongs to the manager taking the item out (R1).
+        let owner = crate::supervision::origin_terminal(store)?;
+        let own = crate::factory::OwnCheckout::new(&config, &store.workspace);
+        let (_, goal) = locked
+            .dispatch(&next.id, owner, own == crate::factory::OwnCheckout::On)
+            .await?;
+        let view = locked.view(&locked.status(&next.id)?, now)?;
+        let skipped = match &own {
+            crate::factory::OwnCheckout::Skipped(reason) if goal.checkout.is_none() => {
+                Some(reason.as_str())
+            }
+            _ => None,
+        };
+        if json {
+            let mut value = serde_json::json!({"item": view, "goal": goal});
+            if let Some(reason) = skipped {
+                value["checkout_skipped"] = reason.into();
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "Queue item {} (agreed {} ago) is now goal {}; send its first assignment with hgm send --goal {} --task TASK",
+                next.id,
+                view["agreement_age"].as_str().unwrap_or_default(),
+                goal.id,
+                goal.id
+            );
+            if let Some(checkout) = &goal.checkout {
+                println!(
+                    "Checkout: {} (branch {}); linked assignments say to work there",
+                    checkout.path.display(),
+                    checkout.branch
+                );
+            }
+            if let Some(reason) = skipped {
+                println!("No own checkout: {reason}");
+            }
+            print_goal(&goal, store, false)?;
+        }
+        return Ok(());
+    }
+    let status = match action {
+        QueueAction::Add { file, evidence } => locked.add(
+            std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?,
+            std::path::absolute(file)?,
+            evidence,
+            crate::supervision::origin_terminal(store)?,
+            config.loop_defaults,
+        )?,
+        QueueAction::Park { id, reason } => locked.park(id, reason.as_deref())?,
+        QueueAction::Unpark { id } => locked.unpark(id)?,
+        QueueAction::Remove { id } => locked.remove(id)?,
+        QueueAction::List { .. } | QueueAction::Next => unreachable!("handled above"),
+    };
+    let view = locked.view(&status, now)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print_queue_item(&view);
+    }
+    Ok(())
+}
+fn print_queue_item(view: &serde_json::Value) {
+    let text = |key: &str| view[key].as_str().unwrap_or_default().to_string();
+    println!(
+        "{}  {}  agreed {} ago  {}",
+        text("id"),
+        text("state"),
+        text("agreement_age"),
+        text("objective")
+    );
+    if let Some(goal) = view["goal"].as_str() {
+        println!("  Goal: {goal}");
+    }
+    if let Some(checkout) = view.get("checkout") {
+        println!(
+            "  Checkout: {} (branch {}){}",
+            checkout["path"].as_str().unwrap_or_default(),
+            checkout["branch"].as_str().unwrap_or_default(),
+            if checkout["removed_at"].is_string() {
+                ", removed"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(reason) = view["reason"].as_str() {
+        println!("  Not dispatched: {reason}");
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -970,4 +1596,168 @@ pub(crate) enum RoleAction {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// What add, confirm, complete, run and resume print: the short result, or
+/// the whole goal with `--verbose`; `--json` prints the goal as before.
+fn print_result(goal: &crate::model::Goal, store: &Store, json: bool, verbose: bool) -> Result<()> {
+    if json || verbose {
+        return print_goal(goal, store, json);
+    }
+    crate::view::print_short(goal);
+    Ok(())
+}
+
+/// `add --validate`: the contract's problems and words per field, with nothing
+/// registered. What confirmation would refuse (autonomy auto without a command
+/// check) counts as a problem too. Fails when there is one.
+fn validate_contract(store: &Store, raw: serde_json::Value, json: bool) -> Result<()> {
+    use crate::model::SPEC_WORD_BUDGET;
+    let mut problems: Vec<String> = vec![];
+    let mut report = serde_json::json!({"registered": false});
+    match crate::config::goal_spec(&store.workspace, raw) {
+        Err(error) => problems.push(format!("{error:#}")),
+        Ok(spec) => {
+            if let Err(error) = crate::model::Goal::new(spec.clone(), store.workspace.clone()) {
+                problems.push(format!("{error:#}"));
+            }
+            // A budget refusal ends validation early; look past it for the rest.
+            let over = spec.words() > SPEC_WORD_BUDGET
+                && spec
+                    .long_spec_reason
+                    .as_ref()
+                    .is_none_or(|r| r.trim().is_empty());
+            if over {
+                let mut rest = spec.clone();
+                rest.long_spec_reason = Some("validate".into());
+                if let Err(error) = rest.validate() {
+                    problems.push(format!("{error:#}"));
+                }
+            }
+            if spec.loop_policy.autonomy == crate::contract::Autonomy::Auto
+                && spec.checks.is_empty()
+            {
+                problems.push(
+                    "autonomy auto needs at least one command check, so hgm confirm would refuse it: add a check, or set loop.autonomy: ask".into(),
+                );
+            }
+            report["words"] = spec.words().into();
+            report["budget"] = SPEC_WORD_BUDGET.into();
+            report["fields"] = spec
+                .word_fields()
+                .into_iter()
+                .map(|(field, words)| (field.to_string(), serde_json::Value::from(words)))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+            report["breakdown"] = spec.word_breakdown().into();
+        }
+    }
+    report["valid"] = problems.is_empty().into();
+    report["problems"] = problems.clone().into();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        if let Some(words) = report["words"].as_u64() {
+            println!(
+                "Contract checked, not registered: about {words} words (budget {SPEC_WORD_BUDGET}).\nWords by field: {}",
+                report["breakdown"].as_str().unwrap_or_default()
+            );
+        }
+        if problems.is_empty() {
+            println!("No problems: hgm add --file registers it as it is.");
+        } else {
+            println!("Problems:");
+            for problem in &problems {
+                println!("- {problem}");
+            }
+        }
+    }
+    ensure!(
+        problems.is_empty(),
+        "the contract has {} problem(s); nothing was registered",
+        problems.len()
+    );
+    Ok(())
+}
+
+/// `goals` without completed and cancelled ones unless `keep`, and how many
+/// were left out: status and list show what is still open by default.
+fn without_finished(goals: Vec<Goal>, keep: bool) -> (Vec<Goal>, usize) {
+    if keep {
+        return (goals, 0);
+    }
+    let total = goals.len();
+    let open: Vec<Goal> = goals
+        .into_iter()
+        .filter(|goal| !matches!(goal.status, GoalStatus::Completed | GoalStatus::Cancelled))
+        .collect();
+    let hidden = total - open.len();
+    (open, hidden)
+}
+/// The line that says how many finished goals `command` left out.
+fn hidden_line(command: &str, hidden: usize) -> String {
+    format!("({hidden} completed or cancelled goal(s) hidden; hgm {command} --finished shows them)")
+}
+
+/// A warning, never a refusal, when other confirmed goals that are not finished
+/// work in the same directory as `goal`: their uncommitted changes mix in one
+/// tree (2026-11-15: five goals in one tree). Names the checkout option.
+fn shared_work_dir(store: &Store, goal: &Goal) -> Result<Option<String>> {
+    let Ok(dir) = goal.work_dir() else {
+        return Ok(None);
+    };
+    let others: Vec<String> = store
+        .list()?
+        .into_iter()
+        .filter(|other| {
+            other.id != goal.id
+                && other.confirmed.is_some()
+                && !matches!(other.status, GoalStatus::Completed | GoalStatus::Cancelled)
+                && other.work_dir().is_ok_and(|d| d == dir)
+        })
+        .map(|other| other.id)
+        .collect();
+    if others.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "Warning: {} also work(s) in {}, confirmed and not finished, so their uncommitted changes mix in one tree. A goal can have its own checkout (a contract `checkout`, a Herdr worktree; see README, Own checkout); to keep this goal apart, cancel it and register it again with one, if the user agrees.",
+        others.join(", "),
+        dir.display()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_review_commands_are_in_the_manager_reference() {
+        let reference = command_reference(false);
+        for line in [
+            "`hgm decision <ID> <TEXT> --why <WHY> [--task <TASK>]`",
+            "`hgm follow-up <ID> <TEXT> [--task <TASK>]`",
+            "`hgm packet <ID>`",
+        ] {
+            assert!(reference.contains(line), "missing {line}: {reference}");
+        }
+    }
+
+    #[test]
+    fn the_queue_commands_join_the_reference_only_in_factory_mode() {
+        let off = command_reference(false);
+        assert!(!off.contains("hgm queue"), "{off}");
+        let on = command_reference(true);
+        assert!(on.starts_with(&off), "only lines are added");
+        for line in [
+            "`hgm queue add --file <FILE> --evidence <EVIDENCE>`",
+            "`hgm queue list [--all]`",
+            "`hgm queue park <ID> [--reason <REASON>]`",
+            "`hgm queue unpark <ID>`",
+            "`hgm queue remove <ID>`",
+            "`hgm queue next`",
+        ] {
+            assert!(on.contains(line), "missing {line}: {on}");
+        }
+    }
 }

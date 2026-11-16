@@ -15,10 +15,14 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
+/// The pinned original agent: its binding, live state and screen. `lines`
+/// asks for that many recent lines from Herdr's scrollback instead of the
+/// visible screen, so a long report that scrolled away can be read.
 pub(crate) async fn target(
     store: &Store,
     start: Option<&str>,
     adopt: Option<&str>,
+    lines: Option<u32>,
 ) -> Result<Value> {
     let mut session = session(store)?;
     let origin = session
@@ -58,13 +62,24 @@ pub(crate) async fn target(
         session.origin = Some(Target::from_value(&live)?);
         store.write_private(&path(store, &session.id, ".json")?, &session)?;
     }
+    let pane = live["pane_id"]
+        .as_str()
+        .context("missing pane")?
+        .to_string();
     let screen = if live.get("agent").is_some() {
-        screen(live["pane_id"].as_str().context("missing pane")?).await?
+        screen(&pane).await?
     } else {
         String::new()
     };
     crate::signals::apply_screen_state(&mut live, &screen);
     let mut result = json!({"binding":session.origin,"live":live,"screen":screen});
+    if let Some(lines) = lines {
+        // The state above is judged from the visible screen; the longer read
+        // is only for the manager to read.
+        let recent = crate::binding::recent_lines(&pane, lines).await?;
+        result["lines"] = json!(recent.lines().count());
+        result["screen"] = json!(recent);
+    }
     if let Some(adopted) = adopted {
         result["adopted"] = adopted;
     }
@@ -137,10 +152,13 @@ pub(crate) use crate::admission::{Assignment, Delivery};
 /// Providers observed to queue input typed while they work: Claude Code reads
 /// it at its next step, Copilot (1.0.110) lists it above its input line and
 /// runs it after the current step. Others are added only after a native check.
-const QUEUES_WHILE_WORKING: [&str; 2] = ["claude", "copilot"];
+pub(crate) const QUEUES_WHILE_WORKING: [&str; 2] = ["claude", "copilot"];
+/// How a send says the text left for the recipient without a confirmed
+/// admission: whoever sent it must not send it again.
+pub(crate) const DELIVERY_UNCONFIRMED: &str = "delivery not confirmed";
 /// Whether the recipient took the text out of its input line: the composer is
 /// empty again shortly after delivery. Text left there is never resent.
-async fn input_consumed(pane: &str, agent: &str) -> Result<bool> {
+pub(crate) async fn input_consumed(pane: &str, agent: &str) -> Result<bool> {
     for _ in 0..6 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if empty_composer(&screen(pane).await?, agent) {
@@ -153,7 +171,7 @@ async fn input_consumed(pane: &str, agent: &str) -> Result<bool> {
 /// or a helper role's target.
 async fn observe_recipient(store: &Store, helper: Option<&Target>) -> Result<(Value, String)> {
     let Some(helper) = helper else {
-        let observed = target(store, None, None).await?;
+        let observed = target(store, None, None, None).await?;
         let screen = observed["screen"]
             .as_str()
             .context("missing target screen")?
@@ -169,6 +187,71 @@ async fn observe_recipient(store: &Store, helper: Option<&Target>) -> Result<(Va
 }
 /// Sends to `main` (the pinned original agent) or to a helper role's target.
 pub(crate) async fn send(
+    store: &Store,
+    text: &str,
+    assignment: Assignment<'_>,
+    helper: Option<&Target>,
+) -> Result<Value> {
+    let goal = assignment.goal.map(String::from);
+    let (command, to) = (assignment.kind.command(), assignment.to.to_string());
+    let result = deliver(store, text, assignment, helper).await;
+    // A linked delivery refused before anything was typed is recorded, so
+    // attention accounting can count refusals; the refusal itself is unchanged.
+    if let (Err(error), Some(goal)) = (&result, goal.as_deref()) {
+        let reason = format!("{error:#}");
+        if !reason.contains(DELIVERY_UNCONFIRMED) && store.load(goal).is_ok() {
+            let first: String = reason
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            if let Err(error) = store.record(
+                goal,
+                "refused",
+                json!({"command": command, "to": to, "reason": first}),
+            ) {
+                eprintln!("The refusal was not recorded: {error:#}");
+            }
+        }
+    }
+    result
+}
+/// Queues the native goal behind an assignment to main when a watch of this
+/// tab observes that pane, and keeps its pending state in the watch record.
+/// From the watch's own delivery (`by_watch`) the caller keeps the state: the
+/// watch holds the operation lease and its record in memory.
+async fn queue_native_goal(
+    store: &Store,
+    context: &Session,
+    goal: &str,
+    task: Option<&str>,
+    pane: &str,
+    agent: &str,
+    by_watch: bool,
+) -> Result<Option<crate::native_goal::NativeGoalState>> {
+    let key = context.key();
+    let Ok(watch) = load_watch(store, &key) else {
+        return Ok(None);
+    };
+    if !watch.active || !watch.serves(goal) || watch.role != "main" || watch.origin.pane != pane {
+        return Ok(None);
+    }
+    let goal = store.load(goal)?;
+    let Some(state) = crate::native_goal::with_assignment(store, &goal, task, pane, agent).await?
+    else {
+        return Ok(None);
+    };
+    if !by_watch {
+        let _operation = wait_operation_lease(store, &key).await?;
+        let mut watch = load_watch(store, &key)?;
+        watch.native_goal = Some(state.clone());
+        save_watch(store, &watch)?;
+    }
+    Ok(Some(state))
+}
+async fn deliver(
     store: &Store,
     text: &str,
     assignment: Assignment<'_>,
@@ -198,13 +281,7 @@ pub(crate) async fn send(
             if active {
                 None
             } else {
-                let config = crate::config::load(&store.workspace)?;
-                let pacing = (
-                    config.idle_secs(),
-                    config.cooldown_secs(),
-                    config.max_wakes(),
-                );
-                Some((pacing, wait_operation_lease(store, &context.key()).await?))
+                Some(wait_operation_lease(store, &context.key()).await?)
             }
         }
         _ => None,
@@ -236,6 +313,15 @@ pub(crate) async fn send(
         );
     }
     let pane = live["pane_id"].as_str().context("missing pane")?;
+    // A task with write_paths starts its scope window before the text goes
+    // out, so every change the assignment leads to is compared. A snapshot
+    // that fails is reported; it never stops the delivery.
+    let scope = match (assignment.kind, assignment.goal, assignment.task) {
+        (Delivery::Assignment, Some(goal), Some(task)) => {
+            crate::scope::begin(store, &store.load(goal)?, task).err()
+        }
+        _ => None,
+    };
     let receipt_path = path(store, &format!("send-{}", uuid::Uuid::new_v4()), ".json")?;
     store.write_private(
         &receipt_path,
@@ -245,13 +331,18 @@ pub(crate) async fn send(
         .await
         .with_context(|| {
             format!(
-                "delivery not confirmed; inspect target before retrying. Receipt: {}",
+                "{DELIVERY_UNCONFIRMED}; inspect target before retrying. Receipt: {}",
                 receipt_path.display()
             )
         })?;
     // The text is delivered: from here on, failures are reported in the result
     // and never returned, so nobody resends what the recipient already has.
     let mut warnings = vec![];
+    if let Some(error) = scope {
+        warnings.push(format!(
+            "the write scope snapshot failed, so writes outside write_paths are not compared for this assignment: {error:#}"
+        ));
+    }
     let consumed = input_consumed(pane, agent).await.unwrap_or_else(|error| {
         warnings.push(format!("could not confirm the input was taken: {error:#}"));
         false
@@ -267,25 +358,73 @@ pub(crate) async fn send(
         unrecorded.push(format!("receipt: {error:#}"));
     }
     let mut result = json!({"status":"admitted","to":assignment.to,"interrupted":interrupting,"consumed":consumed,"receipt":receipt_path,"message":"Admission is not completion. Inspect the result when the goal wakes you."});
-    if let Some(goal) = assignment.goal {
-        if let Err(error) = store.record(
+    if let Some(goal) = assignment.goal
+        && let Err(error) = store.record(
             goal,
             assignment.kind.event(),
-            json!({"task": assignment.task, "text": text, "plan": assignment.plan, "to": assignment.to, "agent": agent, "pane": pane, "state": live["agent_status"], "seq": live["state_change_seq"], "interrupted": interrupting, "consumed": consumed, "receipt": receipt_path, "user_approval": assignment.user_approval}),
-        ) {
-            result["timeline_error"] = format!("{error:#}").into();
-            unrecorded.push(format!("timeline: {error:#}"));
+            json!({"task": assignment.task, "text": text, "plan": assignment.plan, "to": assignment.to, "agent": agent, "pane": pane, "state": live["agent_status"], "seq": live["state_change_seq"], "interrupted": interrupting, "consumed": consumed, "receipt": receipt_path, "user_approval": assignment.user_approval, "via": assignment.via}),
+        )
+    {
+        result["timeline_error"] = format!("{error:#}").into();
+        unrecorded.push(format!("timeline: {error:#}"));
+    }
+    // New work for a role settles its queued steps: the watch's own delivery
+    // used up the next one, the manager's direct send supersedes them all.
+    if assignment.kind == Delivery::Assignment {
+        let key = context.key();
+        let settled = match assignment.via {
+            Some(_) => crate::prepared::remove(store, &key, assignment.to),
+            None => crate::prepared::drop_steps(
+                store,
+                &key,
+                assignment.to,
+                None,
+                "superseded by a direct send",
+            )
+            .map(|_| ()),
+        };
+        if let Err(error) = settled {
+            warnings.push(format!(
+                "the prepared step for {} was not cleared: {error:#}",
+                assignment.to
+            ));
         }
-        if assignment.supervise {
-            result["supervision"] = match arming {
-                None => "already_active".into(),
-                Some((pacing, _operation)) => {
-                    match arm(store, goal, assignment.to, helper.cloned(), pacing).await {
-                        Ok(_) => "armed".into(),
-                        Err(error) => format!("not armed: {error:#}").into(),
-                    }
+    }
+    if let Some(goal) = assignment.goal
+        && assignment.supervise
+    {
+        result["supervision"] = match arming {
+            None => "already_active".into(),
+            Some(_operation) => {
+                match arm(
+                    store,
+                    goal,
+                    assignment.to,
+                    helper.cloned(),
+                    Pacing::default(),
+                )
+                .await
+                {
+                    Ok(_) => "armed".into(),
+                    Err(error) => format!("not armed: {error:#}").into(),
                 }
-            };
+            }
+        };
+    }
+    // `loop.native_goal: assignment`: the native goal follows the assignment
+    // as queued input, pending until the watch reads it (see native_goal).
+    if assignment.kind == Delivery::Assignment
+        && !assignment.plan
+        && assignment.to == "main"
+        && let Some(goal) = assignment.goal
+    {
+        let by_watch = assignment.via.is_some();
+        match queue_native_goal(store, &context, goal, assignment.task, pane, agent, by_watch).await {
+            Ok(Some(state)) => result["native_goal"] = json!(state),
+            Ok(None) => {}
+            Err(error) => warnings.push(format!(
+                "the native goal was not queued with the assignment ({error:#}); the watch sets it after the first settle"
+            )),
         }
     }
     if !unrecorded.is_empty() {
@@ -301,19 +440,82 @@ pub(crate) async fn send(
     Ok(result)
 }
 
+/// Watch timings asked for with `supervise`. A new watch takes the unset ones
+/// from the config; a running watch keeps them as they are.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Pacing {
+    pub idle_secs: Option<u64>,
+    pub cooldown_secs: Option<u64>,
+    pub max_wakes: Option<u32>,
+    pub idle_notice_secs: Option<u64>,
+    pub patrol_minutes: Option<u32>,
+}
+/// Applies `pacing` to a running watch and records the change on `goal`'s
+/// timeline. Returns what was applied and, with the reason, what was not.
+fn apply_pacing(store: &Store, watch: &mut Watch, goal: &str, pacing: Pacing) -> Result<Value> {
+    let before = json!({
+        "idle_secs": watch.idle_secs,
+        "cooldown_secs": watch.cooldown_secs,
+        "max_wakes": watch.max_wakes,
+        "idle_notice_secs": watch.idle_notice_secs,
+        "patrol_minutes": watch.patrol_minutes,
+    });
+    let mut applied = serde_json::Map::new();
+    let mut not_applied = serde_json::Map::new();
+    if let Some(secs) = pacing.idle_secs {
+        watch.idle_secs = secs;
+        applied.insert("idle_secs".into(), secs.into());
+    }
+    if let Some(secs) = pacing.cooldown_secs {
+        watch.cooldown_secs = secs;
+        applied.insert("cooldown_secs".into(), secs.into());
+    }
+    if let Some(secs) = pacing.idle_notice_secs {
+        watch.idle_notice_secs = secs;
+        applied.insert("idle_notice_secs".into(), secs.into());
+    }
+    if let Some(minutes) = pacing.patrol_minutes {
+        watch.patrol_minutes = Some(minutes);
+        applied.insert("patrol_minutes".into(), minutes.into());
+    }
+    if let Some(limit) = pacing.max_wakes {
+        if limit > watch.wakes {
+            watch.max_wakes = limit;
+            applied.insert("max_wakes".into(), limit.into());
+        } else {
+            not_applied.insert(
+                "max_wakes".into(),
+                format!(
+                    "{} wakes are already used; give more than that",
+                    watch.wakes
+                )
+                .into(),
+            );
+        }
+    }
+    if !applied.is_empty() {
+        save_watch(store, watch)?;
+        store.record(
+            goal,
+            "watch_pacing",
+            json!({"before": before, "applied": applied}),
+        )?;
+    }
+    Ok(json!({"applied": applied, "not_applied": not_applied}))
+}
 /// Watches `role` (`main`, or a helper whose target is `helper`) for `goal`.
 /// One watch per manager context: a linked send to another role retargets it.
+/// Timings given for a running watch apply to it at its next step; the
+/// result says which did not.
 pub(crate) async fn supervise(
     store: &Store,
     goal: &str,
     role: &str,
     helper: Option<Target>,
-    idle: u64,
-    cooldown: u64,
-    limit: u32,
-) -> Result<Watch> {
+    pacing: Pacing,
+) -> Result<(Watch, Value)> {
     let _operation = wait_operation_lease(store, &session(store)?.key()).await?;
-    arm(store, goal, role, helper, (idle, cooldown, limit)).await
+    arm(store, goal, role, helper, pacing).await
 }
 /// Arms the watch; the caller holds the supervision lock.
 async fn arm(
@@ -321,8 +523,8 @@ async fn arm(
     goal: &str,
     role: &str,
     helper: Option<Target>,
-    (idle, cooldown, limit): (u64, u64, u32),
-) -> Result<Watch> {
+    pacing: Pacing,
+) -> Result<(Watch, Value)> {
     let context = session(store)?;
     let key = context.key();
     let goal_state = store.load(goal)?;
@@ -386,7 +588,8 @@ async fn arm(
                 watch.same_wakes = 0;
                 save_watch(store, &watch)?;
             }
-            return Ok(watch);
+            let report = apply_pacing(store, &mut watch, goal, pacing)?;
+            return Ok((watch, report));
         }
         ensure!(
             !running,
@@ -416,6 +619,14 @@ async fn arm(
             }
         }
     }
+    let config = crate::config::load(&store.workspace)?;
+    let limit = pacing.max_wakes.unwrap_or(config.max_wakes());
+    // The manager keeps its goal across watches: a goal still set, or one
+    // the spin guard cleared, belongs to this manager session.
+    let manager_goal = previous
+        .as_ref()
+        .and_then(|w| w.manager_goal.clone())
+        .filter(|s| s.pane == manager.pane && s.session == manager.session);
     let watch = Watch {
         context: key.clone(),
         goal: goal.into(),
@@ -428,9 +639,21 @@ async fn arm(
         reanchored_for: None,
         manager,
         active: true,
-        idle_secs: idle,
-        cooldown_secs: cooldown,
+        idle_secs: pacing.idle_secs.unwrap_or(config.idle_secs()),
+        cooldown_secs: pacing.cooldown_secs.unwrap_or(config.cooldown_secs()),
         max_wakes: limit,
+        idle_notice_secs: pacing.idle_notice_secs.unwrap_or(config.idle_notice_secs()),
+        patrol_minutes: pacing.patrol_minutes,
+        pending_stop: false,
+        pending_at: 0,
+        idle_since: 0,
+        idle_noticed: false,
+        stuck: false,
+        retry: None,
+        prepared_held: None,
+        native_goal: None,
+        native_unavailable: false,
+        manager_goal,
         wakes: previous
             .as_ref()
             .filter(|w| w.goal == goal)
@@ -465,7 +688,17 @@ async fn arm(
     }
     save_watch(store, &watch)?;
     open_monitor(store, &context).await?;
-    Ok(watch)
+    let report = json!({
+        "applied": {
+            "idle_secs": watch.idle_secs,
+            "cooldown_secs": watch.cooldown_secs,
+            "max_wakes": watch.max_wakes,
+            "idle_notice_secs": watch.idle_notice_secs,
+            "patrol_minutes": watch.patrol_minutes,
+        },
+        "not_applied": {},
+    });
+    Ok((watch, report))
 }
 
 /// Opens the Goal watch tab for `context`. Call it only when no watch process

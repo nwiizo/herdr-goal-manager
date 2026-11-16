@@ -184,11 +184,22 @@ async fn run_inner(
             "Manual, failed, or dependency-blocked tasks remain. Inspect with show; complete manual work with evidence, or resume unfinished automatic work.",
         );
     }
+    // Asked before the checks run, so a missing verdict costs no check time,
+    // and again after they pass, in case a check changed the work dir.
+    let review_hold = |goal: &Goal| -> Result<Option<String>> {
+        Ok(crate::roles::review_hold(goal, &store.events(&goal.id)?))
+    };
+    if let Some(hold) = review_hold(&goal)? {
+        return finish(store, &goal.id, GoalStatus::NeedsInput, &hold);
+    }
     loop {
         let Some(passed) = verify(store, &goal.id, executor).await? else {
             return stop(store, &goal.id);
         };
         if passed {
+            if let Some(hold) = review_hold(&store.load(&goal.id)?)? {
+                return finish(store, &goal.id, GoalStatus::NeedsInput, &hold);
+            }
             let message = if goal.spec.checks.is_empty() {
                 "Tasks finished. No command checks are registered, so acceptance rests on the recorded evidence. Review it against the acceptance criteria, then accept with evidence or request a revision."
             } else {
@@ -258,11 +269,19 @@ async fn run_inner(
 }
 
 async fn verify(store: &Store, id: &str, executor: &impl Executor) -> Result<Option<bool>> {
+    // The state the checks judge; a later change makes their pass describe an
+    // earlier state. An unreadable work dir fails the checks themselves.
+    let fingerprint = store
+        .load(id)?
+        .work_dir()
+        .ok()
+        .and_then(|dir| crate::fingerprint::digest(dir).ok());
     let goal = store.update(id, |goal| {
         goal.verifications.push(Verification {
             started_at: Utc::now(),
             finished_at: None,
             results: vec![],
+            fingerprint: fingerprint.clone(),
         });
         Ok(())
     })?;
@@ -335,6 +354,25 @@ async fn verify(store: &Store, id: &str, executor: &impl Executor) -> Result<Opt
 
 /// Human acceptance rechecks the current workspace; an earlier pass cannot
 /// accept a now-failing outcome. Manual-only goals still require explicit evidence.
+/// Records the user's agreement to a goal's loop contract. Every refusal of
+/// [`Goal::confirm`] applies before anything changes, so a contract that
+/// cannot be confirmed creates no checkout; then the checkout is prepared,
+/// the protected-path baseline taken and the agreement saved.
+pub(crate) async fn confirm_goal(store: &Store, id: &str, evidence: &str) -> Result<Goal> {
+    let mut goal = store.load(id)?;
+    goal.clone().confirm(evidence.into(), String::new())?;
+    if goal.spec.checkout.is_some() && goal.checkout.is_none() {
+        goal.checkout = Some(crate::checkout::prepare(&goal).await?);
+    }
+    let digest = crate::contract::protected_digest(goal.work_dir()?, &goal.spec.protected_paths)?;
+    store.update(id, |g| {
+        if g.checkout.is_none() {
+            g.checkout = goal.checkout.clone();
+        }
+        g.confirm(evidence.into(), digest)
+    })
+}
+
 pub(crate) async fn accept(
     store: &Store,
     id: &str,

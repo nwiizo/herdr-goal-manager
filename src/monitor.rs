@@ -281,6 +281,10 @@ pub(crate) async fn watch_loop(store: &Store, options: LoopOptions) -> Result<()
         ..Display::default()
     };
     let result = drive(store, options, &mut display).await;
+    // An ended watch leaves no goal in progress to keep the manager going.
+    if let Err(error) = crate::manager_goal::after_watch(store).await {
+        eprintln!("The Goal Manager's native goal was not cleared: {error:#}");
+    }
     // Only a running watch keeps the tab and sidebar current: show how it
     // ended and clear the sidebar so it never shows a stale state.
     display
@@ -467,6 +471,12 @@ async fn drive(store: &Store, options: LoopOptions, display: &mut Display) -> Re
             return Err(error);
         }
         failures = 0;
+        // The manager's own native goal: a failed step leaves the watch running.
+        if watch.active
+            && let Err(error) = crate::manager_goal::step(store, &mut watch).await
+        {
+            eprintln!("The Goal Manager's native goal was not updated: {error:#}");
+        }
         save_watch(store, &watch)?;
         display
             .show(store, &watch, last.as_ref().map(|(live, _)| live))
@@ -479,7 +489,7 @@ async fn drive(store: &Store, options: LoopOptions, display: &mut Display) -> Re
         }
         drop(operation);
         if main && watch.handoff_due {
-            let observed = target(store, None, None).await?;
+            let observed = target(store, None, None, None).await?;
             if can_prompt(&observed["live"], observed["screen"].as_str().unwrap_or("")) {
                 crate::handoff::request(store).await?;
             }
@@ -500,7 +510,15 @@ async fn drive(store: &Store, options: LoopOptions, display: &mut Display) -> Re
                         // Between Herdr's events only the local record is read:
                         // a pause, cancel or wait ends this watch within seconds.
                         Ok(None) if Instant::now() < until => {
-                            if !load_watch(store, &context.key()).is_ok_and(|w| w.active) {
+                            let Ok(record) = load_watch(store, &context.key()) else {
+                                break Trigger::Poll;
+                            };
+                            // An await that started while a wake waits takes it now.
+                            if !record.active
+                                || (wake_ready(&record, chrono::Utc::now().timestamp())
+                                    && crate::wake_await::running(store, &context.key())
+                                        .unwrap_or(false))
+                            {
                                 break Trigger::Poll;
                             }
                         }
@@ -818,7 +836,7 @@ fn view_of(
     let assignments = assignments.or(Some((0, policy.max_assignments)));
     let time_left_minutes =
         time_left_minutes.or(policy.max_hours.map(|hours| i64::from(hours) * 60));
-    let patrol = i64::from(goal.spec.loop_policy.patrol_minutes) * 60;
+    let patrol = i64::from(watch.patrol(&goal)) * 60;
     let next_check_secs = (patrol > 0 && state == "working" && ended.is_none())
         .then(|| watch.last_patrol + patrol - now.timestamp());
     let last_observation = (watch.last_observation_at > 0).then(|| {
@@ -858,7 +876,20 @@ fn view_of(
         wakes_used: watch.wakes,
         wakes_max: watch.max_wakes,
         next_check_secs,
-        patrol_minutes: goal.spec.loop_policy.patrol_minutes,
+        patrol_minutes: watch.patrol(&goal),
+        idle_secs: watch
+            .idle_for(now.timestamp())
+            .filter(|_| ended.is_none() && crate::watch::short_of_completion(&goal)),
+        idle_notice_secs: watch.idle_notice_secs,
+        native_goal: watch.native_goal.as_ref().map(|state| {
+            crate::cli::native_text(
+                &serde_json::json!({"set": state.is_set(), "outcome": state.outcome}),
+            )
+        }),
+        manager_goal: watch
+            .manager_goal
+            .as_ref()
+            .map(|state| crate::manager_goal::text(&state.view())),
         time_left_minutes,
         assignments,
         events: events[recent..]

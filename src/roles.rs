@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 
 const IMPL_GUIDE: &str = include_str!("../prompts/impl.md");
@@ -33,7 +32,7 @@ impl RoleKind {
             Self::Reviewer => "reviewer",
         }
     }
-    fn guide(self) -> &'static str {
+    pub(crate) fn guide(self) -> &'static str {
         match self {
             Self::Impl => IMPL_GUIDE,
             Self::Reviewer => REVIEWER_GUIDE,
@@ -42,7 +41,7 @@ impl RoleKind {
     /// The only hgm commands an agent in this role may run.
     pub(crate) fn commands(self) -> &'static [&'static str] {
         match self {
-            Self::Impl => &["show", "report"],
+            Self::Impl => &["show", "report", "decision", "follow-up"],
             Self::Reviewer => &["show", "review-submit"],
         }
     }
@@ -390,37 +389,6 @@ pub(crate) async fn stop(store: &Store, name: &str, force: bool) -> Result<Value
     Ok(json!({"role": name, "stopped": true}))
 }
 
-/// What the workspace contains now: git state when it is a repository,
-/// otherwise a digest of every file. A review is valid only for this state.
-pub(crate) fn workspace_digest(workspace: &Path) -> Result<String> {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(workspace)
-            .output()
-    };
-    match git(&["rev-parse", "--is-inside-work-tree"]) {
-        Ok(output) if output.status.success() => {
-            let mut hasher = Sha256::new();
-            for args in [
-                &["rev-parse", "HEAD"][..],
-                &["status", "--porcelain=v1", "-uall"],
-                &["diff", "HEAD", "--binary"],
-            ] {
-                hasher.update(git(args)?.stdout);
-            }
-            let untracked = git(&["ls-files", "--others", "--exclude-standard", "-z"])?.stdout;
-            for file in untracked.split(|b| *b == 0).filter(|f| !f.is_empty()) {
-                let name = String::from_utf8_lossy(file);
-                hasher.update(file);
-                hasher.update(std::fs::read(workspace.join(name.as_ref())).unwrap_or_default());
-            }
-            Ok(format!("{:x}", hasher.finalize()))
-        }
-        _ => crate::contract::protected_digest(workspace, &[".".into()]),
-    }
-}
-
 /// The calling role, from the environment hgm set when it started the agent.
 fn calling_role(store: &Store) -> Result<Role> {
     let name = std::env::var("HGM_ROLE").context("only a helper role runs this command")?;
@@ -428,6 +396,21 @@ fn calling_role(store: &Store) -> Result<Role> {
     load(store, &context)?
         .remove(&name)
         .with_context(|| format!("role {name} is not pinned in its manager"))
+}
+
+/// The helper role running this hgm, refused unless its kind may run
+/// `command`; `None` outside a helper role (main or the manager).
+pub(crate) fn caller(store: &Store, command: &str) -> Result<Option<String>> {
+    if std::env::var_os("HGM_ROLE").is_none() {
+        return Ok(None);
+    }
+    let role = calling_role(store)?;
+    ensure!(
+        role.kind.commands().contains(&command),
+        "the {} role may not run hgm {command}",
+        role.name
+    );
+    Ok(Some(role.name))
 }
 
 /// Points the manager at news from a helper: the next wake carries `note`.
@@ -488,7 +471,7 @@ pub(crate) async fn request_review(
         bail!("{}; nothing was sent", refusal.explain(reviewer));
     }
     let review = format!("r-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let digest = workspace_digest(goal.work_dir()?)?;
+    let digest = crate::fingerprint::digest(goal.work_dir()?)?;
     let list = |items: &[String]| {
         if items.is_empty() {
             "(none)".to_string()
@@ -497,7 +480,7 @@ pub(crate) async fn request_review(
         }
     };
     let request = format!(
-        "Review request {review} for goal {goal_id}. You are an independent reviewer: you did not write this work; do not change files.\nWhat to review: {text}\nGoal: {}\nAcceptance: {}\nInvariants: {}\nOut of scope: {}\nSubmit once, with findings as a JSON array on stdin:\nhgm review-submit {goal_id} --review {review} --verdict approve|revise --findings - <<'EOF'\n[{{\"severity\":\"blocking\",\"where\":\"path:line\",\"issue\":\"what is wrong\",\"evidence\":\"how you know\"}}]\nEOF\nUse revise when any finding is blocking; approve allows only advisory findings (or []).",
+        "Review request {review} for goal {goal_id}. You are an independent reviewer: you did not write this work; do not change files.\nWhat to review: {text}\nGoal: {}\nAcceptance: {}\nInvariants: {}\nOut of scope: {}\nSubmit once, with findings as a JSON array on stdin:\nhgm review-submit {goal_id} --review {review} --verdict approve|revise --findings - <<'EOF'\n[{{\"severity\":\"blocking\",\"where\":\"path:line\",\"issue\":\"what is wrong\",\"evidence\":\"how you know\"}}]\nEOF\nJudge the files and the diff, not a summary of them. A finding is blocking only when you can show it: a command that fails or a line that is wrong, named in where and evidence. Everything else is advisory and becomes a follow-up. Use revise when any finding is blocking; approve allows only advisory findings (or []).",
         goal.spec.objective,
         list(&goal.spec.acceptance),
         list(&goal.spec.invariants),
@@ -586,12 +569,16 @@ pub(crate) async fn submit_review(
         (verdict == Verdict::Revise) == (blocking > 0),
         "revise needs at least one blocking finding, and approve allows none"
     );
-    let current = workspace_digest(store.load(goal_id)?.work_dir()?)? == request.detail["digest"];
+    // The verdict keeps the state it was given for; once the work dir no
+    // longer has this fingerprint, the verdict is shown as stale.
+    let fingerprint = crate::fingerprint::digest(store.load(goal_id)?.work_dir()?)?;
+    let current = fingerprint == request.detail["digest"];
     store.record(
         goal_id,
         "reviewed",
         json!({"review": review, "reviewer": role.name, "agent": role.target.agent,
-               "verdict": verdict, "findings": findings, "current": current}),
+               "verdict": verdict, "findings": findings, "current": current,
+               "fingerprint": fingerprint}),
     )?;
     let note = format!(
         "review {review} from {}: {verdict:?} with {blocking} blocking finding(s){}; read it with hgm log {goal_id}",
@@ -616,42 +603,268 @@ pub(crate) async fn submit_review(
     )
 }
 
+/// Every review verdict on a goal, oldest first, with whether it still
+/// describes the work: `current` when the work dir has the fingerprint the
+/// verdict was given for, `stale` when it changed since, `unknown` when the
+/// work dir cannot be read. A verdict submitted on a work dir that changed
+/// during its review is stale from the start. A verdict recorded before
+/// fingerprints were stored is compared through its request.
+pub(crate) fn review_states(
+    goal: &crate::model::Goal,
+    events: &[crate::events::Event],
+    fingerprints: &mut crate::fingerprint::Fingerprints,
+) -> Vec<Value> {
+    let mut current: Option<Option<String>> = None;
+    let mut states = vec![];
+    for event in events.iter().filter(|e| e.kind == "reviewed") {
+        let d = &event.detail;
+        let given = d["fingerprint"].as_str().map(String::from).or_else(|| {
+            events
+                .iter()
+                .find(|e| e.kind == "review_requested" && e.detail["review"] == d["review"])
+                .and_then(|request| request.detail["digest"].as_str())
+                .map(String::from)
+        });
+        let now = current
+            .get_or_insert_with(|| goal.work_dir().ok().and_then(|dir| fingerprints.of(dir)));
+        let fresh = match (now.as_deref(), given) {
+            _ if d["current"] == false => "stale",
+            (Some(now), Some(given)) if now == given => "current",
+            (Some(_), _) => "stale",
+            (None, _) => "unknown",
+        };
+        let findings = d["findings"].as_array().map_or(&[][..], Vec::as_slice);
+        let blocking = findings
+            .iter()
+            .filter(|f| f["severity"] == "blocking")
+            .count();
+        states.push(json!({
+            "review": d["review"], "reviewer": d["reviewer"], "agent": d["agent"],
+            "verdict": d["verdict"], "at": event.at, "blocking": blocking,
+            "advisory": findings.len() - blocking, "current_at_submit": d["current"],
+            "fresh": fresh,
+        }));
+    }
+    states
+}
+
+/// Under `loop.require_review`, why the goal may not move to review yet, with
+/// the commands to run next; `None` when it may (or the setting is off). It
+/// needs a current approving verdict from a reviewer whose provider received
+/// none of the goal's linked assignments or corrections, and no reviewer's
+/// latest current verdict may ask for a revision.
+pub(crate) fn review_hold(
+    goal: &crate::model::Goal,
+    events: &[crate::events::Event],
+) -> Option<String> {
+    if !goal.spec.loop_policy.require_review {
+        return None;
+    }
+    let id = &goal.id;
+    let workers: std::collections::BTreeSet<&str> = events
+        .iter()
+        .filter(|e| matches!(e.kind.as_str(), "assigned" | "correction"))
+        .filter_map(|e| e.detail["agent"].as_str())
+        .collect();
+    let states = review_states(goal, events, &mut Default::default());
+    let mut latest: BTreeMap<&str, &Value> = BTreeMap::new();
+    for state in &states {
+        if let Some(reviewer) = state["reviewer"].as_str() {
+            latest.insert(reviewer, state);
+        }
+    }
+    let text = |state: &Value, key: &str| state[key].as_str().unwrap_or_default().to_string();
+    if let Some(revise) = latest
+        .values()
+        .find(|s| s["fresh"] == "current" && s["verdict"] == "revise")
+    {
+        return Some(format!(
+            "loop.require_review: review {} from {} asks for a revision with {} blocking finding(s); fix them, ask again with hgm review {id} TEXT, then run hgm resume {id}",
+            text(revise, "review"),
+            text(revise, "reviewer"),
+            revise["blocking"]
+        ));
+    }
+    let other_provider = |s: &Value| s["agent"].as_str().is_some_and(|a| !workers.contains(a));
+    if latest
+        .values()
+        .any(|s| s["fresh"] == "current" && s["verdict"] == "approve" && other_provider(s))
+    {
+        return None;
+    }
+    let reason = match states.iter().rev().find(|s| s["verdict"] == "approve") {
+        None => "no reviewer has approved this goal".to_string(),
+        Some(s) if s["fresh"] != "current" => format!(
+            "approving review {} is stale: the work dir changed after it",
+            text(s, "review")
+        ),
+        Some(s) => format!(
+            "approving review {} came from {}, a provider that worked on this goal",
+            text(s, "review"),
+            s["agent"].as_str().unwrap_or("an unknown provider")
+        ),
+    };
+    let workers = if workers.is_empty() {
+        "the worker's".to_string()
+    } else {
+        workers.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    Some(format!(
+        "loop.require_review: {reason}. Start a reviewer on a provider other than {workers} (hgm role start reviewer --agent OTHER) if none runs, ask with hgm review {id} TEXT, then run hgm resume {id}"
+    ))
+}
+
 /// Records an implementer's report and points the manager at it.
+/// The longest report, in words (two CJK characters count as one): a worker's
+/// full report with plan, changes and verification ran to a few thousand
+/// characters on 2026-11-15.
+pub(crate) const REPORT_WORD_BUDGET: usize = 3_000;
+
+/// Records a worker's report on the goal's timeline in full, from `text` or
+/// the file at `file`, so the manager reads it with `hgm log` or the packet
+/// instead of the provider's transcript. main, impl and the manager may
+/// report; a reviewer answers with `review-submit`. Like a decision, a report
+/// completes nothing.
 pub(crate) fn report(
     store: &Store,
     goal_id: &str,
     task: Option<&str>,
-    text: &str,
+    text: Option<&str>,
+    file: Option<&Path>,
 ) -> Result<Value> {
-    let role = calling_role(store)?;
-    ensure!(role.kind == RoleKind::Impl, "only an impl role reports");
+    let by = crate::packet::recorder(store, "report")?;
+    let text = match (text, file) {
+        (Some(text), None) => text.to_string(),
+        (None, Some(file)) => std::fs::read_to_string(file)
+            .with_context(|| format!("read the report from {}", file.display()))?,
+        _ => bail!("give the report as TEXT or with --file PATH, not both"),
+    };
+    let text = text.trim();
     let words = crate::model::word_units(text);
     ensure!(
-        (1..=crate::admission::ASSIGNMENT_WORD_BUDGET).contains(&words),
-        "report in 1..{} words",
-        crate::admission::ASSIGNMENT_WORD_BUDGET
+        (1..=REPORT_WORD_BUDGET).contains(&words),
+        "a report takes 1 to {REPORT_WORD_BUDGET} words; this one has about {words}: shorten it, or keep the details in a file in the work dir and name that file in the report"
     );
-    store.load(goal_id)?;
-    store.record(
-        goal_id,
-        "report",
-        json!({"from": role.name, "task": task, "text": text}),
-    )?;
-    let short: String = text.chars().take(200).collect();
-    nudge_manager(
-        store,
-        goal_id,
-        &format!(
-            "{} reported on {}: {short}",
-            role.name,
-            task.unwrap_or("the goal")
-        ),
-    )?;
-    Ok(json!({"recorded": true}))
+    crate::packet::record_target(store, goal_id, task)?;
+    let mut detail = json!({"from": by, "task": task, "text": text});
+    if let Some(file) = file {
+        detail["file"] = json!(file);
+    }
+    store.record(goal_id, "report", detail)?;
+    // A helper's report wakes the manager; main's goes with the wake its
+    // settling brings, among the events since the last one.
+    if std::env::var_os("HGM_ROLE").is_some() {
+        let short: String = text.chars().take(200).collect();
+        nudge_manager(
+            store,
+            goal_id,
+            &format!("{by} reported on {}: {short}", task.unwrap_or("the goal")),
+        )?;
+    }
+    Ok(json!({"recorded": "report", "by": by, "words": words}))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::events::Event;
+    use serde_json::json;
+
+    #[test]
+    fn a_verdict_goes_stale_when_the_work_dir_changes_and_require_review_needs_another_provider()
+    -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let store = crate::store::Store::new(workspace.path(), state.path())?;
+        std::fs::write(workspace.path().join("a.rs"), "one")?;
+        let goal = store.add(
+            serde_norway::from_str(
+                "objective: o\nacceptance: [a]\nloop: {require_review: true}\n",
+            )?,
+            None,
+        )?;
+        let fingerprint = crate::fingerprint::digest(workspace.path())?;
+        let event = |kind: &str, detail: serde_json::Value| Event::new(&goal.id, kind, detail);
+        let verdict = |review: &str, reviewer: &str, agent: &str, verdict: &str| {
+            let blocking = if verdict == "revise" {
+                json!([{"severity": "blocking", "issue": "fails"}])
+            } else {
+                json!([])
+            };
+            event(
+                "reviewed",
+                json!({"review": review, "reviewer": reviewer, "agent": agent,
+                       "verdict": verdict, "findings": blocking, "current": true,
+                       "fingerprint": fingerprint}),
+            )
+        };
+        let hold = |events: &[Event]| super::review_hold(&goal, events);
+        let mut events = vec![event(
+            "assigned",
+            json!({"task": "work", "agent": "claude"}),
+        )];
+        assert!(
+            hold(&events)
+                .unwrap()
+                .contains("no reviewer has approved this goal")
+        );
+        events.push(verdict("r-1", "reviewer", "claude", "approve"));
+        let same = hold(&events).unwrap();
+        assert!(
+            same.contains("came from claude, a provider that worked on this goal")
+                && same.contains("other than claude")
+                && same.contains(&format!("hgm resume {}", goal.id)),
+            "{same}"
+        );
+        events.push(verdict("r-2", "second", "codex", "approve"));
+        assert_eq!(hold(&events), None);
+        // A current revise from any reviewer holds it again.
+        events.push(verdict("r-3", "reviewer", "claude", "revise"));
+        assert!(
+            hold(&events)
+                .unwrap()
+                .contains("review r-3 from reviewer asks for a revision with 1 blocking")
+        );
+        events.pop();
+
+        let states = super::review_states(&goal, &events, &mut Default::default());
+        assert!(states.iter().all(|s| s["fresh"] == "current"), "{states:?}");
+        std::fs::write(workspace.path().join("a.rs"), "changed")?;
+        let states = super::review_states(&goal, &events, &mut Default::default());
+        assert!(states.iter().all(|s| s["fresh"] == "stale"), "{states:?}");
+        assert!(
+            hold(&events)
+                .unwrap()
+                .contains("approving review r-2 is stale")
+        );
+
+        // Without the setting, nothing is held.
+        let plain = store.add(
+            serde_norway::from_str("objective: o\nacceptance: [a]\n")?,
+            None,
+        )?;
+        assert_eq!(super::review_hold(&plain, &[]), None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_reviewer_guide_judges_the_diff_and_blocks_only_on_what_it_can_show() {
+        let guide = super::REVIEWER_GUIDE;
+        for rule in [
+            "Judge the artifact and the diff, not the summary.",
+            "Block only on a problem you can show: a command that fails",
+            "or a line that is wrong",
+            "Everything else",
+            "is an\n  advisory finding; hgm keeps advisory findings as follow-ups",
+            "it is shown as stale",
+        ] {
+            assert!(guide.contains(rule), "missing {rule:?}");
+        }
+        assert_eq!(
+            super::RoleKind::Reviewer.commands(),
+            ["show", "review-submit"]
+        );
+    }
+
     #[test]
     fn multi_line_agent_arguments_are_refused_before_launch() {
         let ok = vec![

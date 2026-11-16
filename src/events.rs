@@ -122,6 +122,10 @@ pub(crate) fn transitions(before: Option<&Goal>, after: &Goal) -> Vec<Event> {
 }
 
 /// Title, reason and sound for events that need the user's attention.
+/// Whether `event` sends the person a notification (see [`attention`]).
+pub(crate) fn notifies_person(event: &Event) -> bool {
+    attention(event).is_some()
+}
 fn attention(event: &Event) -> Option<(&'static str, String, &'static str)> {
     let text = |key: &str| event.detail[key].as_str().unwrap_or_default().to_string();
     match event.kind.as_str() {
@@ -131,6 +135,12 @@ fn attention(event: &Event) -> Option<(&'static str, String, &'static str)> {
             _ => None,
         },
         "waiting" => Some(("Goal is waiting for you", text("reason"), "request")),
+        "attention" if event.detail["cause"] == crate::watch::IDLE_NOTICE => {
+            Some(("Worker idle short of completion", text("reason"), "request"))
+        }
+        "attention" if event.detail["cause"] == crate::manager_goal::SPINNING => {
+            Some(("Goal Manager's /goal cleared", text("reason"), "request"))
+        }
         "attention" => Some(("Original agent needs you", text("reason"), "request")),
         "watch_ended" if event.detail["notify"] == true => {
             Some(("Goal monitoring stopped", text("reason"), "request"))
@@ -235,10 +245,31 @@ pub(crate) fn since(text: &str) -> Result<DateTime<Utc>> {
 }
 
 /// One readable line per event for `hgm log`.
+/// The full text an event carries beyond its summary line: a report, which
+/// the manager reads here rather than in the provider's transcript.
+pub(crate) fn full_text(event: &Event) -> Option<&str> {
+    (event.kind == "report")
+        .then(|| event.detail["text"].as_str())
+        .flatten()
+        .filter(|text| text.contains('\n') || text.chars().count() > 120)
+}
+/// `at` in the local time zone with its offset, for human-readable output;
+/// JSON keeps UTC. On 2026-11-15 wakes showed local time and `hgm log` UTC,
+/// and the manager misread a one-minute stop as four.
+pub(crate) fn local_time(at: DateTime<Utc>) -> String {
+    at.with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+/// The local clock time of `at` (hours and minutes), where the date and offset
+/// are already shown nearby.
+pub(crate) fn local_clock(at: DateTime<Utc>) -> String {
+    at.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
 pub(crate) fn describe(event: &Event) -> String {
     format!(
         "{}  {}  {:<14} {}",
-        event.at.format("%Y-%m-%d %H:%M:%S"),
+        local_time(event.at),
         &event.goal[..event.goal.len().min(10)],
         event.kind,
         summary(event)
@@ -272,7 +303,59 @@ pub(crate) fn summary(event: &Event) -> String {
         "guidance" => text("note"),
         "waiting" | "attention" | "watch_ended" => text("reason"),
         "accepted" | "confirmed" => text("evidence"),
+        "patrol" if d["quiet"] == true => {
+            format!("{} (progressing, nothing found: no wake)", text("reason"))
+        }
         "patrol" => text("reason"),
+        "prepared" => format!("{}: {}", text("task"), text("text")),
+        "prepared_held" | "prepared_withdrawn" => text("reason"),
+        "provider_error" | "provider_continue" => text("line"),
+        "decision" => format!(
+            "{}{}: {} (why: {})",
+            text("by"),
+            d["task"]
+                .as_str()
+                .map(|t| format!(" [{t}]"))
+                .unwrap_or_default(),
+            text("what"),
+            text("why")
+        ),
+        "native_goal_queued" => format!(
+            "queued with the assignment for {}; pending until Goal set: shows",
+            text("task")
+        ),
+        "manager_goal_set" => match (d["delivery"].as_str(), d["via"].as_str()) {
+            (Some(_), _) => format!("not confirmed: {}", text("why")),
+            (_, Some("queued")) if d["pending"] == true => {
+                "queued on the Goal Manager; pending until Goal set: shows".into()
+            }
+            _ => "set on the Goal Manager".into(),
+        },
+        "manager_goal" => format!("{}: {}", text("outcome"), text("line")),
+        "manager_goal_cleared" => text("reason"),
+        "refused" => format!("{} to {}: {}", text("command"), text("to"), text("reason")),
+        "report" => format!(
+            "{}{}: {}",
+            text("from"),
+            d["task"]
+                .as_str()
+                .map(|t| format!(" [{t}]"))
+                .unwrap_or_default(),
+            text("text").lines().next().unwrap_or_default()
+        ),
+        "follow_up" => format!(
+            "{}{}: {}",
+            text("by"),
+            d["task"]
+                .as_str()
+                .map(|t| format!(" [{t}]"))
+                .unwrap_or_default(),
+            text("text")
+        ),
+        "no_progress" => d["retry"].as_str().map_or_else(
+            || "no retry notice".into(),
+            |line| format!("retrying: {line}"),
+        ),
         "watch_joined" => format!(
             "shares the watch on {} ({} goals)",
             text("pane"),

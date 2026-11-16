@@ -17,6 +17,68 @@ pub(crate) enum Autonomy {
     Ask,
 }
 
+/// When hgm sets a worker's native goal (see `LoopPolicy::native_goal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeGoalMode {
+    /// As queued input right after a linked non-plan assignment is delivered.
+    Assignment,
+    /// Once the worker first settles after the assignment (before 2026-11-16).
+    Settle,
+    /// Never.
+    Off,
+}
+impl Serialize for NativeGoalMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Assignment => serializer.serialize_str("assignment"),
+            Self::Settle => serializer.serialize_str("settle"),
+            // `false`, as stored contracts and configs already write it.
+            Self::Off => serializer.serialize_bool(false),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for NativeGoalMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Name(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            // `true` was the only way to say "on", which set it after a settle.
+            Raw::Flag(true) => Ok(Self::Settle),
+            Raw::Flag(false) => Ok(Self::Off),
+            Raw::Name(name) => match name.as_str() {
+                "assignment" => Ok(Self::Assignment),
+                "settle" => Ok(Self::Settle),
+                "off" => Ok(Self::Off),
+                other => Err(serde::de::Error::custom(format!(
+                    "loop.native_goal must be assignment, settle or false, not {other}"
+                ))),
+            },
+        }
+    }
+}
+
+/// When a patrol of a working worker wakes the manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PatrolWake {
+    /// Only with a finding: no visible progress since the previous patrol, or
+    /// a change outside the task's write_paths. A patrol that finds the worker
+    /// progressing with nothing to report is recorded, and nobody is woken.
+    #[default]
+    Finding,
+    /// Every patrol wakes the manager, as before 2026-11-16.
+    Always,
+}
+impl PatrolWake {
+    fn is_finding(&self) -> bool {
+        *self == Self::Finding
+    }
+}
+
 /// When to stop iterating and escalate to a person.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -46,6 +108,23 @@ pub(crate) struct LoopPolicy {
     /// Minutes of work between goal checks (the worker restates the goal so
     /// long work does not drift); 30..=60.
     pub reanchor_minutes: u32,
+    /// When to set the provider's native goal (`/goal`) on a Claude Code
+    /// worker under autonomy auto: with each linked assignment (`assignment`,
+    /// written into new contracts), after the worker first settles (`settle`,
+    /// what an unset or `true` field of a stored contract means), or never
+    /// (`false`). Only Claude Code has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_goal: Option<NativeGoalMode>,
+    /// `hgm run` moves the goal to review only with a current approving
+    /// verdict from a reviewer running another provider than the workers,
+    /// and while no reviewer's latest current verdict asks for a revision.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_review: bool,
+    /// Whether a patrol that finds the worker progressing with no finding
+    /// wakes the manager (`always`) or is only recorded (`finding`, the
+    /// default: on 2026-11-15 about thirty such wakes led to no action).
+    #[serde(skip_serializing_if = "PatrolWake::is_finding")]
+    pub patrol_wake: PatrolWake,
 }
 
 /// A user-authored shell command whose success means the loop must stop.
@@ -65,8 +144,8 @@ impl Default for LoopPolicy {
         Self {
             max_assignments: 3,
             max_hours: None,
-            // User decision (2026-11-13): check main every 5 minutes.
-            patrol_minutes: 5,
+            // User decision (2026-11-15): check main every 3 minutes (was 5).
+            patrol_minutes: 3,
             autonomy: Autonomy::Auto,
             stop_when: vec![],
             // User decision (2026-11-13): hand off at 85%, never compact.
@@ -77,6 +156,9 @@ impl Default for LoopPolicy {
             check_on_settle: true,
             // User decision (2026-11-13): re-read the goal every 30-60 minutes.
             reanchor_minutes: 45,
+            native_goal: None,
+            require_review: false,
+            patrol_wake: PatrolWake::Finding,
         }
     }
 }

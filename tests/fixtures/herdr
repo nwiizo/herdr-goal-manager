@@ -5,11 +5,43 @@ case "$1 $2" in
   "pane process-info") cat "$FIXTURE_ROOT/process.json" ;;
   "agent list") cat "$FIXTURE_ROOT/agents.json" ;;
   "agent read")
-    if [ "$3" = w1:p1 ]; then cat "$FIXTURE_ROOT/target.screen"; else cat "$FIXTURE_ROOT/manager.screen"; fi ;;
+    if [ "$3" = w1:p1 ]; then
+      if [ "$5" = recent-unwrapped ] && [ -f "$FIXTURE_ROOT/target.recent" ]; then cat "$FIXTURE_ROOT/target.recent"; else cat "$FIXTURE_ROOT/target.screen"; fi
+      # What the worker shows from the next read on: a screen that changed
+      # after an observation (a dialog opening while checks run).
+      if [ -f "$FIXTURE_ROOT/after-read.screen" ]; then mv "$FIXTURE_ROOT/after-read.screen" "$FIXTURE_ROOT/target.screen"; fi
+    else cat "$FIXTURE_ROOT/manager.screen"; fi ;;
   "agent prompt")
     printf '%s\n%s\n' "$3" "$4" >> "$FIXTURE_ROOT/sent.txt"
     if [ -f "$FIXTURE_ROOT/fail-send" ]; then exit 1; fi
+    if [ -f "$FIXTURE_ROOT/fail-send-$3" ]; then exit 1; fi
     if [ -f "$FIXTURE_ROOT/after-prompt.screen" ]; then cp "$FIXTURE_ROOT/after-prompt.screen" "$FIXTURE_ROOT/target.screen"; fi
+    if [ "$3" != w1:p1 ] && [ -f "$FIXTURE_ROOT/after-prompt-manager.screen" ]; then cp "$FIXTURE_ROOT/after-prompt-manager.screen" "$FIXTURE_ROOT/manager.screen"; fi
+    # Claude Code answers a /goal line it takes as a command (not one it took
+    # as pasted text: goal-pasted).
+    if [ "$3" = w1:p1 ] && [ ! -f "$FIXTURE_ROOT/goal-pasted" ]; then
+      case "$4" in
+        "/goal clear") answer="  ⎿  Goal cleared: (fixture)" ;;
+        "/goal "*) answer="  ⎿  Goal set: ${4#/goal }" ;;
+        *) answer="" ;;
+      esac
+      if [ -n "$answer" ]; then
+        { printf '%s\n' "$answer"; cat "$FIXTURE_ROOT/target.screen"; } > "$FIXTURE_ROOT/target.answer"
+        mv "$FIXTURE_ROOT/target.answer" "$FIXTURE_ROOT/target.screen"
+      fi
+    fi
+    # A Claude Code Goal Manager answers its own /goal the same way.
+    if [ "$3" = w1:p2 ]; then
+      case "$4" in
+        "/goal clear") answer="  ⎿  Goal cleared: (fixture)" ;;
+        "/goal "*) answer="  ⎿  Goal set: ${4#/goal }" ;;
+        *) answer="" ;;
+      esac
+      if [ -n "$answer" ]; then
+        { printf '%s\n' "$answer"; cat "$FIXTURE_ROOT/manager.screen"; } > "$FIXTURE_ROOT/manager.answer"
+        mv "$FIXTURE_ROOT/manager.answer" "$FIXTURE_ROOT/manager.screen"
+      fi
+    fi
     if [ "$4" = /exit ] && [ -f "$FIXTURE_ROOT/exited.json" ]; then
       cp "$FIXTURE_ROOT/exited.json" "$FIXTURE_ROOT/panes.json"
       cp "$FIXTURE_ROOT/exited-agents.json" "$FIXTURE_ROOT/agents.json"

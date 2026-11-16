@@ -1,4 +1,5 @@
 //! herdr-goal-manager CLI entrypoint.
+mod accounting;
 mod admission;
 mod binding;
 mod checkout;
@@ -6,20 +7,29 @@ mod cli;
 mod config;
 mod contract;
 mod events;
+mod factory;
+mod fingerprint;
 mod handoff;
 mod herdr;
 mod herdr_cli;
 mod herdr_events;
 mod manager;
+mod manager_goal;
 mod model;
 mod monitor;
+mod native_goal;
+mod packet;
+mod prepared;
 mod process;
+mod queue;
 mod roles;
 mod runner;
+mod scope;
 mod signals;
 mod store;
 mod supervision;
 mod view;
+mod wake_await;
 mod watch;
 mod watch_view;
 

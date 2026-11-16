@@ -43,6 +43,11 @@ pub(crate) struct TaskSpec {
     pub runner: Option<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Workspace-relative files or directories this task may write. hgm
+    /// records and reports changes elsewhere during its assignment; it never
+    /// blocks them. Written only for tasks that name some.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,17 +176,11 @@ impl GoalSpec {
                     .long_spec_reason
                     .as_ref()
                     .is_some_and(|r| !r.trim().is_empty()),
-            "the contract is about {words} words (budget {SPEC_WORD_BUDGET}); long specs are followed less reliably. Link background material, split the goal, or state long_spec_reason"
+            "the contract is about {words} words (budget {SPEC_WORD_BUDGET}; by field: {}); long specs are followed less reliably. Link background material, split the goal, or state long_spec_reason",
+            self.word_breakdown()
         );
         ensure!(
-            self.protected_paths.iter().all(|p| {
-                let path = std::path::Path::new(p);
-                !p.trim().is_empty()
-                    && path.is_relative()
-                    && path
-                        .components()
-                        .all(|c| matches!(c, std::path::Component::Normal(_)))
-            }),
+            relative_paths(&self.protected_paths),
             "protected_paths must be workspace-relative paths without '..'"
         );
         ensure!(
@@ -245,6 +244,11 @@ impl GoalSpec {
                     task.id
                 );
             }
+            ensure!(
+                relative_paths(&task.write_paths),
+                "task {}'s write_paths must be workspace-relative paths without '..'",
+                task.id
+            );
         }
         for task in tasks {
             let mut dependencies = HashSet::new();
@@ -306,23 +310,49 @@ impl GoalSpec {
     }
     /// Approximate length of the human-written contract in words.
     pub fn words(&self) -> usize {
+        self.word_fields().iter().map(|(_, words)| words).sum()
+    }
+    /// The contract's words per field, in contract order, so an author over
+    /// budget sees where the words are (2026-11-15: four failed adds that
+    /// only said the total).
+    pub fn word_fields(&self) -> Vec<(&'static str, usize)> {
+        let sum = |texts: &mut dyn Iterator<Item = &String>| -> usize {
+            texts.map(|text| word_units(text)).sum()
+        };
         let questions = self.open_questions.iter().flat_map(|q| {
             [Some(&q.question), Some(&q.resolve_by), q.default.as_ref()]
                 .into_iter()
                 .flatten()
         });
-        std::iter::once(&self.objective)
-            .chain(&self.acceptance)
-            .chain(&self.invariants)
-            .chain(&self.out_of_scope)
-            .chain(&self.constraints)
-            .chain(&self.notes)
-            .chain(&self.loop_policy.stop_when)
-            .chain(self.on_boundary.as_ref())
-            .chain(questions)
-            .chain(self.tasks.iter().map(|t| &t.instruction))
-            .map(|text| word_units(text))
-            .sum()
+        vec![
+            ("objective", word_units(&self.objective)),
+            ("acceptance", sum(&mut self.acceptance.iter())),
+            ("invariants", sum(&mut self.invariants.iter())),
+            ("out_of_scope", sum(&mut self.out_of_scope.iter())),
+            ("constraints", sum(&mut self.constraints.iter())),
+            ("notes", sum(&mut self.notes.iter())),
+            (
+                "loop.stop_when",
+                sum(&mut self.loop_policy.stop_when.iter()),
+            ),
+            ("on_boundary", sum(&mut self.on_boundary.iter())),
+            ("open_questions", sum(&mut questions.into_iter())),
+            ("tasks", sum(&mut self.tasks.iter().map(|t| &t.instruction))),
+        ]
+    }
+    /// The fields with words, largest first, as `acceptance 320, tasks 210`.
+    pub fn word_breakdown(&self) -> String {
+        let mut fields: Vec<_> = self
+            .word_fields()
+            .into_iter()
+            .filter(|(_, words)| *words > 0)
+            .collect();
+        fields.sort_by_key(|(_, words)| std::cmp::Reverse(*words));
+        fields
+            .iter()
+            .map(|(field, words)| format!("{field} {words}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
     /// The contract every linked assignment carries, so the original agent
     /// works from the agreed spec whatever the manager's wording.
@@ -362,7 +392,7 @@ impl GoalSpec {
             .map(|p| format!("{p} (protected)"))
             .collect();
         format!(
-            "--- Goal contract (from hgm; binding) ---\nGoal: {}\n{}{}{}{}At a boundary: {}\n{}Report: what changed, how each acceptance item was verified, and anything unresolved. Do not claim completion without evidence.",
+            "--- Goal contract (from hgm; binding) ---\nGoal: {}\n{}{}{}{}At a boundary: {}\n{}Decide choices inside this contract yourself and report them afterwards; ask first only at a boundary or before an irreversible or outward-facing step.\nReport: what changed, how each acceptance item was verified, and anything unresolved. Do not claim completion without evidence.",
             self.objective,
             section("Acceptance", &self.acceptance),
             section("Invariants", &self.invariants),
@@ -403,6 +433,25 @@ impl GoalSpec {
         self.validate_tasks(&tasks)?;
         Ok(tasks)
     }
+}
+
+/// Every entry names a path inside the workspace: relative, without `..`.
+fn relative_paths(paths: &[String]) -> bool {
+    paths.iter().all(|p| {
+        let path = std::path::Path::new(p);
+        !p.trim().is_empty()
+            && path.is_relative()
+            && path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+    })
+}
+
+/// Whether workspace-relative `path` lies in one of `scope` (a file or a
+/// directory and everything under it).
+pub(crate) fn within(path: &str, scope: &[String]) -> bool {
+    let path = std::path::Path::new(path);
+    scope.iter().any(|entry| path.starts_with(entry))
 }
 
 pub(crate) fn validate_id(id: &str) -> Result<()> {
@@ -525,6 +574,10 @@ pub(crate) struct Verification {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub results: Vec<CheckResult>,
+    /// Fingerprint of the work dir the checks started on; a pass describes
+    /// only that state. Absent in records written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,7 +629,7 @@ impl Goal {
                 "goal {}'s checkout {} was removed with hgm checkout remove at {}; there is nowhere to run its commands or checks. Register a new goal for further work",
                 self.id,
                 checkout.path.display(),
-                removed.format("%Y-%m-%d %H:%M UTC")
+                crate::events::local_time(removed)
             );
         }
         Ok(checkout.path.as_path())
@@ -589,6 +642,7 @@ impl Goal {
                 instruction: spec.objective.clone(),
                 runner: None,
                 depends_on: vec![],
+                write_paths: vec![],
             });
         }
         let tasks = spec.tasks.iter().cloned().map(Task::new).collect();

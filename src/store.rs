@@ -16,6 +16,8 @@ use std::{
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// The pause between attempts to take a busy lock; nothing is held meanwhile.
 pub(crate) const LOCK_RETRY: Duration = Duration::from_millis(50);
+/// How long a busy execution lease is retried before another runner is refused.
+const EXECUTION_WAIT: Duration = Duration::from_secs(1);
 
 pub(crate) struct Store {
     pub workspace: PathBuf,
@@ -64,18 +66,21 @@ impl Store {
         }
         Ok(options.open(self.directory.join(name))?)
     }
-    fn lock(&self, name: &str) -> Result<File> {
-        let file = self.open_lock(name)?;
-        file.try_lock().with_context(|| {
-            format!("workspace manager is busy ({name}); retry after the active operation finishes")
-        })?;
-        Ok(file)
-    }
     /// The state transaction lock. Every holder keeps it for one short
     /// transaction, so a busy lock is retried for up to [`LOCK_WAIT`].
     fn transaction(&self) -> Result<File> {
-        let file = self.open_lock("state.lock")?;
-        let deadline = Instant::now() + LOCK_WAIT;
+        self.wait_lock("state.lock")
+    }
+    /// Takes the lock file `name` (relative to the workspace state directory),
+    /// retrying a busy lock for up to [`LOCK_WAIT`] without blocking on it, so a
+    /// wedged holder turns into a refusal instead of a hang. The operating
+    /// system releases the lock when its holder exits, however it exits.
+    pub(crate) fn wait_lock(&self, name: &str) -> Result<File> {
+        self.wait_lock_for(name, LOCK_WAIT)
+    }
+    fn wait_lock_for(&self, name: &str, wait: Duration) -> Result<File> {
+        let file = self.open_lock(name)?;
+        let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(file),
@@ -83,30 +88,62 @@ impl Store {
                     std::thread::sleep(LOCK_RETRY);
                 }
                 Err(TryLockError::WouldBlock) => bail!(
-                    "workspace manager stayed busy for {}s (state.lock is held); nothing was changed; retry after the active operation finishes",
-                    LOCK_WAIT.as_secs()
+                    "workspace manager stayed busy for {}s ({name} is held); nothing was changed; retry after the active operation finishes",
+                    wait.as_secs_f32()
                 ),
-                Err(TryLockError::Error(error)) => return Err(error).context("lock state.lock"),
+                Err(TryLockError::Error(error)) => {
+                    return Err(error).context(format!("lock {name}"));
+                }
             }
         }
     }
     /// Exclusive execution ownership across processes. This file lease guards
     /// no shared memory; individual state transactions are synchronous and short.
+    ///
+    /// A lease just released can still look held for a moment: a process
+    /// forked by another thread keeps a copy of the lock until it executes its
+    /// program (unit tests failed on it about once in six runs). So a busy
+    /// lease is retried for [`EXECUTION_WAIT`] before another runner is refused.
     pub fn execution_lease(&self) -> Result<File> {
-        self.lock("execution.lock")
+        self.wait_lock_for("execution.lock", EXECUTION_WAIT)
     }
     /// Registers a goal. `owner` is the original Herdr terminal of the manager.
     pub fn add(&self, spec: GoalSpec, owner: Option<String>) -> Result<Goal> {
+        self.register(Goal::new(spec, self.workspace.clone())?, owner)
+    }
+    /// Registers a goal under a chosen ID, refusing one that already exists.
+    /// A caller that derives the ID from its own record (a queue claim) can
+    /// later tell from the goal file alone whether registration happened.
+    pub fn add_with_id(&self, spec: GoalSpec, owner: Option<String>, id: &str) -> Result<Goal> {
+        validate_id(id)?;
         let mut goal = Goal::new(spec, self.workspace.clone())?;
+        goal.id = id.into();
+        self.register(goal, owner)
+    }
+    fn register(&self, mut goal: Goal, owner: Option<String>) -> Result<Goal> {
         goal.owner = owner;
         let events = events::transitions(None, &goal);
         {
             let _transaction = self.transaction()?;
+            ensure!(
+                !self.goal_exists(&goal.id)?,
+                "goal {} already exists",
+                goal.id
+            );
             self.save(&goal)?;
             self.append(&goal.id, &events)?;
         }
         events::notify(&goal.spec.objective, &events);
         Ok(goal)
+    }
+    /// Whether a goal record with this ID exists in the workspace.
+    pub fn goal_exists(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        Ok(self
+            .directory
+            .join("goals")
+            .join(format!("{id}.json"))
+            .try_exists()?)
     }
     pub fn load(&self, id: &str) -> Result<Goal> {
         validate_id(id)?;
@@ -158,6 +195,37 @@ impl Store {
         events::notify(&goal.spec.objective, &events);
         Ok(goal)
     }
+    /// Replaces the contract of an unconfirmed goal with `spec`, keeping its
+    /// id, owner and timeline, so a corrected draft leaves no cancelled goal
+    /// behind (2026-11-15: two cancelled drafts stayed in status all day). A
+    /// confirmed or finished goal keeps its contract: the user agreed to it.
+    pub fn replace_contract(&self, id: &str, spec: GoalSpec) -> Result<Goal> {
+        let words = spec.words();
+        let goal = self.update(id, |goal| {
+            ensure!(
+                goal.confirmed.is_none(),
+                "goal {id} is confirmed, so its contract stays as the user agreed it; nothing was replaced. If the user agrees to a new contract, cancel this goal and register a new one"
+            );
+            ensure!(
+                !matches!(
+                    goal.status,
+                    crate::model::GoalStatus::Completed | crate::model::GoalStatus::Cancelled
+                ),
+                "goal {id} is {:?}; nothing was replaced, register a new goal instead",
+                goal.status
+            );
+            let fresh = Goal::new(spec, goal.workspace.clone())?;
+            goal.spec = fresh.spec;
+            goal.tasks = fresh.tasks;
+            Ok(())
+        })?;
+        self.record(
+            id,
+            "contract_replaced",
+            serde_json::json!({"objective": goal.spec.objective, "words": words}),
+        )?;
+        Ok(goal)
+    }
     /// Records an assignment or observation that does not change the goal record.
     pub fn record(&self, id: &str, kind: &str, detail: serde_json::Value) -> Result<()> {
         let goal = self.load(id)?;
@@ -185,28 +253,26 @@ impl Store {
             .join("goals")
             .join(format!("{id}.events.ndjson")))
     }
-    /// One `write` per batch with O_APPEND keeps concurrent appends whole.
+    /// Appends events to a goal's timeline.
     fn append(&self, id: &str, events: &[Event]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
-        let mut text = String::new();
-        for event in events {
-            text.push_str(&serde_json::to_string(event)?);
-            text.push('\n');
-        }
         self.initialize()?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options
-            .open(self.events_path(id)?)?
-            .write_all(text.as_bytes())
-            .context("append goal timeline")
+        append_lines(&self.events_path(id)?, events).context("append goal timeline")
+    }
+    /// Appends one JSON line per value to a private append-only file under
+    /// this store, with the same whole-line guarantee as the goal timeline.
+    pub(crate) fn append_private<T: serde::Serialize>(
+        &self,
+        path: &Path,
+        values: &[T],
+    ) -> Result<()> {
+        ensure!(
+            path.starts_with(&self.directory),
+            "append-only state must stay in the private state directory"
+        );
+        append_lines(path, values).with_context(|| format!("append {}", path.display()))
     }
     fn save(&self, goal: &Goal) -> Result<()> {
         let directory = self.directory.join("goals");
@@ -272,6 +338,27 @@ impl Store {
     }
 }
 
+/// One `write` per batch with O_APPEND keeps concurrent appends whole.
+fn append_lines<T: serde::Serialize>(path: &Path, values: &[T]) -> Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let mut text = String::new();
+    for value in values {
+        text.push_str(&serde_json::to_string(value)?);
+        text.push('\n');
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 fn brief_file(scope: Option<&str>) -> Result<String> {
     match scope {
         Some(terminal) => {
@@ -315,6 +402,31 @@ mod tests {
         );
         assert_eq!(store.load(&goal.id)?.version, 1);
         assert!(store.load("../escape").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_briefly_held_execution_lease_is_waited_for_and_a_held_one_still_excludes() -> Result<()> {
+        // A lease released while a forked child still holds a copy of it looks
+        // held for a moment; the next runner waits instead of failing.
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let store = Store::new(workspace.path(), state.path())?;
+        let held = store.open_lock("execution.lock")?;
+        held.try_lock()?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let start = Instant::now();
+        let lease = store.execution_lease()?;
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        release.join().expect("holder thread");
+        let start = Instant::now();
+        let other = Store::new(workspace.path(), state.path())?.execution_lease();
+        assert!(format!("{:#}", other.unwrap_err()).contains("execution.lock is held"));
+        assert!(start.elapsed() >= EXECUTION_WAIT);
+        drop(lease);
         Ok(())
     }
 
