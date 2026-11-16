@@ -17,8 +17,14 @@ These are documented capabilities, not exhaustive claims about uninspected code.
 
 The initial implementation deliberately covers a smaller execution model:
 one active manager per canonical workspace, sequential ready tasks, configured
-executors, local evidence, and explicit acceptance. It does not provide TAKT's
-complete software-factory lifecycle or Quartermaster's worker fleet.
+executors, local evidence, and explicit acceptance. The optional factory mode
+(first stage) adds the parts a software factory needs before scale: a local
+queue of user-agreed contracts, exclusive claiming so one contract never becomes
+two goals, kept evidence of every item's history, and dispatch that holds while
+human review is behind, with a run class per goal computed from recorded
+events. It still does not create, update or merge pull requests, take work from
+issue trackers or chat, or start several agent loops or worktrees in parallel,
+so it is not TAKT's complete lifecycle or Quartermaster's worker fleet.
 
 ## State transitions
 
@@ -37,6 +43,15 @@ Goal YAML is a trusted, user-authored executable configuration. Planner output
 is untrusted structured data: exact fields, bounded task count, allowed runner
 names, dependency validity and acyclicity are checked before dispatch.
 Commands and acceptance checks remain fixed in the imported contract.
+
+A queued contract is the same trusted, user-authored file with the user's
+agreement attached when it is queued. hgm stores its text verbatim with the
+`loop` defaults in effect, records a content fingerprint in the append-only
+ledger, and refuses to dispatch it when the stored text no longer matches that
+fingerprint; the goal is built from that text alone, so nothing a model writes
+becomes executable. Factory settings cannot switch off confirmation, budgets,
+word caps or acceptance, and a run class is an observation, never evidence of
+completion.
 
 Prompts and evidence are data passed through stdin/environment, not shell source.
 AI runners still need their own sandbox and external-service permissions.
