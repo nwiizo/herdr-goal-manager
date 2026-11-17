@@ -4751,7 +4751,7 @@ struct ClaudeWorker {
 impl ClaudeWorker {
     fn new() -> Self {
         let bridge = Bridge::new();
-        let origin = json!({"pane":"w1:p1","tab":"w1:t1","terminal":"original","agent":"claude","session":null}).to_string();
+        let origin = json!({"pane":"w1:p1","tab":"w1:t1","terminal":"original","agent":"claude","session":{"value":"claude-1"}}).to_string();
         let output = bridge
             .command(&["manager", "--agent", "codex"])
             .env("HGM_ORIGIN_JSON", &origin)
@@ -4775,7 +4775,7 @@ impl ClaudeWorker {
     fn state(&self, status: &str, screen: &str) {
         let (manager, manager_status) = *self.manager.borrow();
         let panes = json!([
-            {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"original","agent":"claude","agent_status":status,"focused":false},
+            {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"original","agent":"claude","agent_status":status,"agent_session":{"value":"claude-1"},"focused":false},
             {"pane_id":"w1:p2","tab_id":"w1:t2","terminal_id":"manager","agent":manager,"agent_status":manager_status,"agent_session":{"value":"manager"},"focused":true}
         ]);
         self.bridge
@@ -6171,7 +6171,9 @@ fn a_stopped_goals_prepared_step_with_a_removed_checkout_does_not_end_the_watch(
     // CX3-2: its boundaries are checked only for a goal still served.
     let bridge = Bridge::new();
     let a = confirmed_goal(&bridge, "true", json!({}));
-    let b = confirmed_goal(&bridge, "true", json!({}));
+    std::fs::create_dir_all(bridge.workspace.join("secret")).unwrap();
+    std::fs::write(bridge.workspace.join("secret/key.txt"), "v1").unwrap();
+    let b = confirmed_goal(&bridge, "true", json!({"protected_paths":["secret"]}));
     bridge.ok(&["send", "--goal", &a, "--task", "work", "Work on A"]);
     bridge.inventory("working", "idle", "original");
     bridge.write("target.screen", "Editing A\n› ");
@@ -6261,8 +6263,9 @@ fn another_providers_check_runs_at_settle_and_wakes_the_manager_with_its_verdict
         "{prompt}"
     );
     assert!(
-        sent_text(&worker.bridge)
-            .contains("the codex check of main's work for work says changes_requested"),
+        sent_text(&worker.bridge).contains(&format!(
+            "the codex check of main's work for goal {goal} task work says changes_requested"
+        )),
         "{}",
         sent_text(&worker.bridge)
     );
@@ -6271,4 +6274,79 @@ fn another_providers_check_runs_at_settle_and_wakes_the_manager_with_its_verdict
         0,
         "decides nothing"
     );
+}
+
+/// A fake Codex for cross checks: records its arguments and prompt, then runs
+/// `body` (with `$out` set to its `-o` file).
+fn fake_codex(worker: &ClaudeWorker, body: &str) {
+    std::fs::write(
+        worker.bridge.root.path().join("bin/codex"),
+        format!("#!/bin/sh\nout=; prev=\nfor a in \"$@\"; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\nprintf '%s\\n' \"$@\" > \"$FIXTURE_ROOT/cross-args\"\ncat > \"$FIXTURE_ROOT/cross-prompt\"\n{body}\n"),
+    )
+    .unwrap();
+}
+/// Steps the watch until `kind` shows on `goal`'s timeline.
+fn step_until(worker: &ClaudeWorker, goal: &str, kind: &str) -> Vec<Value> {
+    for _ in 0..30 {
+        worker.step("done", "Updated the copy\n❯ ");
+        let found = worker.events(goal, kind);
+        if !found.is_empty() {
+            return found;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    vec![]
+}
+
+#[test]
+fn a_cross_check_runs_without_settle_checks_and_a_failed_reviewer_has_no_verdict() {
+    // CX4-4, CX4-7, CX4-8, CX4-9, CX4-10.
+    let worker = ClaudeWorker::new();
+    fake_codex(&worker, "printf 'VERDICT: approve\\n' > \"$out\"\nexit 3");
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"cross_check":"auto","check_on_settle":false},
+               "tasks":[{"id":"work","instruction":"Update the login copy only","write_paths":["copy"]}]}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    let checked = step_until(&worker, &goal, "cross_checked");
+    assert_eq!(checked[0]["detail"]["verdict"], "failed", "{checked:?}");
+    let args = std::fs::read_to_string(worker.bridge.root.path().join("cross-args")).unwrap();
+    assert!(args.contains("--skip-git-repo-check"), "{args}");
+    let prompt = std::fs::read_to_string(worker.bridge.root.path().join("cross-prompt")).unwrap();
+    for part in [
+        "Update the login copy only",
+        "- copy",
+        "Update the copy",
+        "not a Git repository",
+    ] {
+        assert!(prompt.contains(part), "{part:?} missing: {prompt}");
+    }
+    assert!(
+        sent_text(&worker.bridge).contains(&format!("work for goal {goal} task work says failed")),
+        "{}",
+        sent_text(&worker.bridge)
+    );
+}
+
+#[test]
+fn a_cross_check_still_running_when_the_watch_ends_is_stopped_and_recorded() {
+    // CX4-6.
+    let worker = ClaudeWorker::new();
+    fake_codex(&worker, "sleep 30");
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"cross_check":"codex"}}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    let started = step_until(&worker, &goal, "cross_check_started");
+    assert_eq!(started.len(), 1);
+    assert!(worker.run(&["pause", &goal]).status.success());
+    worker.step("done", "Updated the copy\n❯ ");
+    let checked = worker.events(&goal, "cross_checked");
+    assert_eq!(checked[0]["detail"]["verdict"], "stopped", "{checked:?}");
 }

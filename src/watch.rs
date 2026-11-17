@@ -135,6 +135,12 @@ pub(crate) struct Watch {
     /// (`loop.cross_check`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_check: Option<crate::cross_check::CrossRun>,
+    /// The latest assignment or correction a cross check was started for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_through: Option<chrono::DateTime<Utc>>,
+    /// The worker settled after a change since the last cross check started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_due: bool,
 }
 fn default_idle_notice_secs() -> u64 {
     crate::config::DEFAULT_IDLE_NOTICE_SECS
@@ -994,15 +1000,6 @@ async fn settle_checks(
         None => note,
     });
     watch.pending_stop = true;
-    // The other provider looks at the same work, if the contract asks for it.
-    let task = events
-        .iter()
-        .rev()
-        .find(|e| matches!(e.kind.as_str(), "assigned" | "correction"))
-        .and_then(|e| e.detail["task"].as_str());
-    if let Err(error) = crate::cross_check::start(store, watch, goal, task) {
-        append_note(watch, format!("the cross check could not start: {error:#}"));
-    }
     Ok(())
 }
 /// The wake note after settle checks. A failing check asks for a correction
@@ -1130,7 +1127,7 @@ pub(crate) async fn watch_once(
         )?;
     }
     confirm_pending_goal(store, watch, target, screen, now)?;
-    if let Some(note) = crate::cross_check::poll(store, watch, now)? {
+    if let Some(note) = crate::cross_check::poll(store, watch, now, false)? {
         append_note(watch, note);
         watch.pending_stop = true;
     }
@@ -1150,6 +1147,8 @@ pub(crate) async fn watch_once(
         }
         if !continued && watch.held.is_none() && settled {
             settle_checks(store, watch, &goal, &events).await?;
+            // The same settle makes the cross check due, checks or none.
+            watch.cross_due = true;
         }
         if let Some(line) = compaction_shown(screen) {
             let recent = events
@@ -1177,6 +1176,12 @@ pub(crate) async fn watch_once(
         if watch.rot_signals >= ROT_SIGNS_PER_WAKE {
             rot_wake(watch);
         }
+    }
+    // The other provider checks settled work, apart from the settle checks:
+    // due from this observation's settle, or still due after a running check.
+    let settled_now = matches!(target["agent_status"].as_str(), Some("idle" | "done"));
+    if let Err(error) = crate::cross_check::request(store, watch, &goal, &events, settled_now) {
+        append_note(watch, format!("the cross check could not start: {error:#}"));
     }
     // The worker drives itself only while the goal its native goal is for has
     // work here: on a shared watch, or after a watch armed again for another
@@ -2508,6 +2513,8 @@ mod tests {
             native_unavailable: false,
             manager_goal: None,
             cross_check: None,
+            cross_through: None,
+            cross_due: false,
         }
     }
     #[test]

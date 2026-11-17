@@ -358,6 +358,8 @@ async fn drain_once(store: &Store) -> Result<Option<(String, Vec<&'static str>)>
     if crate::manager_goal::after_watch(store, &mut watch).await? {
         left.push("the Goal Manager");
     }
+    // A check still running is stopped; a finished one is recorded.
+    crate::cross_check::poll(store, &mut watch, chrono::Utc::now().timestamp(), true)?;
     save_watch(store, &watch)?;
     Ok((!left.is_empty()).then(|| (watch.goal.clone(), left)))
 }

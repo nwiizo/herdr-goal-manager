@@ -639,6 +639,7 @@ async fn arm(
         w.origin.pane == origin.pane
             && w.origin.terminal == origin.terminal
             && w.origin.agent == origin.agent
+            && w.origin.session.is_some()
             && w.origin.session == origin.session
     };
     let native_goal = previous
@@ -683,6 +684,8 @@ async fn arm(
         native_unavailable: false,
         manager_goal,
         cross_check,
+        cross_through: None,
+        cross_due: false,
         wakes: previous
             .as_ref()
             .filter(|w| w.goal == goal)
