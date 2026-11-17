@@ -733,6 +733,16 @@ async fn classify_stop(
             if native_driving(watch, screen) {
                 return Ok(false);
             }
+            // No continue past a boundary: a spent wake budget, changed protected
+            // paths, a spent time budget or a stop condition ends or holds the
+            // loop instead (the steps after this one act on them).
+            let goal = store.load(&watch.goal)?;
+            if watch.wakes >= watch.max_wakes
+                || boundary_reached(&goal, events, now)?.is_some()
+                || stop_condition(store, watch, &goal).await?
+            {
+                return Ok(false);
+            }
             // Only into an empty input line of a settled agent, never a draft:
             // as observed, and again right before typing.
             if can_prompt(live, screen) {
@@ -1569,6 +1579,8 @@ fn notice_unseen_end(
         "native_goal",
         json!({"outcome": outcome, "line": line, "task": state.task, "read": "indicator"}),
     )?;
+    watch.checked_through = None;
+    watch.cross_through = None;
     if watch.pending.is_some() {
         append_note(
             watch,
@@ -1623,6 +1635,10 @@ fn observe_native(store: &Store, watch: &mut Watch, screen: &str) -> Result<()> 
             "the native goal reports {outcome} ({line}); that is the provider's verdict, not evidence: check the result against the contract"
         ),
     );
+    // The goal went on working after the first settle: what it left is
+    // checked again, by the settle checks and the cross check.
+    watch.checked_through = None;
+    watch.cross_through = None;
     watch.pending_stop = true;
     watch.native_goal = Some(crate::native_goal::NativeGoalState {
         outcome: Some(outcome.into()),
@@ -1691,11 +1707,11 @@ async fn set_native(
 }
 /// Runs the goal's stop checks; one that holds makes the goal wait for the
 /// person and ends the watch. Returns whether one held.
-async fn stop_condition(
+/// The name of the first stop check of `goal` whose command succeeds now.
+pub(crate) async fn stop_check_holding(
     store: &Store,
-    watch: &mut Watch,
     goal: &crate::model::Goal,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     for check in &goal.spec.loop_policy.stop_checks {
         let command = crate::model::CommandSpec {
             program: "sh".into(),
@@ -1714,18 +1730,25 @@ async fn stop_condition(
         .await
         .is_ok()
         {
-            let reason = format!(
-                "Stop condition {} holds. Decide whether to revise the goal or stop.",
-                check.name
-            );
-            crate::native_goal::clear(store, watch, "a stop condition holds").await?;
-            store.record(&goal.id, "stop_condition", json!({ "check": check.name }))?;
-            store.update(&goal.id, |g| g.wait(reason.clone()))?;
-            end_watch(store, watch, "stop_condition", false);
-            return Ok(true);
+            return Ok(Some(check.name.clone()));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+async fn stop_condition(
+    store: &Store,
+    watch: &mut Watch,
+    goal: &crate::model::Goal,
+) -> Result<bool> {
+    let Some(name) = stop_check_holding(store, goal).await? else {
+        return Ok(false);
+    };
+    let reason = format!("Stop condition {name} holds. Decide whether to revise the goal or stop.");
+    crate::native_goal::clear(store, watch, "a stop condition holds").await?;
+    store.record(&goal.id, "stop_condition", json!({ "check": name }))?;
+    store.update(&goal.id, |g| g.wait(reason.clone()))?;
+    end_watch(store, watch, "stop_condition", false);
+    Ok(true)
 }
 /// Checks failing at the latest settle after the latest assignment or
 /// correction that passed at an earlier settle of the goal.
@@ -1862,7 +1885,7 @@ fn uncertain_delivery(events: &[crate::events::Event]) -> bool {
 /// since the contract was confirmed, or its time budget is spent. The watch
 /// ends for these on the goal wakes are about; a prepared step of another
 /// goal sharing the watch is held for them instead.
-fn boundary_reached(
+pub(crate) fn boundary_reached(
     goal: &crate::model::Goal,
     events: &[crate::events::Event],
     now: i64,

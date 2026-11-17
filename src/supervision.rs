@@ -280,6 +280,26 @@ async fn deliver(
         Some(_) => None,
     };
     let delivered = crate::admission::admit(store, &assignment, text)?;
+    // New linked work stops at the goal's boundaries as the watch does: a
+    // spent time budget, changed protected paths or a stop condition.
+    if assignment.kind == Delivery::Assignment
+        && let Some(goal_id) = assignment.goal
+    {
+        let goal = store.load(goal_id)?;
+        let events = store.events(goal_id)?;
+        if let Some(reason) =
+            crate::watch::boundary_reached(&goal, &events, Utc::now().timestamp())?
+        {
+            anyhow::bail!(
+                "{reason}; nothing was sent. Decide with the user whether to revise the goal or stop"
+            );
+        }
+        if let Some(check) = crate::watch::stop_check_holding(store, &goal).await? {
+            anyhow::bail!(
+                "stop condition {check} holds; nothing was sent. Decide with the user whether to revise the goal or stop"
+            );
+        }
+    }
     let context = session(store)?;
     let transfer_path = path(store, &context.key(), "-handoff.json")?;
     if helper.is_none() && transfer_path.exists() {
