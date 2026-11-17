@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 (2026-11-18)
 
 Interaction design (verified with controlled executables):
 
