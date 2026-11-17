@@ -89,7 +89,7 @@ impl Gate {
         }
         if self.active.len() >= self.max_active as usize {
             reasons.push(format!(
-                "factory.max_active ({}) reached: {} in progress (finish, wait or cancel first)",
+                "factory.max_active ({}) reached: {} in progress (finish or cancel one first; a waiting goal still counts)",
                 self.max_active,
                 self.active.join(", ")
             ));

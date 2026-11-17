@@ -352,11 +352,17 @@ async fn drain_once(store: &Store) -> Result<Option<(String, Vec<&'static str>)>
         return Ok(None);
     }
     let mut left = vec![];
-    if !crate::native_goal::clear(store, &mut watch, "the watch ended").await? {
-        left.push("main");
+    // Each clear on its own: a closed main pane must not keep the Goal
+    // Manager's goal set.
+    match crate::native_goal::clear(store, &mut watch, "the watch ended").await {
+        Ok(true) => {}
+        Ok(false) => left.push("main"),
+        Err(error) => eprintln!("Main's native goal was not cleared: {error:#}"),
     }
-    if crate::manager_goal::after_watch(store, &mut watch).await? {
-        left.push("the Goal Manager");
+    match crate::manager_goal::after_watch(store, &mut watch).await {
+        Ok(true) => left.push("the Goal Manager"),
+        Ok(false) => {}
+        Err(error) => eprintln!("The Goal Manager's native goal was not cleared: {error:#}"),
     }
     // A check still running is stopped; a finished one is recorded.
     crate::cross_check::poll(store, &mut watch, chrono::Utc::now().timestamp(), true)?;

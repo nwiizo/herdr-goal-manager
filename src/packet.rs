@@ -305,6 +305,24 @@ pub(crate) fn build(store: &Store, goal: &Goal) -> Result<Value> {
                 "delivery",
                 format!("{kind} may not have arrived (delivery uncertain)"),
             ),
+            // A send whose input line did not empty, and a wake that went
+            // the same way: both may still sit unread.
+            kind if d["consumed"] == false => unverified(
+                Some(event.at),
+                "delivery",
+                format!("{kind} may still sit in the input (input not consumed)"),
+            ),
+            "wake"
+                if d["via"]
+                    .as_str()
+                    .is_some_and(|via| via.ends_with("_unconfirmed")) =>
+            {
+                unverified(
+                    Some(event.at),
+                    "delivery",
+                    "a wake may still sit in the manager's input (not confirmed)".into(),
+                )
+            }
             _ => {}
         }
     }

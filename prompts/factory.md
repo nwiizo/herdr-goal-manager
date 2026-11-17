@@ -23,7 +23,7 @@ the user's call (hgm checkout remove GOAL); hgm never commits or merges it.
 When results awaiting review reach factory.max_awaiting_review or confirmed
 goals in progress reach factory.max_active, `queue next` refuses and names the
 goals; inbox and overview show the same reason. Do not work around it: help the
-user review, finish, wait or cancel those goals first. A goal's run class
+user review, finish or cancel those goals first (a waiting goal still counts). A goal's run class
 (success, flawed, blocked, manual) in show and status comes from recorded
 events only; it is never evidence of completion, and acceptance stays the
 user's.

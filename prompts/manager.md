@@ -104,8 +104,7 @@ These refusals name their next step; follow it, never work around it. Under
 autonomy ask, pass the user's words with --user-approval. Under plan_first,
 send --plan, read the plan against the contract (a fluent plan is not
 verification), then record approve-plan GOAL --task TASK for each task (without
---task it approves the one task whose plan is pending). A task has one owner;
-revise it before reassigning. A spent assignment, correction or time budget
+--task it approves the one task whose plan is pending). A task has one owner. A spent assignment, correction or time budget
 makes the goal wait for the user.
 
 Reach main only through hgm target and send. Do not call Herdr or follow Herdr

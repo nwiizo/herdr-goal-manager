@@ -315,7 +315,7 @@ fn admission(
     if let Some(owner) = history.owner {
         ensure!(
             owner == assignment.to,
-            "{task} belongs to {owner}; split the work into separate tasks, or revise it before reassigning"
+            "{task} belongs to {owner}; send its remaining work to {owner}, or split the work into separate tasks; a completed task can be revised (hgm revise) and then reassigned"
         );
     }
     let list = |items: &[String]| {

@@ -538,6 +538,9 @@ pub(crate) fn can_prompt(live: &Value, screen: &str) -> bool {
     matches!(live["agent_status"].as_str(), Some("idle" | "done"))
         && !busy_on_screen(screen, agent)
         && empty_composer(screen, agent)
+        // A dialog can leave an empty composer on screen (Herdr may list the
+        // agent as done): it is never typed into.
+        && !needs_human(live, screen)
 }
 
 /// The one observed reason an agent cannot take typed input now, so a refusal
@@ -611,6 +614,18 @@ pub(crate) fn input_refusal(live: &Value, screen: &str) -> Option<Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dialog_above_an_empty_input_line_is_not_free_input() {
+        // UC-1: Herdr may list the agent as done while a dialog shows above
+        // an empty composer.
+        let live = serde_json::json!({"agent": "claude", "agent_status": "done"});
+        assert!(can_prompt(&live, "Finished\n❯ "));
+        assert!(!can_prompt(
+            &live,
+            "Permission request: write notes.txt\n  1. Yes\n  2. No\n❯ "
+        ));
+    }
     use serde_json::json;
 
     #[test]

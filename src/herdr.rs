@@ -75,6 +75,9 @@ pub(crate) async fn open_panel(entrypoint: &str, state_root: &Path) -> Result<()
         format!("HGM_WORKSPACE={workspace}"),
         "--env".into(),
         format!("HGM_ORIGIN_JSON={origin}"),
+        // The new pane uses the state this command searched.
+        "--env".into(),
+        format!("HGM_STATE_DIR={}", state_root.display()),
     ];
     call(&args).await
 }

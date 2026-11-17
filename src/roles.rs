@@ -480,11 +480,19 @@ pub(crate) async fn request_review(
         }
     };
     let request = format!(
-        "Review request {review} for goal {goal_id}. You are an independent reviewer: you did not write this work; do not change files.\nWhat to review: {text}\nGoal: {}\nAcceptance: {}\nInvariants: {}\nOut of scope: {}\nSubmit once, with findings as a JSON array on stdin:\nhgm review-submit {goal_id} --review {review} --verdict approve|revise --findings - <<'EOF'\n[{{\"severity\":\"blocking\",\"where\":\"path:line\",\"issue\":\"what is wrong\",\"evidence\":\"how you know\"}}]\nEOF\nJudge the files and the diff, not a summary of them. A finding is blocking only when you can show it: a command that fails or a line that is wrong, named in where and evidence. Everything else is advisory and becomes a follow-up. Use revise when any finding is blocking; approve allows only advisory findings (or []).",
+        "Review request {review} for goal {goal_id}. You are an independent reviewer: you did not write this work; do not change files.\nWhat to review: {text}\nWork dir (review the files there): {work_dir}\nGoal: {}\nAcceptance: {}\nInvariants: {}\nOut of scope: {}\nSubmit once, with findings as a JSON array on stdin:\nhgm review-submit {goal_id} --review {review} --verdict approve|revise --findings - <<'EOF'\n[{{\"severity\":\"blocking\",\"where\":\"path:line\",\"issue\":\"what is wrong\",\"evidence\":\"how you know\"}}]\nEOF\nJudge the files and the diff, not a summary of them. A finding is blocking only when you can show it: a command that fails or a line that is wrong, named in where and evidence. Everything else is advisory and becomes a follow-up. Use revise when any finding is blocking; approve allows only advisory findings (or []).",
         goal.spec.objective,
         list(&goal.spec.acceptance),
         list(&goal.spec.invariants),
         list(&goal.spec.out_of_scope),
+        work_dir = match &goal.checkout {
+            Some(checkout) => format!(
+                "{} (the goal's checkout, branch {})",
+                checkout.path.display(),
+                checkout.branch
+            ),
+            None => goal.work_dir()?.display().to_string(),
+        },
     );
     store.record(
         goal_id,
@@ -495,6 +503,22 @@ pub(crate) async fn request_review(
     herdr::json_query(&args(&["agent", "prompt", &role.target.pane, &request]))
         .await
         .context("review request delivery uncertain; inspect the reviewer before resending")?;
+    // As with send: the input line must empty, or the review may not start.
+    let agent = role.target.agent.as_deref().unwrap_or("");
+    let consumed = crate::supervision::input_consumed(&role.target.pane, agent)
+        .await
+        .unwrap_or(false);
+    if !consumed {
+        store.record(
+            goal_id,
+            "review_delivery",
+            json!({"review": review, "reviewer": reviewer, "consumed": false, "delivery": "uncertain"}),
+        )?;
+        return Ok(
+            json!({"review": review, "reviewer": reviewer, "status": "uncertain",
+            "message": "the request may still sit in the reviewer's input; inspect it before resending"}),
+        );
+    }
     Ok(json!({"review": review, "reviewer": reviewer, "status": "requested"}))
 }
 

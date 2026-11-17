@@ -235,7 +235,13 @@ async fn queue_native_goal(
     let Ok(watch) = load_watch(store, &key) else {
         return Ok(None);
     };
-    if !watch.active || !watch.serves(goal) || watch.role != "main" || watch.origin.pane != pane {
+    // A provider seen without /goal gets none with later assignments either.
+    if !watch.active
+        || watch.native_unavailable
+        || !watch.serves(goal)
+        || watch.role != "main"
+        || watch.origin.pane != pane
+    {
         return Ok(None);
     }
     let goal = store.load(goal)?;
