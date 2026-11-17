@@ -243,8 +243,9 @@ async fn queue_native_goal(
     else {
         return Ok(None);
     };
+    // The caller holds the operation lease: the manager's delivery took it
+    // before admission, and the watch's own step holds it.
     if !by_watch {
-        let _operation = wait_operation_lease(store, &key).await?;
         let mut watch = load_watch(store, &key)?;
         watch.native_goal = Some(state.clone());
         save_watch(store, &watch)?;
@@ -261,6 +262,17 @@ async fn deliver(
         (assignment.kind == Delivery::Reanchor || !text.trim().is_empty()) && text.len() <= 32_768,
         "assignment must contain 1..32768 bytes"
     );
+    // The manager's own delivery holds the operation lease from admission to
+    // the native goal it queues. The watch types prepared steps, clears and
+    // wakes under it, so the two never type into one input at once, what
+    // admission counts (budgets, the goal's state) cannot move meanwhile, and
+    // the steps a direct send supersedes change under the lease that prepare
+    // and withdraw take. The watch's own delivery runs inside its step, which
+    // holds the lease already.
+    let arming = match assignment.via {
+        None => Some(wait_operation_lease(store, &session(store)?.key()).await?),
+        Some(_) => None,
+    };
     let delivered = crate::admission::admit(store, &assignment, text)?;
     let context = session(store)?;
     let transfer_path = path(store, &context.key(), "-handoff.json")?;
@@ -281,18 +293,6 @@ async fn deliver(
             .as_ref()
             .is_some_and(|watch| watch.serves(goal) && watch.role == assignment.to)
     });
-    // The watch types prepared steps under the operation lease, so the
-    // manager's own delivery takes it too: the two never type into one input
-    // at once, and the steps a direct send supersedes change under the lease
-    // that prepare and withdraw take. The watch's own delivery runs inside its
-    // step, which holds the lease already.
-    let arming = if assignment.via.is_none()
-        && (watch.is_some() || (assignment.goal.is_some() && assignment.supervise))
-    {
-        Some(wait_operation_lease(store, &context.key()).await?)
-    } else {
-        None
-    };
     let (live, screen) = observe_recipient(store, helper).await?;
     let agent = live["agent"].as_str().unwrap_or("");
     let working = live["agent_status"] == "working";
@@ -419,8 +419,6 @@ async fn deliver(
             }
         };
     }
-    // Released before the native goal is queued, which takes it again.
-    drop(arming);
     // `loop.native_goal: assignment`: the native goal follows the assignment
     // as queued input, pending until the watch reads it (see native_goal).
     if assignment.kind == Delivery::Assignment
@@ -633,6 +631,13 @@ async fn arm(
     let limit = pacing.max_wakes.unwrap_or(config.max_wakes());
     // The manager keeps its goal across watches: a goal still set, or one
     // the spin guard cleared, belongs to this manager session.
+    // A native goal main may still run (a stop could not clear it) stays with
+    // the pane, so this watch clears it unless its goal is served again.
+    let native_goal = previous
+        .as_ref()
+        .filter(|w| w.origin.pane == origin.pane)
+        .and_then(|w| w.native_goal.clone())
+        .filter(crate::native_goal::NativeGoalState::is_set);
     let manager_goal = previous
         .as_ref()
         .and_then(|w| w.manager_goal.clone())
@@ -661,7 +666,7 @@ async fn arm(
         stuck: false,
         retry: None,
         prepared_held: None,
-        native_goal: None,
+        native_goal,
         native_unavailable: false,
         manager_goal,
         wakes: previous

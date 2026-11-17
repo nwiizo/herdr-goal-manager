@@ -5874,7 +5874,7 @@ fn a_prepared_step_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     // The wake to the manager (w1:p2) may quote the step; main never gets it.
     assert!(
-        !sent_text(&bridge).contains("w1:p1\nSecond step"),
+        !delivered(&bridge, &goal, "Second step"),
         "never typed into main again: {}",
         sent_text(&bridge)
     );
@@ -5891,4 +5891,232 @@ fn a_prepared_step_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
         "{uncertain:?}"
     );
     assert!(!file.exists(), "taken off the queue");
+}
+
+#[test]
+fn a_native_goal_a_stop_left_set_is_cleared_by_the_next_watch_of_the_pane() {
+    // CX-1, rest: a watch armed again before the ending one cleared main's
+    // goal carries it, and clears it since its goal is not watched any more.
+    let (worker, a) = ClaudeWorker::with_native_goal(json!({}));
+    worker.state("done", "Updated the copy\n❯ half-typed note");
+    assert!(worker.run(&["pause", &a]).status.success());
+    assert_eq!(worker.clears_typed(), 0);
+    let b = confirmed_goal(&worker.bridge, "true", json!({}));
+    worker.state("done", "Updated the copy\n❯ ");
+    worker.ok(&["supervise", &b]);
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(worker.clears_typed(), 1, "{}", sent_text(&worker.bridge));
+    let cleared = worker.cleared(&a);
+    assert!(
+        cleared.last().unwrap()["detail"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&a),
+        "{cleared:?}"
+    );
+}
+
+#[test]
+fn the_ending_watch_waits_for_the_operation_lease_before_the_watch_lease() {
+    // CX2-1: while `supervise` holds the operation lease to start a new watch,
+    // the ending watch holds nothing the new one needs.
+    let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
+    worker.state("done", "Updated the copy\n❯ half-typed note");
+    assert!(worker.run(&["pause", &goal]).status.success());
+    let lock = hold_operation_lock(&worker.bridge);
+    let draining = worker
+        .bridge
+        .command(&["watch-loop", "--once"])
+        .env("HGM_CONTEXT", &worker.context)
+        .env("HGM_ORIGIN_JSON", &worker.origin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let watch_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(manager_dir(&worker.bridge).join("t-original-watch.lock"))
+        .unwrap();
+    assert!(watch_lock.try_lock().is_ok(), "the watch lease stays free");
+    drop(watch_lock);
+    drop(lock);
+    // A one-off run that met a held operation lease exits with an error; the
+    // point is what it held while it waited.
+    let _ = draining.wait_with_output().unwrap();
+}
+
+#[test]
+fn after_an_uncertain_prepared_step_the_next_waits_for_the_manager() {
+    // CX2-2 and CX2-3: the marker is written before the step is typed, and
+    // after an uncertain delivery the next step waits.
+    let bridge = Bridge::new();
+    let goal = confirmed_goal(&bridge, "true", json!({}));
+    bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
+    bridge.inventory("working", "idle", "original");
+    bridge.write("target.screen", "Editing\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    let prepare = |text: &str| {
+        bridge.ok(&["send", "--goal", &goal, "--task", "work", "--prepare", text]);
+    };
+    prepare("Second step");
+    let file = manager_dir(&bridge).join("t-original-prepared-main.json");
+    bridge.write("snapshot-prepared", file.to_str().unwrap());
+    bridge.inventory("done", "idle", "original");
+    bridge.write("target.screen", "First step done\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    assert!(
+        delivered(&bridge, &goal, "Second step"),
+        "{}",
+        sent_text(&bridge)
+    );
+    let at_prompt: Value = serde_json::from_slice(
+        &std::fs::read(bridge.root.path().join("prepared-at-prompt.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        at_prompt[0]["sending_at"].is_string(),
+        "marked before typing: {at_prompt}"
+    );
+    // Two more; the first was being typed when the watch stopped.
+    std::fs::remove_file(bridge.root.path().join("snapshot-prepared")).unwrap();
+    bridge.inventory("working", "idle", "original");
+    bridge.write("target.screen", "Working on the second\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    prepare("Third step");
+    prepare("Fourth step");
+    let mut steps: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    steps[0]["sending_at"] = json!("2026-11-16T00:00:00Z");
+    std::fs::write(&file, steps.to_string()).unwrap();
+    bridge.inventory("done", "idle", "original");
+    bridge.write("target.screen", "Second step done\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    bridge.write("target.screen", "Second step done, still\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    let sent = sent_text(&bridge);
+    assert!(!delivered(&bridge, &goal, "Third step"), "{sent}");
+    assert!(!delivered(&bridge, &goal, "Fourth step"), "waits: {sent}");
+    let held: Vec<Value> = bridge
+        .ok(&["log", &goal])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "prepared_held")
+        .cloned()
+        .collect();
+    assert!(
+        held.last().unwrap()["detail"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("may not have arrived"),
+        "{held:?}"
+    );
+}
+
+#[test]
+fn a_direct_send_is_admitted_under_the_lease_it_waits_for() {
+    // CX2-4: an assignment the watch delivered while the send waited counts.
+    let bridge = Bridge::new();
+    let goal = confirmed_goal(&bridge, "true", json!({"loop":{"max_assignments":2}}));
+    bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
+    let events = state_directory(&bridge)
+        .join("goals")
+        .join(format!("{goal}.events.ndjson"));
+    let lock = hold_operation_lock(&bridge);
+    let sending = bridge
+        .command(&["send", "--goal", &goal, "--task", "work", "Second step"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Meanwhile the watch delivered a prepared step for the same task.
+    let text = std::fs::read_to_string(&events).unwrap();
+    let assigned = text
+        .lines()
+        .find(|line| line.contains("\"kind\":\"assigned\""))
+        .unwrap()
+        .to_string();
+    std::fs::write(&events, format!("{text}{assigned}\n")).unwrap();
+    drop(lock);
+    let output = sending.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "admitted past the budget");
+    assert!(said.contains("Assignment budget exhausted"), "{said}");
+    assert!(!sent_text(&bridge).contains("Second step"));
+}
+
+#[test]
+fn a_shared_goals_prepared_step_is_held_at_its_own_boundary() {
+    // CX2-5: the step's goal has its own protected paths, checked before it goes.
+    let bridge = Bridge::new();
+    let a = confirmed_goal(&bridge, "true", json!({}));
+    std::fs::create_dir_all(bridge.workspace.join("secret")).unwrap();
+    std::fs::write(bridge.workspace.join("secret/key.txt"), "v1").unwrap();
+    let b = confirmed_goal(&bridge, "true", json!({"protected_paths":["secret"]}));
+    bridge.ok(&["send", "--goal", &a, "--task", "work", "Work on A"]);
+    bridge.inventory("working", "idle", "original");
+    bridge.write("target.screen", "Editing A\n› ");
+    bridge.ok(&[
+        "send",
+        "--goal",
+        &b,
+        "--task",
+        "work",
+        "--prepare",
+        "Work on B",
+    ]);
+    std::fs::write(bridge.workspace.join("secret/key.txt"), "v2").unwrap();
+    bridge.inventory("done", "idle", "original");
+    bridge.write("target.screen", "A done\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    assert!(
+        !delivered(&bridge, &b, "Work on B"),
+        "{}",
+        sent_text(&bridge)
+    );
+    let held: Vec<Value> = bridge
+        .ok(&["log", &b])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "prepared_held")
+        .cloned()
+        .collect();
+    assert!(
+        held[0]["detail"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("protected paths changed"),
+        "{held:?}"
+    );
+}
+
+#[test]
+fn a_stop_condition_comes_before_a_native_goal_set_at_settle() {
+    // CX2-6: under `settle`, the /goal would start new work.
+    let worker = ClaudeWorker::new();
+    let stop = worker.bridge.root.path().join("STOP");
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"native_goal":"settle",
+            "stop_checks":[{"name":"stop-file","command":format!("test -e '{}'", stop.display())}]}}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    std::fs::write(&stop, "").unwrap();
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(worker.goal_lines(), 0, "{}", sent_text(&worker.bridge));
+    assert!(worker.events(&goal, "stop_condition").len() == 1);
+}
+
+/// Whether the watch or a send delivered `text` to main as a linked
+/// assignment of `goal`'s task work (its delivered form).
+fn delivered(bridge: &Bridge, goal: &str, text: &str) -> bool {
+    sent_text(bridge).contains(&format!(
+        "w1:p1\nGoal {goal}, work, assigned to main.\n{text}"
+    ))
 }

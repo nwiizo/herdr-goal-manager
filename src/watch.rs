@@ -1161,10 +1161,31 @@ pub(crate) async fn watch_once(
             rot_wake(watch);
         }
     }
-    // The worker drives itself only while the goal has work for it.
-    if !short_of_completion(&goal) {
-        let reason = format!("goal {} is {:?}", goal.id, goal.status);
-        crate::native_goal::clear(store, watch, &reason).await?;
+    // The worker drives itself only while the goal its native goal is for has
+    // work here: on a shared watch, or after a watch armed again for another
+    // goal, that need not be the goal wakes are about.
+    if let Some(state) = watch
+        .native_goal
+        .clone()
+        .filter(crate::native_goal::NativeGoalState::is_set)
+    {
+        let owner = if state.goal == goal.id {
+            Some(goal.clone())
+        } else {
+            store.load(&state.goal).ok()
+        };
+        let reason = match &owner {
+            Some(owner) if !short_of_completion(owner) => {
+                Some(format!("goal {} is {:?}", owner.id, owner.status))
+            }
+            _ if !watch.serves(&state.goal) => {
+                Some(format!("goal {} is not watched here", state.goal))
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            crate::native_goal::clear(store, watch, &reason).await?;
+        }
     }
     if watch.wakes >= watch.max_wakes {
         // The budget is the goal's own: only it waits, other goals stay watched.
@@ -1589,7 +1610,9 @@ fn observe_native(store: &Store, watch: &mut Watch, screen: &str) -> Result<()> 
 }
 /// Sets the native goal once the worker has settled after a linked non-plan
 /// assignment that has none yet, when the contract wants one and nothing
-/// holds. Setting it starts a turn at once. Returns whether it was set.
+/// holds. Setting it starts a turn at once, so the stop checks run first.
+/// Returns whether it acted: set it, or found a stop condition that ended
+/// the watch.
 async fn set_native(
     store: &Store,
     watch: &mut Watch,
@@ -1621,6 +1644,11 @@ async fn set_native(
         .is_some_and(|state| state.goal == goal.id && state.assigned_at >= assigned.at);
     if assigned.detail["plan"] == true || done {
         return Ok(false);
+    }
+    // A /goal starts new work at once: a stop condition that holds comes
+    // first, as it does before a prepared step.
+    if stop_condition(store, watch, goal).await? {
+        return Ok(true);
     }
     // The settle checks ran since the observation: look again before typing.
     let (live, fresh) = fresh_worker(&watch.origin.pane).await?;
@@ -1791,6 +1819,54 @@ fn keep_prepared(
     watch.prepared_held = Some(reason);
     Ok(())
 }
+/// Whether a prepared step's delivery for this goal is uncertain with no
+/// manager action since: the next step may build on one that never arrived,
+/// so it waits until the manager prepares, withdraws or sends.
+fn uncertain_delivery(events: &[crate::events::Event]) -> bool {
+    let Some(at) = events
+        .iter()
+        .rposition(|e| e.kind == "prepared_delivery_uncertain")
+    else {
+        return false;
+    };
+    !events[at + 1..].iter().any(|e| {
+        matches!(
+            e.kind.as_str(),
+            "prepared" | "prepared_withdrawn" | "correction" | "reanchor"
+        ) || (e.kind == "assigned" && e.detail["via"].as_str() != Some("watch"))
+    })
+}
+/// Why `goal`'s own boundaries stop its work now: its protected paths changed
+/// since the contract was confirmed, or its time budget is spent. The watch
+/// ends for these on the goal wakes are about; a prepared step of another
+/// goal sharing the watch is held for them instead.
+fn boundary_reached(
+    goal: &crate::model::Goal,
+    events: &[crate::events::Event],
+    now: i64,
+) -> Result<Option<String>> {
+    if let Some(baseline) = &goal.protected_digest
+        && !goal.spec.protected_paths.is_empty()
+        && crate::contract::protected_digest(goal.work_dir()?, &goal.spec.protected_paths)?
+            != *baseline
+    {
+        return Ok(Some(format!(
+            "goal {}'s protected paths changed ({})",
+            goal.id,
+            goal.spec.protected_paths.join(", ")
+        )));
+    }
+    let first = events.iter().find(|e| e.kind == "assigned").map(|e| e.at);
+    if let (Some(hours), Some(first)) = (goal.spec.loop_policy.max_hours, first)
+        && now - first.timestamp() >= i64::from(hours) * 3600
+    {
+        return Ok(Some(format!(
+            "goal {}'s time budget of {hours} h is spent",
+            goal.id
+        )));
+    }
+    Ok(None)
+}
 /// Hands the step the manager prepared for the watched role to the worker
 /// once it has settled, through normal admission, when no check regressed, no
 /// stop condition, protected path or budget holds, the goal still has work
@@ -1836,11 +1912,19 @@ async fn deliver_prepared(
     } else {
         store.load(&step.goal)?
     };
-    let regressed = regressed(&store.events(&step.goal)?);
+    let step_events = store.events(&step.goal)?;
+    let regressed = regressed(&step_events);
+    let boundary = boundary_reached(&step_goal, &step_events, Utc::now().timestamp())?;
+    let uncertain = uncertain_delivery(&step_events);
     let hold = if !watch.serves(&step.goal) {
         Some(format!("goal {} is not watched here", step.goal))
     } else if let Some(held) = &watch.held {
         Some(format!("{} is held: {held}", watch.role))
+    } else if uncertain {
+        Some(format!(
+            "an earlier prepared step may not have arrived; inspect {} first, then prepare, withdraw or send to go on",
+            watch.role
+        ))
     } else if native_driving(watch, screen) {
         Some(format!("the native goal still drives {}", watch.role))
     } else if !regressed.is_empty() {
@@ -1853,6 +1937,8 @@ async fn deliver_prepared(
             "goal {} is not running (it awaits review, waits for the person, is paused or finished)",
             step.goal
         ))
+    } else if let Some(reason) = boundary {
+        Some(reason)
     } else if !can_prompt(target, screen) {
         Some(format!(
             "the input of {} is not free (a draft, a dialog or an unknown input line)",

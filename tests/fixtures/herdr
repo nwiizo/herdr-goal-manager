@@ -13,6 +13,10 @@ case "$1 $2" in
     else cat "$FIXTURE_ROOT/manager.screen"; fi ;;
   "agent prompt")
     printf '%s\n%s\n' "$3" "$4" >> "$FIXTURE_ROOT/sent.txt"
+    # The prepared queue as it stands while main is typed into.
+    if [ "$3" = w1:p1 ] && [ -f "$FIXTURE_ROOT/snapshot-prepared" ]; then
+      cp "$(cat "$FIXTURE_ROOT/snapshot-prepared")" "$FIXTURE_ROOT/prepared-at-prompt.json" 2>/dev/null || true
+    fi
     if [ -f "$FIXTURE_ROOT/fail-send" ]; then exit 1; fi
     if [ -f "$FIXTURE_ROOT/fail-send-$3" ]; then exit 1; fi
     if [ -f "$FIXTURE_ROOT/after-prompt.screen" ]; then cp "$FIXTURE_ROOT/after-prompt.screen" "$FIXTURE_ROOT/target.screen"; fi

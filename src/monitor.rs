@@ -340,11 +340,13 @@ async fn drain_once(store: &Store) -> Result<Option<(String, Vec<&'static str>)>
     if !watch_path(store, &key)?.exists() {
         return Ok(None);
     }
+    // The operation lease first: `supervise` holds it while it starts a new
+    // watch, which must then find the watch lease free.
+    let _operation = crate::binding::wait_operation_lease(store, &key).await?;
     let lease = watch_lease(store, &key)?;
     if lease.try_lock().is_err() {
         return Ok(None);
     }
-    let _operation = crate::binding::wait_operation_lease(store, &key).await?;
     let mut watch = load_watch(store, &key)?;
     if watch.active {
         return Ok(None);

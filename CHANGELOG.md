@@ -185,6 +185,15 @@ Fixes from an independent review (Codex, 2026-11-17; each with a test):
 - A prepared step is marked as being typed before the watch types it; a watch
   that stopped in between records it as uncertain on restart and never types it
   again.
+- After a second review: a native goal a stop left set is carried to the next
+  watch of the pane and cleared unless its goal is watched again, also on a
+  shared watch; the ending watch takes the operation lease before the watch
+  lease, so a watch `supervise` starts meanwhile is not shut out; after an
+  uncertain prepared step the next waits until the manager prepares, withdraws
+  or sends; a prepared step of another goal on a shared watch is held at that
+  goal's protected paths and time budget; a direct send holds the operation
+  lease from admission until the native goal it queues, so a budget spent
+  meanwhile refuses it; and stop checks run before a settle-time native goal.
 
 Native goal where it helps (verified with controlled executables; the native
 check is in docs/verification.md, 2026-11-16):
