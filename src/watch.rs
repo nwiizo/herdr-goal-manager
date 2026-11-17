@@ -1136,6 +1136,7 @@ pub(crate) async fn watch_once(
                    "work_dir_changed_at": changed_at}),
         )?;
     }
+    settle_interrupted(store, watch, now)?;
     confirm_pending_goal(store, watch, target, screen, now)?;
     if let Some(note) = crate::cross_check::poll(store, watch, now, false)? {
         append_note(watch, note);
@@ -1457,6 +1458,56 @@ fn hand_to_await(
             Ok(true)
         }
     }
+}
+/// A native goal input the watch was typing when it stopped: `sending` or
+/// `clearing`, saved right before typing and replaced right after, is left
+/// only by a watch that stopped in between. It may have arrived, so it is
+/// recorded as uncertain once and never typed again.
+pub(crate) fn settle_interrupted(store: &Store, watch: &mut Watch, now: i64) -> Result<()> {
+    let typing = |outcome: Option<&str>| matches!(outcome, Some("sending" | "clearing"));
+    let why = "the watch stopped while typing it";
+    if let Some(state) = watch
+        .native_goal
+        .clone()
+        .filter(|s| typing(s.outcome.as_deref()))
+    {
+        let kind = if state.outcome.as_deref() == Some("sending") {
+            "native_goal_set"
+        } else {
+            "native_goal_cleared"
+        };
+        store.record(
+            &state.goal,
+            kind,
+            json!({"task": state.task, "delivery": "uncertain", "why": why}),
+        )?;
+        watch.native_goal = Some(crate::native_goal::NativeGoalState {
+            outcome: Some("uncertain".into()),
+            ..state
+        });
+    }
+    if let Some(state) = watch
+        .manager_goal
+        .clone()
+        .filter(|s| typing(s.outcome.as_deref()))
+    {
+        let kind = if state.outcome.as_deref() == Some("sending") {
+            "manager_goal_set"
+        } else {
+            "manager_goal_cleared"
+        };
+        store.record(
+            &watch.goal,
+            kind,
+            json!({"delivery": "uncertain", "why": why}),
+        )?;
+        watch.manager_goal = Some(crate::manager_goal::ManagerGoalState {
+            outcome: Some("uncertain".into()),
+            ended_at: now,
+            ..state
+        });
+    }
+    Ok(())
 }
 /// Whether the native goal hgm set still drives the worker: no outcome yet and
 /// the screen shows it active or retrying by itself.

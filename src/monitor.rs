@@ -351,6 +351,7 @@ async fn drain_once(store: &Store) -> Result<Option<(String, Vec<&'static str>)>
     if watch.active {
         return Ok(None);
     }
+    settle_interrupted(store, &mut watch, chrono::Utc::now().timestamp())?;
     let mut left = vec![];
     // Each clear on its own: a closed main pane must not keep the Goal
     // Manager's goal set.

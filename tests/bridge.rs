@@ -6350,3 +6350,48 @@ fn a_cross_check_still_running_when_the_watch_ends_is_stopped_and_recorded() {
     let checked = worker.events(&goal, "cross_checked");
     assert_eq!(checked[0]["detail"]["verdict"], "stopped", "{checked:?}");
 }
+
+#[test]
+fn a_native_goal_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
+    // UC-2: `sending` is saved before typing; a watch that stopped in between
+    // leaves it, and the next one records it as uncertain without retyping.
+    let worker = ClaudeWorker::new();
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"native_goal":"settle"}}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    let assigned = worker.events(&goal, "assigned")[0]["at"].clone();
+    edit_watch(&worker.bridge, |w| {
+        w["native_goal"] = json!({"goal": goal, "task": "work", "assigned_at": assigned,
+            "set_at": chrono_now(), "outcome": "sending"});
+    });
+    worker.step("done", "Updated the copy\n❯ ");
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(worker.goal_lines(), 0, "{}", sent_text(&worker.bridge));
+    let set = worker.events(&goal, "native_goal_set");
+    assert_eq!(set[0]["detail"]["delivery"], "uncertain", "{set:?}");
+    assert_eq!(set[0]["detail"]["why"], "the watch stopped while typing it");
+}
+
+#[test]
+fn a_linked_send_is_refused_once_a_stop_condition_holds() {
+    // UC-4: the boundary the watch would stop at, before anything is typed.
+    let bridge = Bridge::new();
+    let stop = bridge.root.path().join("STOP");
+    let goal = confirmed_goal(
+        &bridge,
+        "true",
+        json!({"loop":{"stop_checks":[{"name":"stop-file","command":format!("test -e '{}'", stop.display())}]}}),
+    );
+    bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
+    std::fs::write(&stop, "").unwrap();
+    refused_with(
+        &bridge,
+        &["send", "--goal", &goal, "--task", "work", "Second step"],
+        "stop condition stop-file holds; nothing was sent",
+    );
+    assert!(!sent_text(&bridge).contains("Second step"));
+}

@@ -243,6 +243,12 @@ async fn set_goal(
         counted_at: now,
         ..ManagerGoalState::default()
     };
+    // Saved before typing (see `watch::settle_interrupted`).
+    watch.manager_goal = Some(ManagerGoalState {
+        outcome: Some("sending".into()),
+        ..state.clone()
+    });
+    crate::watch::save_watch(store, watch)?;
     let typed = type_into(
         &state.pane,
         &format!("/goal {condition}"),
@@ -416,6 +422,11 @@ async fn clear(
     if !free && !queued {
         return Ok(());
     }
+    watch.manager_goal = Some(ManagerGoalState {
+        outcome: Some("clearing".into()),
+        ..state.clone()
+    });
+    crate::watch::save_watch(store, watch)?;
     let answer = ["Goal cleared:", "No goal set"];
     let typed = type_into(&state.pane, "/goal clear", "claude", &answer, queued).await;
     let (mut detail, outcome) = match typed {

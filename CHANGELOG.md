@@ -165,6 +165,20 @@ Native goal (verified with controlled executables; native checks pending):
 - Design rule in the README and the manager guide: where a provider has an
   official mechanism, hgm uses it as documented.
 
+Fixes from a review of every use case (Codex, 2026-11-17):
+
+- Input is never typed while a dialog shows above an empty input line; native
+  goal inputs are saved as being typed before typing, and one a watch left
+  half-done is recorded as uncertain and never typed again.
+- The provider-error continue and linked sends stop at the goal's boundaries
+  (wake and time budgets, protected paths, stop checks); work a native goal did
+  after the first settle is checked again.
+- Review requests name the goal's checkout and are confirmed like a send; the
+  packet lists sends and wakes not confirmed; the ending watch clears main's
+  and the manager's goals independently; herdr-open passes its state folder;
+  guides no longer promise that a wait frees a factory slot or that revise
+  reassigns unfinished work.
+
 Another provider's check (verified with controlled executables):
 
 - New `loop.cross_check` (contract field or config default): `false` (default),

@@ -245,7 +245,8 @@ async fn queue_native_goal(
         return Ok(None);
     }
     let goal = store.load(goal)?;
-    let Some(state) = crate::native_goal::with_assignment(store, &goal, task, pane, agent).await?
+    let Some(state) =
+        crate::native_goal::with_assignment(store, &goal, task, pane, agent, &key).await?
     else {
         return Ok(None);
     };

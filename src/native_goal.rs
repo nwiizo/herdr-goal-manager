@@ -209,6 +209,13 @@ pub(crate) async fn set(
         set_at: Utc::now().timestamp(),
         outcome: None,
     };
+    // Saved before typing: a watch that stops in between finds it on restart,
+    // records it as uncertain and never types it again.
+    watch.native_goal = Some(NativeGoalState {
+        outcome: Some("sending".into()),
+        ..state.clone()
+    });
+    crate::watch::save_watch(store, watch)?;
     match type_into(
         &watch.origin.pane.clone(),
         &command,
@@ -289,6 +296,11 @@ pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Res
     if !free && !queued {
         return Ok(false);
     }
+    watch.native_goal = Some(NativeGoalState {
+        outcome: Some("clearing".into()),
+        ..state.clone()
+    });
+    crate::watch::save_watch(store, watch)?;
     let answer = ["Goal cleared:", "No goal set"];
     let (detail, outcome) = match type_into(
         &watch.origin.pane.clone(),
@@ -380,6 +392,7 @@ pub(crate) async fn with_assignment(
     task: Option<&str>,
     pane: &str,
     agent: &str,
+    key: &str,
 ) -> Result<Option<NativeGoalState>> {
     if mode(goal, agent) != Some(NativeGoalMode::Assignment) {
         return Ok(None);
@@ -409,6 +422,14 @@ pub(crate) async fn with_assignment(
         set_at: Utc::now().timestamp(),
         outcome: Some("pending".into()),
     };
+    // Saved before typing, as every native goal input is.
+    if let Ok(mut record) = crate::watch::load_watch(store, key) {
+        record.native_goal = Some(NativeGoalState {
+            outcome: Some("sending".into()),
+            ..state.clone()
+        });
+        crate::watch::save_watch(store, &record)?;
+    }
     match type_into(
         pane,
         &format!("/goal {condition}"),
