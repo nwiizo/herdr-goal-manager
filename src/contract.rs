@@ -17,6 +17,15 @@ pub(crate) enum Autonomy {
     Ask,
 }
 
+/// A loop setting written as `true` or `false`, or as a name
+/// (`loop.native_goal`, `loop.cross_check`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FlagOrName {
+    Flag(bool),
+    Name(String),
+}
+
 /// When hgm sets a worker's native goal (see `LoopPolicy::native_goal`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeGoalMode {
@@ -39,17 +48,11 @@ impl Serialize for NativeGoalMode {
 }
 impl<'de> Deserialize<'de> for NativeGoalMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Flag(bool),
-            Name(String),
-        }
-        match Raw::deserialize(deserializer)? {
+        match FlagOrName::deserialize(deserializer)? {
             // `true` was the only way to say "on", which set it after a settle.
-            Raw::Flag(true) => Ok(Self::Settle),
-            Raw::Flag(false) => Ok(Self::Off),
-            Raw::Name(name) => match name.as_str() {
+            FlagOrName::Flag(true) => Ok(Self::Settle),
+            FlagOrName::Flag(false) => Ok(Self::Off),
+            FlagOrName::Name(name) => match name.as_str() {
                 "assignment" => Ok(Self::Assignment),
                 "settle" => Ok(Self::Settle),
                 "off" => Ok(Self::Off),
@@ -92,16 +95,10 @@ impl Serialize for CrossCheck {
 }
 impl<'de> Deserialize<'de> for CrossCheck {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Flag(bool),
-            Name(String),
-        }
-        match Raw::deserialize(deserializer)? {
-            Raw::Flag(true) => Ok(Self::Auto),
-            Raw::Flag(false) => Ok(Self::Off),
-            Raw::Name(name) => match name.as_str() {
+        match FlagOrName::deserialize(deserializer)? {
+            FlagOrName::Flag(true) => Ok(Self::Auto),
+            FlagOrName::Flag(false) => Ok(Self::Off),
+            FlagOrName::Name(name) => match name.as_str() {
                 "auto" | "on" => Ok(Self::Auto),
                 "off" => Ok(Self::Off),
                 "codex" => Ok(Self::Codex),

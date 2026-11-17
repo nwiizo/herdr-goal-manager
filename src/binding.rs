@@ -344,31 +344,17 @@ pub(crate) async fn screen(pane: &str) -> Result<String> {
 /// Up to `lines` recent lines of `pane` from Herdr's scrollback, soft wraps
 /// joined; as many as Herdr has when it holds fewer.
 pub(crate) async fn recent_lines(pane: &str, lines: u32) -> Result<String> {
-    let ansi = herdr::query(&args(&[
-        "agent",
-        "read",
-        pane,
-        "--source",
-        "recent-unwrapped",
-        "--lines",
-        &lines.to_string(),
-        "--format",
-        "ansi",
-    ]))
-    .await?;
-    Ok(crate::signals::plain_screen(&ansi))
+    read_plain(pane, "recent-unwrapped", lines).await
 }
 pub(crate) async fn screen_lines(pane: &str, lines: u32) -> Result<String> {
+    read_plain(pane, "visible", lines).await
+}
+/// `lines` of `pane` from Herdr's `source`, read with styles and returned as
+/// plain text (see `signals::plain_screen`).
+async fn read_plain(pane: &str, source: &str, lines: u32) -> Result<String> {
+    let lines = lines.to_string();
     let ansi = herdr::query(&args(&[
-        "agent",
-        "read",
-        pane,
-        "--source",
-        "visible",
-        "--lines",
-        &lines.to_string(),
-        "--format",
-        "ansi",
+        "agent", "read", pane, "--source", source, "--lines", &lines, "--format", "ansi",
     ]))
     .await?;
     Ok(crate::signals::plain_screen(&ansi))

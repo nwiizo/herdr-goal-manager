@@ -319,11 +319,11 @@ pub(crate) fn save_watch(store: &Store, watch: &Watch) -> Result<()> {
 fn main_role() -> String {
     "main".into()
 }
-/// Ends every active watch record of `goal`, in any manager context. Pause,
-/// cancel and wait take effect even when no watch process is running to notice.
-pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result<()> {
-    let directory = store.private_directory("manager")?;
-    for entry in std::fs::read_dir(directory)? {
+/// Every watch record of the workspace, in any manager context; one that does
+/// not parse (written by another build) is skipped.
+fn watch_records(store: &Store) -> Result<Vec<Watch>> {
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(store.private_directory("manager")?)? {
         let path = entry?.path();
         if !path
             .file_name()
@@ -332,9 +332,16 @@ pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result
         {
             continue;
         }
-        let Ok(mut watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
-            continue;
-        };
+        if let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) {
+            records.push(watch);
+        }
+    }
+    Ok(records)
+}
+/// Ends every active watch record of `goal`, in any manager context. Pause,
+/// cancel and wait take effect even when no watch process is running to notice.
+pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result<()> {
+    for mut watch in watch_records(store)? {
         if watch.active && watch.serves(goal) {
             drop_goal(store, &mut watch, goal, reason, false)?;
             save_watch(store, &watch)?;
@@ -353,18 +360,7 @@ pub(crate) struct IdleStretch {
 /// Idle stretches of workers that running watches observe, by member goal.
 pub(crate) fn idle_stretches(store: &Store, now: i64) -> Result<BTreeMap<String, IdleStretch>> {
     let mut stretches = BTreeMap::new();
-    for entry in std::fs::read_dir(store.private_directory("manager")?)? {
-        let path = entry?.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-watch.json"))
-        {
-            continue;
-        }
-        let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
-            continue;
-        };
+    for watch in watch_records(store)? {
         let Some(secs) = watch.idle_for(now) else {
             continue;
         };
@@ -390,18 +386,7 @@ pub(crate) fn native_goals(
     store: &Store,
 ) -> Result<BTreeMap<String, crate::native_goal::NativeGoalState>> {
     let mut goals = BTreeMap::new();
-    for entry in std::fs::read_dir(store.private_directory("manager")?)? {
-        let path = entry?.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-watch.json"))
-        {
-            continue;
-        }
-        let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
-            continue;
-        };
+    for watch in watch_records(store)? {
         if let Some(state) = watch.native_goal.filter(|_| watch.active) {
             goals.insert(state.goal.clone(), state);
         }
@@ -414,18 +399,7 @@ pub(crate) fn manager_goals(
     store: &Store,
 ) -> Result<BTreeMap<String, crate::manager_goal::ManagerGoalState>> {
     let mut goals = BTreeMap::new();
-    for entry in std::fs::read_dir(store.private_directory("manager")?)? {
-        let path = entry?.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-watch.json"))
-        {
-            continue;
-        }
-        let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
-            continue;
-        };
+    for watch in watch_records(store)? {
         if let Some(state) = watch.manager_goal.clone().filter(|_| watch.active) {
             for goal in watch.members() {
                 goals.insert(goal, state.clone());
@@ -437,18 +411,7 @@ pub(crate) fn manager_goals(
 /// Whether a running watch, in any manager context, serves `goal`.
 pub(crate) fn watched(store: &Store, goal: &str) -> Result<bool> {
     let now = Utc::now().timestamp();
-    for entry in std::fs::read_dir(store.private_directory("manager")?)? {
-        let path = entry?.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-watch.json"))
-        {
-            continue;
-        }
-        let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) else {
-            continue;
-        };
+    for watch in watch_records(store)? {
         if watch.active && watch.serves(goal) && watch_running(store, &watch, now)? {
             return Ok(true);
         }
