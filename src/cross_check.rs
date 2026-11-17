@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::Path;
+use std::{os::unix::process::CommandExt, path::Path};
 
 /// How long a check may run before the watch stops it.
 const TIMEOUT_SECS: i64 = 900;
@@ -18,6 +18,21 @@ const TIMEOUT_SECS: i64 = 900;
 const MAX_DIFF: usize = 60_000;
 /// Findings a result keeps on the timeline and in the wake.
 const MAX_FINDINGS: usize = 10;
+
+/// `text` as one line of plain characters, at most `max` of them: the reviewer's
+/// output is model output, and control characters (escape sequences, carriage
+/// returns) must not reach the manager's terminal through a wake.
+fn clean(text: &str, max: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// Stops a check's process group: the shell leads its own group, so TERM
+/// reaches the CLI it started, not only the shell around it.
+fn stop_group(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pid}")])
+        .output();
+}
 
 /// A check the watch started and has not read back yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +162,7 @@ pub(crate) fn start(
     } else {
         result.clone()
     };
-    let child = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg("\"$@\" < \"$HGM_CROSS_IN\" > \"$HGM_CROSS_OUT\" 2> \"$HGM_CROSS_ERR\"; echo $? > \"$HGM_CROSS_EXIT\"")
         .arg("sh")
@@ -160,6 +175,7 @@ pub(crate) fn start(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("start the {reviewer} check"))?;
     store.record(
@@ -174,6 +190,10 @@ pub(crate) fn start(
         reviewer: reviewer.into(),
         started_at: Utc::now().timestamp(),
         pid: child.id(),
+    });
+    // Reaped when it ends, so a long-running watch leaves no zombie behind.
+    std::thread::spawn(move || {
+        let _ = child.wait();
     });
     Ok(())
 }
@@ -201,14 +221,12 @@ pub(crate) fn poll(store: &Store, watch: &mut Watch, now: i64) -> Result<Option<
                 .map(str::trim)
                 .filter(|line| line.starts_with("- "))
                 .take(MAX_FINDINGS)
-                .map(|line| line.chars().take(200).collect())
+                .map(|line| clean(line, 200))
                 .collect();
             (verdict, findings, status.trim().to_string())
         }
         None if now - run.started_at >= TIMEOUT_SECS => {
-            let _ = std::process::Command::new("kill")
-                .arg(run.pid.to_string())
-                .output();
+            stop_group(run.pid);
             ("timeout".to_string(), vec![], String::new())
         }
         None => return Ok(None),
@@ -223,7 +241,8 @@ pub(crate) fn poll(store: &Store, watch: &mut Watch, now: i64) -> Result<Option<
     let detail = if findings.is_empty() {
         String::new()
     } else {
-        format!(": {}", findings.join(" "))
+        // Model output, quoted as data: never raw text in the manager's input.
+        format!(": {}", serde_json::to_string(&findings).unwrap_or_default())
     };
     let note = format!(
         "the {} check of {}'s work for {} says {verdict}{detail}; it is an observation, not evidence: weigh it against the contract",
@@ -237,6 +256,61 @@ pub(crate) fn poll(store: &Store, watch: &mut Watch, now: i64) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timed_out_check_stops_the_cli_the_shell_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        let shell = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & echo $! > \"$1\"; wait")
+            .arg("sh")
+            .arg(&child)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let mut sleeper = String::new();
+        for _ in 0..50 {
+            sleeper = std::fs::read_to_string(&child)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !sleeper.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(alive(&sleeper));
+        stop_group(shell.id());
+        let mut shell = shell;
+        let _ = shell.wait();
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(&sleeper) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "the CLI under the shell was stopped too");
+    }
+
+    #[test]
+    fn reviewer_output_reaches_the_manager_as_plain_text() {
+        // An escape sequence and a carriage return in a finding are dropped.
+        assert_eq!(
+            clean("- \u{1b}[2Jcleared\rscreen", 200),
+            "- [2Jclearedscreen"
+        );
+        assert_eq!(clean("abcdef", 3), "abc");
+    }
 
     #[test]
     fn the_other_provider_checks_unless_the_contract_names_one() {
