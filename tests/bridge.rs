@@ -5692,3 +5692,203 @@ fn a_worker_goal_met_at_the_stop_that_ran_it_is_read_from_the_indicator() {
     );
     assert_eq!(worker.goal_lines(), 1, "never typed again");
 }
+
+/// Holds `<key>-operation.lock` as a watch step does.
+fn hold_operation_lock(bridge: &Bridge) -> std::fs::File {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(manager_dir(bridge).join("t-original-operation.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    lock
+}
+
+#[test]
+fn a_quiet_patrol_still_runs_the_stop_checks() {
+    // CX-6: under patrol_wake finding a progressing patrol wakes nobody; the
+    // stop checks must run all the same.
+    let bridge = Bridge::new();
+    let stop = bridge.root.path().join("STOP");
+    let spec = json!({"objective":"Long report","acceptance":["Report covers Q3"],
+        "checks":[{"name":"report","command":"true"}],
+        "loop":{"patrol_minutes":1,
+            "stop_checks":[{"name":"stop-file","command":format!("test -e '{}'", stop.display())}]}});
+    let goal = add_file(&bridge, spec);
+    bridge.ok(&["confirm", &goal, "--evidence", "User: go"]);
+    bridge.ok(&[
+        "send",
+        "--goal",
+        &goal,
+        "--task",
+        "work",
+        "Draft the Q3 report",
+    ]);
+    bridge.inventory("working", "idle", "original");
+    bridge.write("target.screen", "Writing section 1\n› ");
+    edit_watch(&bridge, |w| w["last_patrol"] = json!(0));
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    assert!(!kinds(&bridge, &goal).contains(&"stop_condition".to_string()));
+    std::fs::write(&stop, "").unwrap();
+    bridge.write("target.screen", "Writing section 2\n› ");
+    edit_watch(&bridge, |w| w["last_patrol"] = json!(0));
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    assert!(
+        kinds(&bridge, &goal).contains(&"stop_condition".to_string()),
+        "{:?}",
+        kinds(&bridge, &goal)
+    );
+    assert!(bridge.ok(&["show", &goal])["waiting"].is_object());
+}
+
+#[test]
+fn a_native_goal_a_draft_kept_from_clearing_is_cleared_after_the_watch_ends() {
+    // CX-1: a stop ends the watch at once; the ended watch clears the goal
+    // once main's input is free, never into the draft.
+    let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
+    worker.state("done", "Updated the copy\n❯ half-typed note");
+    let paused = worker.run(&["pause", &goal]);
+    assert!(paused.status.success());
+    let said = String::from_utf8_lossy(&paused.stderr);
+    assert!(said.contains("input is not free"), "{said}");
+    assert_eq!(worker.clears_typed(), 0);
+    worker.step("done", "Updated the copy\n❯ half-typed note");
+    assert_eq!(worker.clears_typed(), 0, "never into a draft");
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(worker.clears_typed(), 1);
+    let cleared = worker.cleared(&goal);
+    assert_eq!(
+        cleared.last().unwrap()["detail"]["reason"],
+        "the watch ended"
+    );
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(worker.clears_typed(), 1, "cleared once");
+}
+
+#[test]
+fn a_native_goal_is_not_cleared_in_a_session_the_user_started_since() {
+    // CX-2: the pane now runs another session than the bound one.
+    let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
+    let panes = json!([
+        {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"replacement","agent":"claude","agent_status":"idle","focused":false},
+        {"pane_id":"w1:p2","tab_id":"w1:t2","terminal_id":"manager","agent":"codex","agent_status":"idle","agent_session":{"value":"manager"},"focused":true}
+    ]);
+    worker
+        .bridge
+        .write("panes.json", &json!({"result":{"panes":panes}}).to_string());
+    worker.bridge.write(
+        "agents.json",
+        &json!({"result":{"agents":panes}}).to_string(),
+    );
+    worker.bridge.write("target.screen", "Fresh session\n❯ ");
+    assert!(worker.run(&["pause", &goal]).status.success());
+    assert_eq!(worker.clears_typed(), 0);
+    let cleared = worker.cleared(&goal);
+    assert_eq!(cleared[0]["detail"]["delivery"], "skipped", "{cleared:?}");
+}
+
+#[test]
+fn a_stop_reads_the_watch_again_under_the_lease() {
+    // CX-3: what a watch step saved while the stop waited for the lease stays.
+    let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
+    let lock = hold_operation_lock(&worker.bridge);
+    let pausing = worker
+        .bridge
+        .command(&["pause", &goal])
+        .env("HGM_CONTEXT", &worker.context)
+        .env("HGM_ORIGIN_JSON", &worker.origin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    edit_watch(&worker.bridge, |w| w["wakes"] = json!(7));
+    drop(lock);
+    let output = pausing.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(worker.clears_typed(), 1);
+    let watch: Value = serde_json::from_slice(
+        &std::fs::read(manager_dir(&worker.bridge).join("t-original-watch.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(watch["wakes"], 7, "not overwritten by an earlier read");
+}
+
+#[test]
+fn a_direct_send_waits_while_a_watch_step_holds_the_lease() {
+    // CX-4: the manager's own delivery and the watch's prepared step never
+    // type at once.
+    let bridge = Bridge::new();
+    let goal = bridge.goal();
+    bridge.ok(&["supervise", &goal]);
+    let lock = hold_operation_lock(&bridge);
+    let sending = bridge
+        .command(&["send", "Direct note while the watch works"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !sent_text(&bridge).contains("Direct note"),
+        "typed under a held lease"
+    );
+    drop(lock);
+    let output = sending.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(sent_text(&bridge).contains("Direct note while the watch works"));
+}
+
+#[test]
+fn a_prepared_step_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
+    // CX-5: a step marked as being typed when the watch stopped is uncertain.
+    let bridge = Bridge::new();
+    let goal = confirmed_goal(&bridge, "true", json!({}));
+    bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
+    bridge.inventory("working", "idle", "original");
+    bridge.write("target.screen", "Editing\n› ");
+    bridge.ok(&[
+        "send",
+        "--goal",
+        &goal,
+        "--task",
+        "work",
+        "--prepare",
+        "Second step",
+    ]);
+    let file = manager_dir(&bridge).join("t-original-prepared-main.json");
+    let mut steps: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    steps[0]["sending_at"] = json!("2026-11-16T00:00:00Z");
+    std::fs::write(&file, steps.to_string()).unwrap();
+    bridge.inventory("done", "idle", "original");
+    bridge.write("target.screen", "First step done\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    // The wake to the manager (w1:p2) may quote the step; main never gets it.
+    assert!(
+        !sent_text(&bridge).contains("w1:p1\nSecond step"),
+        "never typed into main again: {}",
+        sent_text(&bridge)
+    );
+    let uncertain: Vec<Value> = bridge
+        .ok(&["log", &goal])
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "prepared_delivery_uncertain")
+        .cloned()
+        .collect();
+    assert_eq!(
+        uncertain[0]["detail"]["error"], "the watch stopped while delivering it",
+        "{uncertain:?}"
+    );
+    assert!(!file.exists(), "taken off the queue");
+}

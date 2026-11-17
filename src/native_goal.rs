@@ -260,11 +260,25 @@ pub(crate) async fn set(
 /// only where the provider queues it and its input line is empty with no
 /// dialog. The worker is read right before typing, since a stop check may have
 /// run since the observation; otherwise the clear waits for a later one.
-pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Result<()> {
+pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Result<bool> {
     let Some(state) = watch.native_goal.clone().filter(NativeGoalState::is_set) else {
-        return Ok(());
+        return Ok(true);
     };
     let (live, screen) = crate::watch::fresh_worker(&watch.origin.pane).await?;
+    // The goal belongs to the bound session: a session the user started in
+    // that pane since is not typed into, and has no goal hgm set.
+    if let Err(error) = watch.origin.check(&live) {
+        store.record(
+            &state.goal,
+            "native_goal_cleared",
+            json!({"reason": reason, "delivery": "skipped", "why": format!("{error:#}")}),
+        )?;
+        watch.native_goal = Some(NativeGoalState {
+            outcome: Some("unbound".into()),
+            ..state
+        });
+        return Ok(true);
+    }
     let (live, screen) = (&live, screen.as_str());
     let agent = live["agent"].as_str().unwrap_or("");
     let free = crate::signals::can_prompt(live, screen);
@@ -273,7 +287,7 @@ pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Res
         && live["agent_status"] == "working"
         && crate::signals::input_refusal(live, screen).is_none();
     if !free && !queued {
-        return Ok(());
+        return Ok(false);
     }
     let answer = ["Goal cleared:", "No goal set"];
     let (detail, outcome) = match type_into(
@@ -304,7 +318,7 @@ pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Res
         outcome: Some(outcome.into()),
         ..state
     });
-    Ok(())
+    Ok(true)
 }
 
 /// Clears the native goal on this tab's watched worker, for `goal` or any
@@ -316,26 +330,37 @@ pub(crate) async fn clear_for(store: &Store, goal: Option<&str>, reason: &str) -
         return Ok(());
     };
     let key = context.key();
-    let Ok(mut watch) = crate::watch::load_watch(store, &key) else {
-        return Ok(());
+    let wanted = |watch: &Watch| {
+        watch
+            .native_goal
+            .as_ref()
+            .is_some_and(|state| goal.is_none_or(|goal| state.goal == goal) && state.is_set())
     };
-    if !watch
-        .native_goal
-        .as_ref()
-        .is_some_and(|state| goal.is_none_or(|goal| state.goal == goal) && state.is_set())
-    {
+    // A first look without the lease: most stops have no native goal to clear.
+    if !crate::watch::load_watch(store, &key).is_ok_and(|watch| wanted(&watch)) {
         return Ok(());
     }
     let cleared = async {
         let _operation = crate::binding::wait_operation_lease(store, &key).await?;
-        clear(store, &mut watch, reason).await?;
-        crate::watch::save_watch(store, &watch)
+        // Read again under the lease: a watch step or another command may have
+        // changed the record meanwhile, and the whole record is saved back.
+        let mut watch = crate::watch::load_watch(store, &key)?;
+        if !wanted(&watch) {
+            return Ok(true);
+        }
+        let typed = clear(store, &mut watch, reason).await?;
+        crate::watch::save_watch(store, &watch)?;
+        anyhow::Ok(typed)
     };
-    // The command that stops the goal goes on; the watch retries the clear.
-    if let Err(error) = cleared.await {
-        eprintln!(
-            "The native goal was not cleared now ({error:#}); the watch clears it on its next step."
-        );
+    // The command that stops the goal goes on; the ending watch retries.
+    match cleared.await {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "The native goal was not cleared now: the worker's input is not free (a draft, a dialog or an unknown input line). The watch clears it once the input is free and tells the user if it cannot."
+        ),
+        Err(error) => eprintln!(
+            "The native goal was not cleared now ({error:#}); the watch clears it once it can and tells the user if it cannot."
+        ),
     }
     Ok(())
 }

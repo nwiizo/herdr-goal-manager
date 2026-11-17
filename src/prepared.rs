@@ -31,6 +31,12 @@ pub(crate) struct Prepared {
     pub plan: bool,
     pub user_approval: Option<String>,
     pub prepared_at: DateTime<Utc>,
+    /// When the watch began to type it. Set right before typing and gone with
+    /// the step once it is delivered, so a watch that stopped in between finds
+    /// it on restart and never types it again (whether it arrived is unknown).
+    /// Written only while set, so a queue stays readable by earlier builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sending_at: Option<DateTime<Utc>>,
 }
 impl Prepared {
     /// The send the watch makes: normal admission, recorded as by the watch.
@@ -82,6 +88,21 @@ fn save(store: &Store, context: &str, role: &str, steps: &[Prepared]) -> Result<
 /// The next step for `role` in manager context `context`, if any.
 pub(crate) fn load(store: &Store, context: &str, role: &str) -> Result<Option<Prepared>> {
     Ok(queue(store, context, role)?.into_iter().next())
+}
+/// Marks the next step for `role` as being typed now (`at`), or no longer
+/// (`None`, when it was refused before anything was typed).
+pub(crate) fn mark_sending(
+    store: &Store,
+    context: &str,
+    role: &str,
+    at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let mut steps = queue(store, context, role)?;
+    if let Some(next) = steps.first_mut() {
+        next.sending_at = at;
+        save(store, context, role, &steps)?;
+    }
+    Ok(())
 }
 /// Takes the next step for `role` off its queue without a timeline record
 /// (it was delivered, or its delivery is recorded as uncertain).
@@ -179,6 +200,7 @@ pub(crate) async fn prepare(
         plan: assignment.plan,
         user_approval: assignment.user_approval.map(String::from),
         prepared_at: Utc::now(),
+        sending_at: None,
     };
     steps.push(step.clone());
     save(store, &key, assignment.to, &steps)?;

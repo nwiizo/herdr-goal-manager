@@ -184,25 +184,26 @@ pub(crate) async fn step(store: &Store, watch: &mut Watch) -> Result<()> {
     spin(store, watch, &live, &screen, &recent, now).await
 }
 
-/// Clears the manager goal once the watch has ended and no confirmed goal of
-/// the tab is in progress. Best-effort, from the ending watch process.
-pub(crate) async fn after_watch(store: &Store) -> Result<()> {
-    let key = crate::binding::session(store)?.key();
-    if !crate::watch::watch_path(store, &key)?.exists() {
-        return Ok(());
+/// After the watch ended (the caller holds the leases and saves `watch`):
+/// clears the manager goal when no confirmed goal of the tab is in progress or
+/// the setting is off. Returns whether a clear is still due, because the
+/// manager's input held a draft, a dialog or an unknown line.
+pub(crate) async fn after_watch(store: &Store, watch: &mut Watch) -> Result<bool> {
+    if !watch
+        .manager_goal
+        .as_ref()
+        .is_some_and(ManagerGoalState::is_set)
+    {
+        return Ok(false);
     }
-    let _operation = crate::binding::wait_operation_lease(store, &key).await?;
-    let mut watch = crate::watch::load_watch(store, &key)?;
-    if watch.active
-        || !watch
+    step(store, watch).await?;
+    let due =
+        !crate::config::load(&store.workspace)?.manager_native_goal() || !tab_in_progress(store)?;
+    Ok(due
+        && watch
             .manager_goal
             .as_ref()
-            .is_some_and(ManagerGoalState::is_set)
-    {
-        return Ok(());
-    }
-    step(store, &mut watch).await?;
-    crate::watch::save_watch(store, &watch)
+            .is_some_and(ManagerGoalState::is_set))
 }
 
 /// Whether hgm may set the goal now: never after the spin guard cleared it

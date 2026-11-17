@@ -281,16 +281,83 @@ pub(crate) async fn watch_loop(store: &Store, options: LoopOptions) -> Result<()
         ..Display::default()
     };
     let result = drive(store, options, &mut display).await;
-    // An ended watch leaves no goal in progress to keep the manager going.
-    if let Err(error) = crate::manager_goal::after_watch(store).await {
-        eprintln!("The Goal Manager's native goal was not cleared: {error:#}");
-    }
+    // Native goals the watch set may still be set when its input was busy.
+    drain(store, options.once || options.run_for.is_some()).await;
     // Only a running watch keeps the tab and sidebar current: show how it
     // ended and clear the sidebar so it never shows a stale state.
     display
         .finish(store, !options.once && options.run_for.is_none())
         .await;
     result
+}
+
+/// How long an ended watch keeps trying to clear the native goals it set.
+const DRAIN: Duration = Duration::from_secs(1800);
+
+/// After the watch ends, clears the native goals it set that may still be
+/// set: main's, and the Goal Manager's once no confirmed goal of the tab is
+/// in progress. A draft, a dialog or an unknown input line defers a clear
+/// (nothing is typed into them), and a stop (wait, pause, cancel) ends the
+/// watch at once, so this retries every [`POLL`] for up to [`DRAIN`] and then
+/// tells the user what may still be set. A one-off run tries once.
+async fn drain(store: &Store, once: bool) {
+    let deadline = Instant::now() + DRAIN;
+    loop {
+        let (goal, left) = match drain_once(store).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("The native goals the watch set were not cleared: {error:#}");
+                return;
+            }
+        };
+        if once {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let reason = format!(
+                "{} may still have the /goal hgm set: its input held a draft, a dialog or an unknown line for {} minutes after the goal stopped, so hgm typed nothing; type /goal clear there",
+                left.join(" and "),
+                DRAIN.as_secs() / 60
+            );
+            if let Err(error) = store.record(
+                &goal,
+                "attention",
+                json!({"cause": "native_goal_left_set", "reason": reason}),
+            ) {
+                eprintln!("Could not tell the user: {error:#}");
+            }
+            return;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+/// One attempt of [`drain`], holding the watch and operation leases. Returns
+/// the watch's goal and who may still have a goal set, or `None` when nothing
+/// is left or another watch runs for the tab (it decides from then on).
+async fn drain_once(store: &Store) -> Result<Option<(String, Vec<&'static str>)>> {
+    let key = session(store)?.key();
+    if !watch_path(store, &key)?.exists() {
+        return Ok(None);
+    }
+    let lease = watch_lease(store, &key)?;
+    if lease.try_lock().is_err() {
+        return Ok(None);
+    }
+    let _operation = crate::binding::wait_operation_lease(store, &key).await?;
+    let mut watch = load_watch(store, &key)?;
+    if watch.active {
+        return Ok(None);
+    }
+    let mut left = vec![];
+    if !crate::native_goal::clear(store, &mut watch, "the watch ended").await? {
+        left.push("main");
+    }
+    if crate::manager_goal::after_watch(store, &mut watch).await? {
+        left.push("the Goal Manager");
+    }
+    save_watch(store, &watch)?;
+    Ok((!left.is_empty()).then(|| (watch.goal.clone(), left)))
 }
 
 async fn drive(store: &Store, options: LoopOptions, display: &mut Display) -> Result<()> {

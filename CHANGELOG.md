@@ -165,6 +165,27 @@ Native goal (verified with controlled executables; native checks pending):
 - Design rule in the README and the manager guide: where a provider has an
   official mechanism, hgm uses it as documented.
 
+Fixes from an independent review (Codex, 2026-11-17; each with a test):
+
+- Stop checks run at every patrol, also a quiet one under `patrol_wake:
+  finding`; before, a stop condition went unseen until another cause woke the
+  manager.
+- A native goal that a draft or a dialog kept from clearing when its goal
+  stopped is cleared by the ending watch once the input is free (retried for up
+  to 30 minutes, then the user is told); before, `wait`, `pause` and `cancel`
+  ended the watch and the goal stayed set. The same holds for the Goal
+  Manager's goal.
+- `/goal clear` goes only to the bound session: a session started in the pane
+  since is not typed into (`native_goal_cleared` `delivery: skipped`).
+- A stop reads the watch record under the operation lease, so it no longer
+  writes back a copy older than a watch step's save.
+- A direct send to a watched tab takes the operation lease, like the watch's
+  delivery of a prepared step, so the two never type at once and the steps it
+  supersedes change under the lease that prepare and withdraw take.
+- A prepared step is marked as being typed before the watch types it; a watch
+  that stopped in between records it as uncertain on restart and never types it
+  again.
+
 Native goal where it helps (verified with controlled executables; the native
 check is in docs/verification.md, 2026-11-16):
 

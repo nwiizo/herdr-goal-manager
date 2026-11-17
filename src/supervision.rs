@@ -273,18 +273,25 @@ async fn deliver(
     }
     // Every lock the delivery needs is taken before anything is typed: once the
     // text leaves the input, no failure may invite a resend.
-    let arming = match assignment.goal {
-        Some(goal) if assignment.supervise => {
-            let active = load_watch(store, &context.key()).is_ok_and(|watch| {
-                watch.active && watch.serves(goal) && watch.role == assignment.to
-            });
-            if active {
-                None
-            } else {
-                Some(wait_operation_lease(store, &context.key()).await?)
-            }
-        }
-        _ => None,
+    let watch = load_watch(store, &context.key())
+        .ok()
+        .filter(|watch| watch.active);
+    let watched = assignment.goal.is_some_and(|goal| {
+        watch
+            .as_ref()
+            .is_some_and(|watch| watch.serves(goal) && watch.role == assignment.to)
+    });
+    // The watch types prepared steps under the operation lease, so the
+    // manager's own delivery takes it too: the two never type into one input
+    // at once, and the steps a direct send supersedes change under the lease
+    // that prepare and withdraw take. The watch's own delivery runs inside its
+    // step, which holds the lease already.
+    let arming = if assignment.via.is_none()
+        && (watch.is_some() || (assignment.goal.is_some() && assignment.supervise))
+    {
+        Some(wait_operation_lease(store, &context.key()).await?)
+    } else {
+        None
     };
     let (live, screen) = observe_recipient(store, helper).await?;
     let agent = live["agent"].as_str().unwrap_or("");
@@ -393,7 +400,8 @@ async fn deliver(
     if let Some(goal) = assignment.goal
         && assignment.supervise
     {
-        result["supervision"] = match arming {
+        result["supervision"] = match &arming {
+            _ if watched => "already_active".into(),
             None => "already_active".into(),
             Some(_operation) => {
                 match arm(
@@ -411,6 +419,8 @@ async fn deliver(
             }
         };
     }
+    // Released before the native goal is queued, which takes it again.
+    drop(arming);
     // `loop.native_goal: assignment`: the native goal follows the assignment
     // as queued input, pending until the watch reads it (see native_goal).
     if assignment.kind == Delivery::Assignment

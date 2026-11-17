@@ -1236,6 +1236,10 @@ pub(crate) async fn watch_once(
         });
     }
     let patrol = watch.patrol(&goal);
+    // Stop checks run at every patrol, whether or not it wakes anyone: a quiet
+    // patrol (`patrol_wake: finding`) would otherwise leave a stop condition
+    // unseen until another cause wakes the manager.
+    let mut stop_checked = false;
     if patrol > 0
         && watch.pending.is_none()
         && watch.held.is_none()
@@ -1245,6 +1249,10 @@ pub(crate) async fn watch_once(
         // Progress is visible when the screen changed since the previous patrol.
         let progressed = watch.last_change > watch.last_patrol;
         watch.last_patrol = now;
+        if stop_condition(store, watch, &goal).await? {
+            return Ok(());
+        }
+        stop_checked = true;
         if watch.repeated() {
             hold(
                 store,
@@ -1286,7 +1294,7 @@ pub(crate) async fn watch_once(
         watch.clear_pending();
         return Ok(());
     }
-    if stop_condition(store, watch, &goal).await? {
+    if !stop_checked && stop_condition(store, watch, &goal).await? {
         return Ok(());
     }
     if hand_to_await(store, watch, &goal, &events, target, screen, now)? {
@@ -1801,6 +1809,25 @@ async fn deliver_prepared(
         watch.prepared_held = None;
         return Ok(false);
     };
+    if let Some(since) = step.sending_at {
+        // The watch stopped while typing this step: whether it arrived is
+        // unknown, so it is recorded as uncertain and never typed again.
+        crate::prepared::remove(store, &watch.context, &watch.role)?;
+        store.record(
+            &step.goal,
+            "prepared_delivery_uncertain",
+            json!({"task": step.task, "to": step.to, "error": "the watch stopped while delivering it", "since": since}),
+        )?;
+        append_note(
+            watch,
+            format!(
+                "the watch stopped while typing your prepared step for {}; it may have arrived and is not typed again: inspect {} before sending anything",
+                step.task.as_deref().unwrap_or("the goal"),
+                watch.role
+            ),
+        );
+        return Ok(false);
+    }
     if !matches!(target["agent_status"].as_str(), Some("idle" | "done")) {
         return Ok(false);
     }
@@ -1843,6 +1870,7 @@ async fn deliver_prepared(
     }
     let helper = crate::roles::resolve(store, &step.to)?;
     let task = step.task.as_deref().unwrap_or("the goal");
+    crate::prepared::mark_sending(store, &watch.context, &watch.role, Some(Utc::now()))?;
     match crate::supervision::send(store, &step.text, step.assignment(), helper.as_ref()).await {
         Ok(result) => {
             watch.prepared_held = None;
@@ -1874,6 +1902,8 @@ async fn deliver_prepared(
             );
         }
         Err(error) => {
+            // Refused before anything was typed: it may go later.
+            crate::prepared::mark_sending(store, &watch.context, &watch.role, None)?;
             keep_prepared(store, watch, &step, format!("{error:#}"))?;
             return Ok(false);
         }
