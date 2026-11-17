@@ -353,6 +353,21 @@ natively on both), and records it as `ended` without a name when the outcome
 line has already scrolled out of the lines it reads. Claude Code's evaluator
 also accepted a manager saying it waits as an exit ([verification](docs/verification.md)).
 
+## Another provider's check (`loop.cross_check`)
+
+A contract (or a `loop` default in the user or project config) can ask the
+watch to have another provider check the worker's work each time it settles
+after new work, next to the settle checks: `false` (the default), `true` or
+`auto` (Codex checks a Claude Code worker, Claude Code checks the others),
+`codex` or `claude`. The watch starts a one-shot, read-only run of that CLI
+(`codex exec --sandbox read-only`, or `claude -p` with Read, Grep and Glob
+only) on the goal's objective and acceptance and the work dir's `git diff HEAD`
+and untracked files, and does not wait for it: a later observation reads the
+result, records `cross_checked` (verdict `approve`, `changes_requested`,
+`no_verdict` or `timeout` after 15 minutes, with up to ten findings) and wakes
+the manager with it. One check runs at a time. Its verdict is an observation:
+it completes no task and accepts no goal.
+
 ## Keep main working
 
 Keeping main working toward the confirmed goal is part of the manager's goal.

@@ -64,7 +64,7 @@ as one word) unless "long_spec_reason" says why. Shape (omit empty fields):
   "stop_when":["Abort condition judged by you"],
   "stop_checks":[{"name":"id","command":"exits 0 when the loop must stop"}],
   "autonomy":"auto","handoff_percent":85,"native_goal":"assignment",
-  "require_review":false,"patrol_wake":"finding"}}
+  "require_review":false,"patrol_wake":"finding","cross_check":false}}
 Make boundaries mechanical where you can: protected_paths stop the loop when
 they change, stop_checks stop it when their command succeeds, and a task's
 write_paths name what it may write (hgm reports writes elsewhere and never

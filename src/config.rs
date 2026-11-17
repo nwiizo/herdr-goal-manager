@@ -108,6 +108,8 @@ pub(crate) struct LoopDefaults {
     pub require_review: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patrol_wake: Option<crate::contract::PatrolWake>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<crate::contract::CrossCheck>,
 }
 
 /// Monitoring defaults for `supervise` and linked sends.

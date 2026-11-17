@@ -6120,3 +6120,155 @@ fn delivered(bridge: &Bridge, goal: &str, text: &str) -> bool {
         "w1:p1\nGoal {goal}, work, assigned to main.\n{text}"
     ))
 }
+
+#[test]
+fn a_native_goal_is_not_carried_to_another_session_in_the_pane() {
+    // CX3-1: after the user started Codex in main's pane and reopened the
+    // manager, the old Claude Code goal is not the new session's to clear.
+    let (worker, a) = ClaudeWorker::with_native_goal(json!({}));
+    worker.state("done", "Updated the copy\n❯ half-typed note");
+    assert!(worker.run(&["pause", &a]).status.success());
+    let origin =
+        json!({"pane":"w1:p1","tab":"w1:t1","terminal":"original","agent":"codex","session":null})
+            .to_string();
+    let panes = json!([
+        {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"original","agent":"codex","agent_status":"idle","focused":false},
+        {"pane_id":"w1:p2","tab_id":"w1:t2","terminal_id":"manager","agent":"codex","agent_status":"idle","agent_session":{"value":"manager"},"focused":true}
+    ]);
+    worker
+        .bridge
+        .write("panes.json", &json!({"result":{"panes":panes}}).to_string());
+    worker.bridge.write(
+        "agents.json",
+        &json!({"result":{"agents":panes}}).to_string(),
+    );
+    worker.bridge.write("target.screen", "Codex ready\n› ");
+    let opened = worker
+        .bridge
+        .command(&["manager", "--agent", "codex"])
+        .env("HGM_ORIGIN_JSON", &origin)
+        .output()
+        .unwrap();
+    assert!(opened.status.success());
+    let context = std::fs::read_to_string(worker.bridge.root.path().join("context")).unwrap();
+    let run = |args: &[&str]| {
+        worker
+            .bridge
+            .command(args)
+            .env("HGM_CONTEXT", &context)
+            .env("HGM_ORIGIN_JSON", &origin)
+            .output()
+            .unwrap()
+    };
+    let b = confirmed_goal(&worker.bridge, "true", json!({}));
+    assert!(run(&["supervise", &b]).status.success());
+    assert!(run(&["watch-loop", "--once"]).status.success());
+    assert_eq!(worker.clears_typed(), 0, "{}", sent_text(&worker.bridge));
+}
+
+#[test]
+fn a_stopped_goals_prepared_step_with_a_removed_checkout_does_not_end_the_watch() {
+    // CX3-2: its boundaries are checked only for a goal still served.
+    let bridge = Bridge::new();
+    let a = confirmed_goal(&bridge, "true", json!({}));
+    let b = confirmed_goal(&bridge, "true", json!({}));
+    bridge.ok(&["send", "--goal", &a, "--task", "work", "Work on A"]);
+    bridge.inventory("working", "idle", "original");
+    bridge.write("target.screen", "Editing A\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    bridge.ok(&[
+        "send",
+        "--goal",
+        &b,
+        "--task",
+        "work",
+        "--prepare",
+        "Work on B",
+    ]);
+    bridge.ok(&["pause", &b]);
+    let file = state_directory(&bridge)
+        .join("goals")
+        .join(format!("{b}.json"));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    record["checkout"] = json!({"path": bridge.root.path().join("gone"), "branch":"b","base":"main",
+        "workspace_id":"w9","removed_at":"2026-11-16T00:00:00Z"});
+    std::fs::write(&file, record.to_string()).unwrap();
+    bridge.inventory("done", "idle", "original");
+    bridge.write("target.screen", "A done\n› ");
+    let output = bridge.call(&["watch-loop", "--once"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(bridge.ok(&["watch"])["active"], true, "A is still watched");
+    assert!(!delivered(&bridge, &b, "Work on B"));
+}
+
+#[test]
+fn another_providers_check_runs_at_settle_and_wakes_the_manager_with_its_verdict() {
+    let worker = ClaudeWorker::new();
+    worker.bridge.write(
+        "bin/codex",
+        "#!/bin/sh\nout=; prev=\nfor a in \"$@\"; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\nprintf '%s\\n' \"$@\" > \"$FIXTURE_ROOT/cross-args\"\ncat > \"$FIXTURE_ROOT/cross-prompt\"\nprintf 'VERDICT: changes_requested\\n- notes.txt misses world\\n' > \"$out\"\n",
+    );
+    // Off by default: nothing starts.
+    let off = confirmed_goal(&worker.bridge, "true", json!({}));
+    worker.ok(&["send", "--goal", &off, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    worker.step("done", "Updated the copy\n❯ ");
+    assert!(worker.events(&off, "cross_check_started").is_empty());
+
+    let worker = ClaudeWorker::new();
+    let codex = worker.bridge.root.path().join("bin/codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\nout=; prev=\nfor a in \"$@\"; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\nprintf '%s\\n' \"$@\" > \"$FIXTURE_ROOT/cross-args\"\ncat > \"$FIXTURE_ROOT/cross-prompt\"\nprintf 'VERDICT: changes_requested\\n- notes.txt misses world\\n' > \"$out\"\n",
+    )
+    .unwrap();
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"cross_check":"auto"}}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    worker.step("done", "Updated the copy\n❯ ");
+    let started = worker.events(&goal, "cross_check_started");
+    assert_eq!(started[0]["detail"]["reviewer"], "codex", "{started:?}");
+    let mut checked = vec![];
+    for _ in 0..30 {
+        worker.step("done", "Updated the copy\n❯ ");
+        checked = worker.events(&goal, "cross_checked");
+        if !checked.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        checked[0]["detail"]["verdict"], "changes_requested",
+        "{checked:?}"
+    );
+    assert_eq!(
+        checked[0]["detail"]["findings"][0],
+        "- notes.txt misses world"
+    );
+    let args = std::fs::read_to_string(worker.bridge.root.path().join("cross-args")).unwrap();
+    assert!(args.contains("read-only"), "{args}");
+    let prompt = std::fs::read_to_string(worker.bridge.root.path().join("cross-prompt")).unwrap();
+    assert!(
+        prompt.contains("Copy updated") && prompt.contains("VERDICT"),
+        "{prompt}"
+    );
+    assert!(
+        sent_text(&worker.bridge)
+            .contains("the codex check of main's work for work says changes_requested"),
+        "{}",
+        sent_text(&worker.bridge)
+    );
+    assert_eq!(
+        worker.events(&goal, "task_completed").len(),
+        0,
+        "decides nothing"
+    );
+}

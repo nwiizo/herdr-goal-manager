@@ -6,6 +6,7 @@ mod checkout;
 mod cli;
 mod config;
 mod contract;
+mod cross_check;
 mod events;
 mod factory;
 mod fingerprint;

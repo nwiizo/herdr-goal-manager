@@ -165,6 +165,15 @@ Native goal (verified with controlled executables; native checks pending):
 - Design rule in the README and the manager guide: where a provider has an
   official mechanism, hgm uses it as documented.
 
+Another provider's check (verified with controlled executables):
+
+- New `loop.cross_check` (contract field or config default): `false` (default),
+  `true`/`auto` (Codex checks Claude Code, Claude Code checks the others),
+  `codex` or `claude`. When the worker settles after new work, the watch starts a
+  one-shot read-only run of that CLI on the goal's acceptance and the work dir's
+  changes, reads the result at a later observation, records `cross_checked` and
+  wakes the manager. It never completes or accepts anything.
+
 Fixes from an independent review (Codex, 2026-11-17; each with a test):
 
 - Stop checks run at every patrol, also a quiet one under `patrol_wake:

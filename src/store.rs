@@ -286,6 +286,11 @@ impl Store {
         File::open(directory)?.sync_all()?;
         Ok(())
     }
+    /// Where the run `attempt` keeps its files, without creating it.
+    pub fn run_path(&self, attempt: &str) -> Result<PathBuf> {
+        validate_id(attempt)?;
+        Ok(self.directory.join("runs").join(attempt))
+    }
     pub fn run_directory(&self, attempt: &str) -> Result<PathBuf> {
         validate_id(attempt)?;
         self.initialize()?;

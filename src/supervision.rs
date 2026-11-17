@@ -633,11 +633,24 @@ async fn arm(
     // the spin guard cleared, belongs to this manager session.
     // A native goal main may still run (a stop could not clear it) stays with
     // the pane, so this watch clears it unless its goal is served again.
+    // Only the same agent session: a session started in the pane since has
+    // no goal hgm set, and its own /goal is not hgm's to clear.
+    let same_worker = |w: &&Watch| {
+        w.origin.pane == origin.pane
+            && w.origin.terminal == origin.terminal
+            && w.origin.agent == origin.agent
+            && w.origin.session == origin.session
+    };
     let native_goal = previous
         .as_ref()
-        .filter(|w| w.origin.pane == origin.pane)
+        .filter(same_worker)
         .and_then(|w| w.native_goal.clone())
         .filter(crate::native_goal::NativeGoalState::is_set);
+    // A check still running reports to the next watch of the same pane.
+    let cross_check = previous
+        .as_ref()
+        .filter(same_worker)
+        .and_then(|w| w.cross_check.clone());
     let manager_goal = previous
         .as_ref()
         .and_then(|w| w.manager_goal.clone())
@@ -669,6 +682,7 @@ async fn arm(
         native_goal,
         native_unavailable: false,
         manager_goal,
+        cross_check,
         wakes: previous
             .as_ref()
             .filter(|w| w.goal == goal)

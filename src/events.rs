@@ -333,6 +333,13 @@ pub(crate) fn summary(event: &Event) -> String {
         },
         "manager_goal" => format!("{}: {}", text("outcome"), text("line")),
         "manager_goal_cleared" => text("reason"),
+        "cross_check_started" => format!("{} checks {}", text("reviewer"), text("task")),
+        "cross_checked" => format!(
+            "{} says {} ({} findings)",
+            text("reviewer"),
+            text("verdict"),
+            d["findings"].as_array().map_or(0, Vec::len)
+        ),
         "refused" => format!("{} to {}: {}", text("command"), text("to"), text("reason")),
         "report" => format!(
             "{}{}: {}",

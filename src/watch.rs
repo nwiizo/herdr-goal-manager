@@ -131,6 +131,10 @@ pub(crate) struct Watch {
     /// The native goal hgm set on the Goal Manager (see `manager_goal`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_goal: Option<crate::manager_goal::ManagerGoalState>,
+    /// The other provider's check of the worker's work, while it runs
+    /// (`loop.cross_check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<crate::cross_check::CrossRun>,
 }
 fn default_idle_notice_secs() -> u64 {
     crate::config::DEFAULT_IDLE_NOTICE_SECS
@@ -990,6 +994,15 @@ async fn settle_checks(
         None => note,
     });
     watch.pending_stop = true;
+    // The other provider looks at the same work, if the contract asks for it.
+    let task = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind.as_str(), "assigned" | "correction"))
+        .and_then(|e| e.detail["task"].as_str());
+    if let Err(error) = crate::cross_check::start(store, watch, goal, task) {
+        append_note(watch, format!("the cross check could not start: {error:#}"));
+    }
     Ok(())
 }
 /// The wake note after settle checks. A failing check asks for a correction
@@ -1117,6 +1130,10 @@ pub(crate) async fn watch_once(
         )?;
     }
     confirm_pending_goal(store, watch, target, screen, now)?;
+    if let Some(note) = crate::cross_check::poll(store, watch, now)? {
+        append_note(watch, note);
+        watch.pending_stop = true;
+    }
     notice_unseen_end(store, watch, target, screen, now)?;
     if seen == Seen::Stalled {
         let reason = format!(
@@ -1914,8 +1931,18 @@ async fn deliver_prepared(
     };
     let step_events = store.events(&step.goal)?;
     let regressed = regressed(&step_events);
-    let boundary = boundary_reached(&step_goal, &step_events, Utc::now().timestamp())?;
-    let uncertain = uncertain_delivery(&step_events);
+    // The step may build on an uncertain step of any goal on this watch.
+    let mut shared = Vec::new();
+    let goals: std::collections::BTreeSet<String> = watch
+        .members()
+        .into_iter()
+        .chain([step.goal.clone()])
+        .collect();
+    for member in goals {
+        shared.extend(store.events(&member)?);
+    }
+    shared.sort_by_key(|e| e.at);
+    let uncertain = uncertain_delivery(&shared);
     let hold = if !watch.serves(&step.goal) {
         Some(format!("goal {} is not watched here", step.goal))
     } else if let Some(held) = &watch.held {
@@ -1937,7 +1964,11 @@ async fn deliver_prepared(
             "goal {} is not running (it awaits review, waits for the person, is paused or finished)",
             step.goal
         ))
-    } else if let Some(reason) = boundary {
+    // Checked only for a goal still served and running, so a stopped goal's
+    // removed checkout holds its step instead of failing the watch.
+    } else if let Some(reason) = boundary_reached(&step_goal, &step_events, Utc::now().timestamp())
+        .unwrap_or_else(|error| Some(format!("{error:#}")))
+    {
         Some(reason)
     } else if !can_prompt(target, screen) {
         Some(format!(
@@ -2476,6 +2507,7 @@ mod tests {
             native_goal: None,
             native_unavailable: false,
             manager_goal: None,
+            cross_check: None,
         }
     }
     #[test]

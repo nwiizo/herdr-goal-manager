@@ -61,6 +61,59 @@ impl<'de> Deserialize<'de> for NativeGoalMode {
     }
 }
 
+/// Which provider checks the watched worker's work each time it settles after
+/// new work (`LoopPolicy::cross_check`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CrossCheck {
+    /// No check (the default).
+    #[default]
+    Off,
+    /// The other provider: Codex checks Claude Code, Claude Code checks the rest.
+    Auto,
+    /// Always Codex.
+    Codex,
+    /// Always Claude Code.
+    Claude,
+}
+impl CrossCheck {
+    fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+}
+impl Serialize for CrossCheck {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => serializer.serialize_bool(false),
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Codex => serializer.serialize_str("codex"),
+            Self::Claude => serializer.serialize_str("claude"),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for CrossCheck {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Name(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Flag(true) => Ok(Self::Auto),
+            Raw::Flag(false) => Ok(Self::Off),
+            Raw::Name(name) => match name.as_str() {
+                "auto" | "on" => Ok(Self::Auto),
+                "off" => Ok(Self::Off),
+                "codex" => Ok(Self::Codex),
+                "claude" => Ok(Self::Claude),
+                other => Err(serde::de::Error::custom(format!(
+                    "loop.cross_check must be false, true, auto, codex or claude, not {other}"
+                ))),
+            },
+        }
+    }
+}
+
 /// When a patrol of a working worker wakes the manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +178,12 @@ pub(crate) struct LoopPolicy {
     /// default: on 2026-11-15 about thirty such wakes led to no action).
     #[serde(skip_serializing_if = "PatrolWake::is_finding")]
     pub patrol_wake: PatrolWake,
+    /// Whether another provider checks the watched worker's work, read-only,
+    /// each time it settles after new work: `false` (the default), `true` or
+    /// `auto` (Codex checks Claude Code, Claude Code checks the rest), `codex`
+    /// or `claude`. Its verdict wakes the manager; it is an observation only.
+    #[serde(skip_serializing_if = "CrossCheck::is_off")]
+    pub cross_check: CrossCheck,
 }
 
 /// A user-authored shell command whose success means the loop must stop.
@@ -159,6 +218,7 @@ impl Default for LoopPolicy {
             native_goal: None,
             require_review: false,
             patrol_wake: PatrolWake::Finding,
+            cross_check: CrossCheck::Off,
         }
     }
 }
