@@ -533,23 +533,14 @@ pub(crate) fn apply_screen_state(live: &mut Value, screen: &str) {
         live["agent_status"] = "working".into();
     }
 }
-/// Whether a dialog shows: one of its phrases with a numbered choice after it
-/// (`1. Yes`, `❯ 1. Allow`) in the last lines. A phrase alone, as in ordinary
-/// text an agent wrote ("Do you want to …"), is not one.
+/// Whether a dialog may show: one of its phrases in the last lines, failing
+/// closed (a box, unnumbered choices or an unknown layout all count). The one
+/// exception is a line the agent wrote itself, which Claude Code starts with
+/// `⏺` (\"⏺ Do you want to keep the old copy? …\").
 fn dialog_shown(screen: &str) -> bool {
     let lines: Vec<&str> = screen.lines().collect();
-    let recent = &lines[lines.len().saturating_sub(30)..];
-    let Some(at) = recent
-        .iter()
-        .position(|line| PROMPTS.iter().any(|prompt| line.contains(prompt)))
-    else {
-        return false;
-    };
-    recent[at + 1..].iter().any(|line| {
-        let choice = line.trim_start().trim_start_matches('❯').trim_start();
-        choice.split_once(". ").is_some_and(|(number, _)| {
-            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
-        })
+    lines[lines.len().saturating_sub(30)..].iter().any(|line| {
+        PROMPTS.iter().any(|prompt| line.contains(prompt)) && !line.trim_start().starts_with('⏺')
     })
 }
 pub(crate) fn can_prompt(live: &Value, screen: &str) -> bool {
@@ -648,6 +639,11 @@ mod tests {
         assert!(can_prompt(
             &live,
             "⏺ Do you want to keep the old copy? I kept it.\n❯ "
+        ));
+        // A boxed dialog without numbered choices still counts.
+        assert!(!can_prompt(
+            &live,
+            "│ Do you want to make this edit?\n│ Yes  No\n❯ "
         ));
     }
     use serde_json::json;
