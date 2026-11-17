@@ -1115,6 +1115,10 @@ pub(crate) async fn watch_once(
     if seen == Seen::Changed {
         observe_native(store, watch, screen)?;
         let continued = classify_stop(store, watch, &events, target, screen, now).await?;
+        // A stop condition found there ended the watch: nothing more runs.
+        if !watch.active {
+            return Ok(());
+        }
         let settled = matches!(target["agent_status"].as_str(), Some("idle" | "done"));
         if settled && watch.held.is_none() {
             compare_scope(store, watch, &goal, &events);

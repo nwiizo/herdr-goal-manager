@@ -276,6 +276,17 @@ async fn deliver(
     // the steps a direct send supersedes change under the lease that prepare
     // and withdraw take. The watch's own delivery runs inside its step, which
     // holds the lease already.
+    // Stop checks run before the lease: they may take long, and one that calls
+    // hgm must not wait for this send. The other boundaries and admission are
+    // checked under the lease, after them.
+    if assignment.kind == Delivery::Assignment
+        && let Some(goal_id) = assignment.goal
+        && let Some(check) = crate::watch::stop_check_holding(store, &store.load(goal_id)?).await?
+    {
+        anyhow::bail!(
+            "stop condition {check} holds; nothing was sent. Decide with the user whether to revise the goal or stop"
+        );
+    }
     let arming = match assignment.via {
         None => Some(wait_operation_lease(store, &session(store)?.key()).await?),
         Some(_) => None,
@@ -293,11 +304,6 @@ async fn deliver(
         {
             anyhow::bail!(
                 "{reason}; nothing was sent. Decide with the user whether to revise the goal or stop"
-            );
-        }
-        if let Some(check) = crate::watch::stop_check_holding(store, &goal).await? {
-            anyhow::bail!(
-                "stop condition {check} holds; nothing was sent. Decide with the user whether to revise the goal or stop"
             );
         }
     }
@@ -673,7 +679,9 @@ async fn arm(
         .as_ref()
         .filter(same_worker)
         .and_then(|w| w.native_goal.clone())
-        .filter(crate::native_goal::NativeGoalState::is_set);
+        // One left half-typed is kept too, so the next watch records it as
+        // uncertain instead of typing it again.
+        .filter(|s| s.is_set() || matches!(s.outcome.as_deref(), Some("sending" | "clearing")));
     // A check still running reports to the next watch of the same pane.
     let cross_check = previous
         .as_ref()

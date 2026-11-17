@@ -376,7 +376,7 @@ fn admission(
     );
     if history.assigned >= policy.max_assignments {
         let reason = format!(
-            "{ASSIGNMENT_BUDGET_SPENT} for {task} ({} of {}). Decide whether to revise, extend loop.max_assignments, or stop.",
+            "{ASSIGNMENT_BUDGET_SPENT} for {task} ({} of {}). Decide with the user whether to stop, or to go on under a new goal with a larger loop.max_assignments (revise reopens only a completed task).",
             history.assigned, policy.max_assignments
         );
         return Err(spent(store, id, reason, wait_on_spent));

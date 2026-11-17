@@ -533,6 +533,25 @@ pub(crate) fn apply_screen_state(live: &mut Value, screen: &str) {
         live["agent_status"] = "working".into();
     }
 }
+/// Whether a dialog shows: one of its phrases with a numbered choice after it
+/// (`1. Yes`, `❯ 1. Allow`) in the last lines. A phrase alone, as in ordinary
+/// text an agent wrote ("Do you want to …"), is not one.
+fn dialog_shown(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let recent = &lines[lines.len().saturating_sub(30)..];
+    let Some(at) = recent
+        .iter()
+        .position(|line| PROMPTS.iter().any(|prompt| line.contains(prompt)))
+    else {
+        return false;
+    };
+    recent[at + 1..].iter().any(|line| {
+        let choice = line.trim_start().trim_start_matches('❯').trim_start();
+        choice.split_once(". ").is_some_and(|(number, _)| {
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        })
+    })
+}
 pub(crate) fn can_prompt(live: &Value, screen: &str) -> bool {
     let agent = live["agent"].as_str().unwrap_or("");
     matches!(live["agent_status"].as_str(), Some("idle" | "done"))
@@ -540,7 +559,7 @@ pub(crate) fn can_prompt(live: &Value, screen: &str) -> bool {
         && empty_composer(screen, agent)
         // A dialog can leave an empty composer on screen (Herdr may list the
         // agent as done): it is never typed into.
-        && !needs_human(live, screen)
+        && !dialog_shown(screen)
 }
 
 /// The one observed reason an agent cannot take typed input now, so a refusal
@@ -624,6 +643,11 @@ mod tests {
         assert!(!can_prompt(
             &live,
             "Permission request: write notes.txt\n  1. Yes\n  2. No\n❯ "
+        ));
+        // UCV-1: the same words in ordinary text are no dialog.
+        assert!(can_prompt(
+            &live,
+            "⏺ Do you want to keep the old copy? I kept it.\n❯ "
         ));
     }
     use serde_json::json;

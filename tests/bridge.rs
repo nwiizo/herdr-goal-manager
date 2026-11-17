@@ -6395,3 +6395,31 @@ fn a_linked_send_is_refused_once_a_stop_condition_holds() {
     );
     assert!(!sent_text(&bridge).contains("Second step"));
 }
+
+#[test]
+fn a_native_goal_is_saved_as_being_typed_before_it_is_typed() {
+    // UCV-5: the watch record holds `sending` while the /goal is typed, so a
+    // watch that stops in between leaves it for the next one.
+    let worker = ClaudeWorker::new();
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"native_goal":"settle"}}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing the copy\n❯ ");
+    let file = manager_dir(&worker.bridge).join("t-original-watch.json");
+    worker
+        .bridge
+        .write("snapshot-prepared", file.to_str().unwrap());
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(worker.goal_lines(), 1, "{}", sent_text(&worker.bridge));
+    let at_prompt: Value = serde_json::from_slice(
+        &std::fs::read(worker.bridge.root.path().join("prepared-at-prompt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        at_prompt["native_goal"]["outcome"], "sending",
+        "{at_prompt}"
+    );
+}
