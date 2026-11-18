@@ -44,7 +44,7 @@ step, `cargo build --release --locked`, so this needs Rust 1.89 or later with
 `cargo` on `PATH` (for example from [rustup.rs](https://rustup.rs)):
 
 ```sh
-herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.1
+herdr plugin install nwiizo/herdr-goal-manager --ref v0.1.2
 ```
 
 **Prebuilt archive** (no Rust needed). Download the archive for your machine,
@@ -61,27 +61,27 @@ case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)  target=x86_64-unknown-linux-gnu ;;
   *) echo "no prebuilt archive for $(uname -sm); build from a checkout" ;;
 esac
-base=https://github.com/nwiizo/herdr-goal-manager/releases/download/v0.1.1
+base=https://github.com/nwiizo/herdr-goal-manager/releases/download/v0.1.2
 mkdir -p ~/.local/share && cd ~/.local/share
-curl -fLO "$base/hgm-v0.1.1-$target.tar.gz"
+curl -fLO "$base/hgm-v0.1.2-$target.tar.gz"
 curl -fLO "$base/SHA256SUMS"
 shasum -a 256 -c SHA256SUMS --ignore-missing  # Linux: sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf "hgm-v0.1.1-$target.tar.gz"
-"hgm-v0.1.1-$target/target/release/hgm" --version  # hgm 0.1.1
-herdr plugin link "$PWD/hgm-v0.1.1-$target"
+tar -xzf "hgm-v0.1.2-$target.tar.gz"
+"hgm-v0.1.2-$target/target/release/hgm" --version  # hgm 0.1.2
+herdr plugin link "$PWD/hgm-v0.1.2-$target"
 ```
 
 On macOS, Gatekeeper may block an archive downloaded with a browser; download it
 with `curl` as above, or clear the attribute with
-`xattr -dr com.apple.quarantine "hgm-v0.1.1-$target"`.
+`xattr -dr com.apple.quarantine "hgm-v0.1.2-$target"`.
 
 **From a checkout** (Rust 1.89 or later):
 
 ```sh
-git clone --branch v0.1.1 https://github.com/nwiizo/herdr-goal-manager
+git clone --branch v0.1.2 https://github.com/nwiizo/herdr-goal-manager
 cd herdr-goal-manager
 cargo build --release --locked
-target/release/hgm --version  # hgm 0.1.1
+target/release/hgm --version  # hgm 0.1.2
 herdr plugin link "$PWD"
 ```
 
@@ -92,7 +92,7 @@ by default in `~/.local/share/herdr-goal-manager/plugin`) for Herdr to link:
 
 ```sh
 cargo install herdr-goal-manager --locked
-hgm --version  # hgm 0.1.1
+hgm --version  # hgm 0.1.2
 hgm plugin-folder
 herdr plugin link ~/.local/share/herdr-goal-manager/plugin
 ```
@@ -139,7 +139,7 @@ To run `hgm` in your own shell as well (`hgm overview`, `hgm log`), link the
 plugin's `target/release/hgm` onto your `PATH`: inside the archive or checkout
 folder, or for a GitHub install under
 `~/.config/herdr/plugins/github-installations/`. For the archive above:
-`ln -s ~/.local/share/hgm-v0.1.1-$target/target/release/hgm ~/.local/bin/hgm`
+`ln -s ~/.local/share/hgm-v0.1.2-$target/target/release/hgm ~/.local/bin/hgm`
 (any folder on your `PATH`). The managers do not need it.
 
 ### Uninstall
