@@ -1,5 +1,3 @@
-//! Private atomic records outside the managed workspace.
-
 use crate::events::{self, Event};
 use crate::model::{Goal, GoalSpec, validate_id};
 use anyhow::{Context, Result, bail, ensure};
@@ -11,12 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a command waits for a lock another hgm process holds for one short
-/// step: a state transaction, or a watch step on the supervision lock.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(10);
-/// The pause between attempts to take a busy lock; nothing is held meanwhile.
 pub(crate) const LOCK_RETRY: Duration = Duration::from_millis(50);
-/// How long a busy execution lease is retried before another runner is refused.
 const EXECUTION_WAIT: Duration = Duration::from_secs(1);
 
 pub(crate) struct Store {
@@ -28,19 +22,44 @@ impl Store {
     pub fn new(workspace: &Path, root: &Path) -> Result<Self> {
         let workspace = workspace.canonicalize().context("resolve workspace")?;
         ensure!(workspace.is_dir(), "workspace must be a directory");
+        let project = workspace
+            .ancestors()
+            .find(|p| p.join(".git").exists())
+            .unwrap_or(&workspace);
+        let resolved = resolved_root(root)?;
+        let workspaces = resolved_root(&resolved.join("workspaces"))?;
+        ensure!(
+            !resolved.starts_with(project)
+                && !workspaces.starts_with(project)
+                && !project.starts_with(&workspaces),
+            "state directory must be outside the workspace and its repository: {}",
+            root.display()
+        );
         let key = format!(
             "{:x}",
             Sha256::digest(workspace.as_os_str().as_encoded_bytes())
         );
+        let root = if root
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            resolved
+        } else {
+            root.to_path_buf()
+        };
         Ok(Self {
             directory: root.join("workspaces").join(key),
             workspace,
-            root: root.to_path_buf(),
+            root,
         })
     }
     fn initialize(&self) -> Result<()> {
+        let mut root = std::fs::DirBuilder::new();
+        root.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut root, 0o700);
+        root.create(&self.root)?;
         for directory in [
-            &self.root,
             &self.root.join("workspaces"),
             &self.directory,
             &self.directory.join("goals"),
@@ -66,15 +85,9 @@ impl Store {
         }
         Ok(options.open(self.directory.join(name))?)
     }
-    /// The state transaction lock. Every holder keeps it for one short
-    /// transaction, so a busy lock is retried for up to [`LOCK_WAIT`].
     fn transaction(&self) -> Result<File> {
         self.wait_lock("state.lock")
     }
-    /// Takes the lock file `name` (relative to the workspace state directory),
-    /// retrying a busy lock for up to [`LOCK_WAIT`] without blocking on it, so a
-    /// wedged holder turns into a refusal instead of a hang. The operating
-    /// system releases the lock when its holder exits, however it exits.
     pub(crate) fn wait_lock(&self, name: &str) -> Result<File> {
         self.wait_lock_for(name, LOCK_WAIT)
     }
@@ -97,15 +110,14 @@ impl Store {
             }
         }
     }
-    /// Exclusive execution ownership across processes. This file lease guards
-    /// no shared memory; individual state transactions are synchronous and short.
-    ///
-    /// A lease just released can still look held for a moment: a process
-    /// forked by another thread keeps a copy of the lock until it executes its
-    /// program (unit tests failed on it about once in six runs). So a busy
-    /// lease is retried for [`EXECUTION_WAIT`] before another runner is refused.
+    /// Acquires the execution lease, retrying briefly because a forked child
+    /// can retain the previous runner's lock until exec.
     pub fn execution_lease(&self) -> Result<File> {
         self.wait_lock_for("execution.lock", EXECUTION_WAIT)
+    }
+    pub(crate) fn contract_lease(&self, id: &str) -> Result<File> {
+        validate_id(id)?;
+        self.wait_lock(&format!("{id}-contract.lock"))
     }
     /// Registers a goal. `owner` is the original Herdr terminal of the manager.
     pub fn add(&self, spec: GoalSpec, owner: Option<String>) -> Result<Goal> {
@@ -195,11 +207,9 @@ impl Store {
         events::notify(&goal.spec.objective, &events);
         Ok(goal)
     }
-    /// Replaces the contract of an unconfirmed goal with `spec`, keeping its
-    /// id, owner and timeline, so a corrected draft leaves no cancelled goal
-    /// behind (2026-11-15: two cancelled drafts stayed in status all day). A
-    /// confirmed or finished goal keeps its contract: the user agreed to it.
+    /// Replaces a draft contract while preserving the goal's ID, owner and timeline.
     pub fn replace_contract(&self, id: &str, spec: GoalSpec) -> Result<Goal> {
+        let _contract = self.contract_lease(id)?;
         let words = spec.words();
         let goal = self.update(id, |goal| {
             ensure!(
@@ -215,6 +225,10 @@ impl Store {
                 goal.status
             );
             let fresh = Goal::new(spec, goal.workspace.clone())?;
+            ensure!(goal.status != crate::model::GoalStatus::Running
+                && goal.plans.is_empty() && goal.verifications.is_empty() && goal.repairs.is_empty()
+                && goal.tasks.iter().all(|t| t.attempts.is_empty() && t.manual_evidence.is_none() && t.superseded_evidence.is_empty()),
+                "goal {id} has started work; register a new goal to preserve its history");
             goal.spec = fresh.spec;
             goal.tasks = fresh.tasks;
             Ok(())
@@ -253,7 +267,6 @@ impl Store {
             .join("goals")
             .join(format!("{id}.events.ndjson")))
     }
-    /// Appends events to a goal's timeline.
     fn append(&self, id: &str, events: &[Event]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -261,8 +274,6 @@ impl Store {
         self.initialize()?;
         append_lines(&self.events_path(id)?, events).context("append goal timeline")
     }
-    /// Appends one JSON line per value to a private append-only file under
-    /// this store, with the same whole-line guarantee as the goal timeline.
     pub(crate) fn append_private<T: serde::Serialize>(
         &self,
         path: &Path,
@@ -343,7 +354,6 @@ impl Store {
     }
 }
 
-/// One `write` per batch with O_APPEND keeps concurrent appends whole.
 fn append_lines<T: serde::Serialize>(path: &Path, values: &[T]) -> Result<()> {
     if values.is_empty() {
         return Ok(());
@@ -364,6 +374,23 @@ fn append_lines<T: serde::Serialize>(path: &Path, values: &[T]) -> Result<()> {
     Ok(())
 }
 
+fn resolved_root(root: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(root)?.components() {
+        if component == std::path::Component::ParentDir {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component);
+        match resolved.symlink_metadata() {
+            Ok(_) => resolved = resolved.canonicalize()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("resolve state directory"),
+        }
+    }
+    Ok(resolved)
+}
+
 fn brief_file(scope: Option<&str>) -> Result<String> {
     match scope {
         Some(terminal) => {
@@ -381,6 +408,22 @@ mod tests {
 
     fn spec() -> GoalSpec {
         serde_norway::from_str("objective: Review\nacceptance: [Reviewed]\n").unwrap()
+    }
+
+    #[test]
+    fn state_is_resolved_outside_the_repository_before_creation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        let workspace = repo.join("project");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir(repo.join(".git"))?;
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&repo, &alias)?;
+        for root in [&workspace, &repo.join("state"), &alias.join("new/state")] {
+            assert!(Store::new(&workspace, root).is_err());
+        }
+        assert!(!repo.join("new").exists());
+        Ok(())
     }
 
     #[test]
@@ -412,8 +455,6 @@ mod tests {
 
     #[test]
     fn a_briefly_held_execution_lease_is_waited_for_and_a_held_one_still_excludes() -> Result<()> {
-        // A lease released while a forked child still holds a copy of it looks
-        // held for a moment; the next runner waits instead of failing.
         let workspace = tempfile::tempdir()?;
         let state = tempfile::tempdir()?;
         let store = Store::new(workspace.path(), state.path())?;

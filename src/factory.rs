@@ -1,10 +1,3 @@
-//! Factory mode decisions read from recorded state: whether the queue may hand
-//! out work now, and how each goal taken from the queue ran.
-//!
-//! The gate counts the whole workspace, not only queued work: the person
-//! reviews every result and the original tab runs one agent. A run class
-//! comes only from timeline events that hgm itself records (checks, stops,
-//! revisions, acceptance), never from what an agent or a reviewer reports.
 use crate::{
     admission::{ASSIGNMENT_BUDGET_SPENT, CORRECTION_BUDGET_SPENT},
     config::Config,
@@ -18,15 +11,10 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-/// Whether `queue next` gives the goal its own checkout (`factory.checkout`).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OwnCheckout {
-    /// Off, or unset outside a Git repository: today's behaviour.
     Off,
-    /// Asked for, but the workspace is not a Git repository; the reason is
-    /// shown and the goal works in the workspace.
     Skipped(String),
-    /// A checkout on a branch named after the item, unless the contract names one.
     On,
 }
 impl OwnCheckout {
@@ -43,7 +31,6 @@ impl OwnCheckout {
     }
 }
 
-/// Goals that hold the queue back.
 #[derive(Debug)]
 pub(crate) struct Gate {
     /// Results waiting for the person's review.
@@ -99,14 +86,12 @@ impl Gate {
     }
 }
 
-/// How a goal taken from the queue ran, or `None` while nothing decides it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RunClass {
     pub class: Option<&'static str>,
     pub reasons: Vec<String>,
 }
 
-/// Attention causes that mean main needs a person's input before it can go on.
 const NEEDS_INPUT: [&str; 5] = [
     "dialog",
     "login",
@@ -115,7 +100,6 @@ const NEEDS_INPUT: [&str; 5] = [
     "manager_blocked",
 ];
 
-/// Why an event stops the loop until someone acts, if it does.
 fn stop(event: &Event) -> Option<String> {
     let text = |key: &str| event.detail[key].as_str().unwrap_or_default();
     match event.kind.as_str() {
@@ -145,8 +129,6 @@ fn stop(event: &Event) -> Option<String> {
         _ => None,
     }
 }
-/// Whether an event shows the loop moving again after a stop: new work, a
-/// resumed or re-confirmed goal, or the watch waking the manager again.
 fn resumes(event: &Event) -> bool {
     match event.kind.as_str() {
         "assigned" | "correction" | "confirmed" | "task_reopened" | "wake" | "patrol"
@@ -156,15 +138,6 @@ fn resumes(event: &Event) -> bool {
     }
 }
 
-/// The run class from a goal's timeline:
-/// - success: accepted after agent work, with no failed check and no revision;
-/// - flawed: a check failed during run, resume or acceptance, a check that
-///   passed at an earlier settle now fails, or the person revised the result.
-///   It is history: it stays after acceptance;
-/// - blocked: stopped now by a protected path, stop condition, spent budget
-///   or needed input, with nothing after it that resumes the loop; never
-///   after acceptance;
-/// - manual: accepted without agent work, or cancelled without being blocked.
 pub(crate) fn run_class(events: &[Event]) -> RunClass {
     let at = |event: &Event| crate::events::local_clock(event.at);
     let mut flaws = vec![];
@@ -224,13 +197,10 @@ pub(crate) fn run_class(events: &[Event]) -> RunClass {
     }
 }
 
-/// The factory view of a workspace; present only while factory mode is on.
 pub(crate) struct Factory<'a> {
     store: &'a Store,
     config: Config,
-    /// Goal ID to the queue item it was dispatched from.
     items: BTreeMap<String, String>,
-    /// Items waiting to be dispatched.
     queued: usize,
 }
 impl<'a> Factory<'a> {
@@ -391,7 +361,6 @@ mod tests {
             Some("success"),
             "a check that never passed was unfinished work"
         );
-        // Reasons give the local clock time, as every human-readable output.
         let at = crate::events::local_clock(regressed.at);
         let flawed = run_class(&[assigned, unfinished, passing, regressed, accepted]);
         assert_eq!(flawed.class, Some("flawed"));
@@ -489,7 +458,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_normal_path_is_a_success_and_a_revision_makes_it_flawed() -> Result<()> {
-        // confirm -> send -> run (needs input) -> complete -> run -> accept (R9)
         async fn walk(revise: bool) -> Result<RunClass> {
             let workspace = tempfile::tempdir()?;
             let state = tempfile::tempdir()?;

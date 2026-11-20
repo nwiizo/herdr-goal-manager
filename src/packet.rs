@@ -1,8 +1,3 @@
-//! What a reviewer of unattended work needs in one place: the worker's own
-//! records (choices it made inside the contract, findings that do not block)
-//! and the review packet that gathers them with the acceptance items, the
-//! latest check results and the verdicts. None of these completes a task or
-//! accepts a goal; hgm's checks and the user's recorded acceptance decide.
 use crate::{
     admission::CORRECTION_WORD_BUDGET,
     events::Event,
@@ -13,15 +8,10 @@ use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-/// Timeline kind of a choice the worker made inside the contract.
 pub(crate) const DECISION: &str = "decision";
-/// Timeline kind of a finding that does not block the work.
 pub(crate) const FOLLOW_UP: &str = "follow_up";
-/// The guidance prefix `hgm revise` writes; each one is a revision.
 const REVISION: &str = "Revision requested: ";
 
-/// Who runs this hgm: a helper role by name (refused unless its kind may run
-/// `command`), the manager (its session sets HGM_CONTEXT), or main.
 pub(crate) fn recorder(store: &Store, command: &str) -> Result<String> {
     if let Some(role) = crate::roles::caller(store, command)? {
         return Ok(role);
@@ -33,7 +23,6 @@ pub(crate) fn recorder(store: &Store, command: &str) -> Result<String> {
     })
 }
 
-/// The goal a record belongs to: live, and with `task` among its tasks.
 pub(crate) fn record_target(store: &Store, id: &str, task: Option<&str>) -> Result<Goal> {
     let goal = store.load(id)?;
     ensure!(
@@ -50,7 +39,6 @@ pub(crate) fn record_target(store: &Store, id: &str, task: Option<&str>) -> Resu
     Ok(goal)
 }
 
-/// One part of a record: present and short enough to read later.
 fn bounded(label: &str, text: &str) -> Result<()> {
     let words = word_units(text);
     ensure!(
@@ -60,7 +48,6 @@ fn bounded(label: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Records a choice the worker made inside the contract, and why.
 pub(crate) fn decide(
     store: &Store,
     id: &str,
@@ -80,7 +67,6 @@ pub(crate) fn decide(
     Ok(json!({"recorded": DECISION, "goal": id, "task": task, "by": by}))
 }
 
-/// Records a finding that should not block the work, to take up later.
 pub(crate) fn follow_up(store: &Store, id: &str, task: Option<&str>, text: &str) -> Result<Value> {
     bounded("the follow-up", text)?;
     let by = recorder(store, "follow-up")?;
@@ -89,9 +75,6 @@ pub(crate) fn follow_up(store: &Store, id: &str, task: Option<&str>, text: &str)
     Ok(json!({"recorded": FOLLOW_UP, "goal": id, "task": task, "by": by}))
 }
 
-/// The latest result of one registered check, from `hgm run`/`hgm accept`
-/// verifications and the watch's settle checks, whichever is newer, with the
-/// fingerprint of the work dir it ran on when one was kept.
 struct CheckView {
     result: &'static str,
     at: Option<DateTime<Utc>>,
@@ -155,10 +138,6 @@ fn latest_check(goal: &Goal, events: &[Event], name: &str) -> CheckView {
     latest
 }
 
-/// Each registered check's latest result, with `state`: `current` when the
-/// work dir still has the fingerprint the check ran on, `stale` when it
-/// changed since, `unknown` when no fingerprint was kept (records written
-/// before it was) or the work dir cannot be read.
 pub(crate) fn check_states(
     goal: &Goal,
     events: &[Event],
@@ -202,8 +181,6 @@ pub(crate) fn check_states(
         .collect()
 }
 
-/// Why a check's latest result does not verify the current work dir, or
-/// `None` when it passed on the state the work dir still has.
 pub(crate) fn check_unverified(check: &Value) -> Option<String> {
     let name = check["name"].as_str().unwrap_or_default();
     let at = serde_json::from_value::<DateTime<Utc>>(check["at"].clone())
@@ -229,7 +206,6 @@ fn when(at: DateTime<Utc>) -> String {
     crate::events::local_time(at)
 }
 
-/// The review packet of `goal` as data; `hgm packet` prints it or its JSON.
 pub(crate) fn build(store: &Store, goal: &Goal) -> Result<Value> {
     let events = store.events(&goal.id)?;
     let count = |kind: &str| events.iter().filter(|e| e.kind == kind).count();
@@ -305,8 +281,6 @@ pub(crate) fn build(store: &Store, goal: &Goal) -> Result<Value> {
                 "delivery",
                 format!("{kind} may not have arrived (delivery uncertain)"),
             ),
-            // A send whose input line did not empty, and a wake that went
-            // the same way: both may still sit unread.
             kind if d["consumed"] == false => unverified(
                 Some(event.at),
                 "delivery",
@@ -351,7 +325,6 @@ pub(crate) fn build(store: &Store, goal: &Goal) -> Result<Value> {
             ),
         );
     }
-    // Blocking findings stand until their reviewer submits a newer verdict.
     let blocking: Vec<Value> = latest_by_reviewer
         .values()
         .flat_map(|event| {
@@ -407,7 +380,6 @@ pub(crate) fn build(store: &Store, goal: &Goal) -> Result<Value> {
     Ok(packet)
 }
 
-/// One titled part of the text packet; an empty part says so.
 fn section(title: &str, lines: Vec<String>) -> String {
     let mut text = format!("{title}:\n");
     if lines.is_empty() {
@@ -419,7 +391,6 @@ fn section(title: &str, lines: Vec<String>) -> String {
     text
 }
 
-/// The packet as text: one section per part, empty parts said plainly.
 pub(crate) fn render(packet: &Value) -> String {
     let mut out = String::new();
     let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
@@ -485,7 +456,6 @@ pub(crate) fn render(packet: &Value) -> String {
                     Some("unknown") => line += ", on a state not recorded",
                     _ => {}
                 }
-                // The fingerprint decides; the time only adds to a doubtful pass.
                 if c["before_last_assignment"] == true && c["state"] != "current" {
                     line += ", before the last assignment";
                 }
@@ -524,7 +494,6 @@ pub(crate) fn render(packet: &Value) -> String {
             })
             .collect(),
     );
-    // Reports in full: the manager reads them here, not in a transcript.
     out += &section(
         "Reports",
         list("reports")
@@ -616,11 +585,9 @@ pub(crate) fn render(packet: &Value) -> String {
         Some(evidence) => format!("Accepted: {evidence}"),
         None => "Not accepted. This packet is a summary for review: it completes no task and accepts nothing; the user's hgm accept does.".into(),
     };
-    out
+    crate::view::terminal_text(&out)
 }
 
-/// One review: who judged, the verdict, the findings and whether it still
-/// describes the work.
 pub(crate) fn review_line(review: &Value) -> String {
     let text = |key: &str| review[key].as_str().unwrap_or_default().to_string();
     let fresh = match review["fresh"].as_str() {
@@ -642,7 +609,6 @@ pub(crate) fn review_line(review: &Value) -> String {
     )
 }
 
-/// The packet for `id`, printed as text or JSON.
 pub(crate) fn show(store: &Store, id: &str, json_output: bool) -> Result<()> {
     let goal = store.load(id)?;
     let packet = build(store, &goal).context("build the review packet")?;
@@ -691,7 +657,6 @@ mod tests {
         let now = crate::fingerprint::digest(workspace.path())?;
         let early = Utc::now() - Duration::minutes(30);
         store.update(&id, |goal| {
-            // Kept before fingerprints: whether lint still holds is unknown.
             goal.verifications.push(Verification {
                 started_at: early,
                 finished_at: Some(early),
@@ -715,8 +680,6 @@ mod tests {
             Ok(())
         })?;
         store.record(&id, "assigned", json!({"task": "work", "to": "main"}))?;
-        // The watch's settle check is newer than the run: its result wins, and
-        // it ran on the state the work dir still has.
         store.record(
             &id,
             "settle_checks",
@@ -754,7 +717,6 @@ mod tests {
                 ("passed", "run", "unknown"),
             ]
         );
-        // The correction came later, yet the work dir has not changed: still current.
         assert_eq!(checks[0]["before_last_assignment"], true);
         assert_eq!(checks[1]["detail"], "1 failed");
         assert_eq!(packet["counts"]["assignments"], 1);
@@ -787,7 +749,6 @@ mod tests {
         let kinds: Vec<&str> = not_verified.iter().map(|n| n.0).collect();
         assert_eq!(kinds[4..], ["delivery", "protected_paths", "native_goal"]);
 
-        // A changed work dir makes the current pass describe an earlier state.
         std::fs::write(workspace.path().join("new.rs"), "x")?;
         let changed = build(&store, &store.load(&id)?)?;
         assert_eq!(changed["checks"][0]["state"], "stale");
@@ -864,7 +825,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("    Unresolved: none.\n"), "{text}");
-        // `hgm log` prints the same lines under the event's summary line.
         let event = store
             .events(&id)?
             .into_iter()

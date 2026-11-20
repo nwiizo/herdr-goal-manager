@@ -1,24 +1,16 @@
-//! The human-designed loop: how far the manager may iterate before a person
-//! decides. Pure types with no dependency on goal records or storage.
-
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Whether the manager may send each assignment itself or must show it first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Autonomy {
-    /// Assign, inspect and retry within budget; humans review the result.
     #[default]
     Auto,
-    /// Every assignment needs the user's recorded approval.
     Ask,
 }
 
-/// A loop setting written as `true` or `false`, or as a name
-/// (`loop.native_goal`, `loop.cross_check`).
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum FlagOrName {
@@ -26,14 +18,10 @@ enum FlagOrName {
     Name(String),
 }
 
-/// When hgm sets a worker's native goal (see `LoopPolicy::native_goal`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeGoalMode {
-    /// As queued input right after a linked non-plan assignment is delivered.
     Assignment,
-    /// Once the worker first settles after the assignment (before 2026-11-16).
     Settle,
-    /// Never.
     Off,
 }
 impl Serialize for NativeGoalMode {
@@ -41,7 +29,6 @@ impl Serialize for NativeGoalMode {
         match self {
             Self::Assignment => serializer.serialize_str("assignment"),
             Self::Settle => serializer.serialize_str("settle"),
-            // `false`, as stored contracts and configs already write it.
             Self::Off => serializer.serialize_bool(false),
         }
     }
@@ -49,7 +36,6 @@ impl Serialize for NativeGoalMode {
 impl<'de> Deserialize<'de> for NativeGoalMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match FlagOrName::deserialize(deserializer)? {
-            // `true` was the only way to say "on", which set it after a settle.
             FlagOrName::Flag(true) => Ok(Self::Settle),
             FlagOrName::Flag(false) => Ok(Self::Off),
             FlagOrName::Name(name) => match name.as_str() {
@@ -64,18 +50,12 @@ impl<'de> Deserialize<'de> for NativeGoalMode {
     }
 }
 
-/// Which provider checks the watched worker's work each time it settles after
-/// new work (`LoopPolicy::cross_check`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CrossCheck {
-    /// No check (the default).
     #[default]
     Off,
-    /// The other provider: Codex checks Claude Code, Claude Code checks the rest.
     Auto,
-    /// Always Codex.
     Codex,
-    /// Always Claude Code.
     Claude,
 }
 impl CrossCheck {
@@ -111,16 +91,11 @@ impl<'de> Deserialize<'de> for CrossCheck {
     }
 }
 
-/// When a patrol of a working worker wakes the manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PatrolWake {
-    /// Only with a finding: no visible progress since the previous patrol, or
-    /// a change outside the task's write_paths. A patrol that finds the worker
-    /// progressing with nothing to report is recorded, and nobody is woken.
     #[default]
     Finding,
-    /// Every patrol wakes the manager, as before 2026-11-16.
     Always,
 }
 impl PatrolWake {
@@ -129,7 +104,6 @@ impl PatrolWake {
     }
 }
 
-/// When to stop iterating and escalate to a person.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LoopPolicy {
@@ -170,9 +144,7 @@ pub(crate) struct LoopPolicy {
     /// and while no reviewer's latest current verdict asks for a revision.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub require_review: bool,
-    /// Whether a patrol that finds the worker progressing with no finding
-    /// wakes the manager (`always`) or is only recorded (`finding`, the
-    /// default: on 2026-11-15 about thirty such wakes led to no action).
+    /// Whether a patrol without findings wakes the manager (`always`) or only records progress (`finding`).
     #[serde(skip_serializing_if = "PatrolWake::is_finding")]
     pub patrol_wake: PatrolWake,
     /// Whether another provider checks the watched worker's work, read-only,
@@ -183,7 +155,6 @@ pub(crate) struct LoopPolicy {
     pub cross_check: CrossCheck,
 }
 
-/// A user-authored shell command whose success means the loop must stop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StopCheck {
@@ -200,17 +171,14 @@ impl Default for LoopPolicy {
         Self {
             max_assignments: 3,
             max_hours: None,
-            // User decision (2026-11-15): check main every 3 minutes (was 5).
             patrol_minutes: 3,
             autonomy: Autonomy::Auto,
             stop_when: vec![],
-            // User decision (2026-11-13): hand off at 85%, never compact.
             handoff_percent: 85,
             plan_first: false,
             stop_checks: vec![],
             max_corrections: 5,
             check_on_settle: true,
-            // User decision (2026-11-13): re-read the goal every 30-60 minutes.
             reanchor_minutes: 45,
             native_goal: None,
             require_review: false,
@@ -262,8 +230,6 @@ impl LoopPolicy {
     }
 }
 
-/// Content digest of workspace-relative protected paths, taken at confirmation
-/// and compared while the agent works. A path created later also changes it.
 pub(crate) fn protected_digest(workspace: &Path, paths: &[String]) -> Result<String> {
     let mut hasher = Sha256::new();
     for prefix in paths {
@@ -274,10 +240,19 @@ pub(crate) fn protected_digest(workspace: &Path, paths: &[String]) -> Result<Str
         hasher.update([0]);
         for file in files {
             let relative = file.strip_prefix(workspace).unwrap_or(&file);
+            let link = file.symlink_metadata()?.is_symlink();
+            if link {
+                hasher.update(b"\0symlink\0");
+            }
             hasher.update(relative.as_os_str().as_encoded_bytes());
             hasher.update([0]);
-            hasher
-                .update(std::fs::read(&file).with_context(|| format!("read {}", file.display()))?);
+            if link {
+                hasher.update(std::fs::read_link(&file)?.as_os_str().as_encoded_bytes());
+            } else {
+                hasher.update(
+                    std::fs::read(&file).with_context(|| format!("read {}", file.display()))?,
+                );
+            }
             hasher.update([0]);
         }
     }
@@ -293,8 +268,30 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         for entry in std::fs::read_dir(path)? {
             collect_files(&entry?.path(), files)?;
         }
-    } else if metadata.is_file() {
+    } else if metadata.is_file() || metadata.is_symlink() {
         files.push(path.to_path_buf());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod protected_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_protected_link_tracks_its_destination_even_when_dangling() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let link = dir.path().join("settings");
+        let digest = || protected_digest(dir.path(), &["settings".into()]);
+        let missing = digest()?;
+        std::os::unix::fs::symlink("v1", &link)?;
+        let first = digest()?;
+        assert_ne!(first, missing);
+        std::fs::remove_file(&link)?;
+        std::os::unix::fs::symlink("v2", &link)?;
+        assert_ne!(digest()?, first);
+        std::fs::remove_file(link)?;
+        assert_eq!(digest()?, missing);
+        Ok(())
+    }
 }

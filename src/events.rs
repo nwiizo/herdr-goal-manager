@@ -1,8 +1,3 @@
-//! Append-only goal timeline and human-attention notifications.
-//!
-//! Goal records stay the source of truth. Every record transition appends the
-//! events it implies, and assignments or observations without a record change
-//! are appended explicitly, so a returning user can see what happened and when.
 use crate::model::{AttemptStatus, Goal};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -10,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::process::{Child, Stdio};
 
-/// One timeline entry, stored as a line of `<goal>.events.ndjson`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Event {
     pub at: DateTime<Utc>,
@@ -30,7 +24,6 @@ impl Event {
     }
 }
 
-/// Events implied by a goal record transition; `before` is `None` on registration.
 pub(crate) fn transitions(before: Option<&Goal>, after: &Goal) -> Vec<Event> {
     let event = |kind: &str, detail: Value| Event::new(&after.id, kind, detail);
     let Some(before) = before else {
@@ -121,8 +114,6 @@ pub(crate) fn transitions(before: Option<&Goal>, after: &Goal) -> Vec<Event> {
     events
 }
 
-/// Title, reason and sound for events that need the user's attention.
-/// Whether `event` sends the person a notification (see [`attention`]).
 pub(crate) fn notifies_person(event: &Event) -> bool {
     attention(event).is_some()
 }
@@ -146,8 +137,6 @@ fn attention(event: &Event) -> Option<(&'static str, String, &'static str)> {
             Some(("Goal monitoring stopped", text("reason"), "request"))
         }
         "accepted" => Some(("Goal accepted", text("evidence"), "done")),
-        // A verdict is input to the person's decision, so they hear of it
-        // even while no watch runs (the goal awaits their acceptance).
         "reviewed" => Some((
             "Review arrived",
             format!(
@@ -162,8 +151,6 @@ fn attention(event: &Event) -> Option<(&'static str, String, &'static str)> {
     }
 }
 
-/// What the Goal watch tab's sheep says about `event`: a notification the
-/// user was shown, or a wake delivered to the manager.
 pub(crate) fn notice(event: &Event) -> Option<String> {
     if let Some((title, reason, _)) = attention(event) {
         return Some(if reason.is_empty() {
@@ -178,8 +165,6 @@ pub(crate) fn notice(event: &Event) -> Option<String> {
     })
 }
 
-/// Shows Herdr notifications for attention events. Best-effort: it runs only in
-/// a Herdr-bound manager context and never fails the state change behind it.
 pub(crate) fn notify(objective: &str, events: &[Event]) {
     if cfg!(test)
         || std::env::var("HERDR_ENV").as_deref() != Ok("1")
@@ -226,7 +211,6 @@ fn wait_bounded(child: &mut Child) {
     }
 }
 
-/// Parses `--since`: RFC 3339, or a recent span such as `30m`, `2h`, `1d`.
 pub(crate) fn since(text: &str) -> Result<DateTime<Utc>> {
     if let Ok(time) = DateTime::parse_from_rfc3339(text) {
         return Ok(time.with_timezone(&Utc));
@@ -244,25 +228,17 @@ pub(crate) fn since(text: &str) -> Result<DateTime<Utc>> {
     Ok(Utc::now() - span)
 }
 
-/// One readable line per event for `hgm log`.
-/// The full text an event carries beyond its summary line: a report, which
-/// the manager reads here rather than in the provider's transcript.
 pub(crate) fn full_text(event: &Event) -> Option<&str> {
     (event.kind == "report")
         .then(|| event.detail["text"].as_str())
         .flatten()
         .filter(|text| text.contains('\n') || text.chars().count() > 120)
 }
-/// `at` in the local time zone with its offset, for human-readable output;
-/// JSON keeps UTC. On 2026-11-15 wakes showed local time and `hgm log` UTC,
-/// and the manager misread a one-minute stop as four.
 pub(crate) fn local_time(at: DateTime<Utc>) -> String {
     at.with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M:%S %:z")
         .to_string()
 }
-/// The local clock time of `at` (hours and minutes), where the date and offset
-/// are already shown nearby.
 pub(crate) fn local_clock(at: DateTime<Utc>) -> String {
     at.with_timezone(&chrono::Local).format("%H:%M").to_string()
 }
@@ -275,7 +251,6 @@ pub(crate) fn describe(event: &Event) -> String {
         summary(event)
     )
 }
-/// What an event says, in at most 200 characters.
 pub(crate) fn summary(event: &Event) -> String {
     let d = &event.detail;
     let text = |key: &str| d[key].as_str().unwrap_or_default().to_string();

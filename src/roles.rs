@@ -1,6 +1,3 @@
-//! Helper agents next to main: `impl` takes a split of the work and reviewers
-//! judge results independently. Each role is a pinned Herdr agent in a tab the
-//! manager owns; reviews are recorded apart from implementation.
 use crate::{
     herdr_cli as herdr,
     manager::{Provider, codex_environment, manager_path, quote},
@@ -38,7 +35,6 @@ impl RoleKind {
             Self::Reviewer => REVIEWER_GUIDE,
         }
     }
-    /// The only hgm commands an agent in this role may run.
     pub(crate) fn commands(self) -> &'static [&'static str] {
         match self {
             Self::Impl => &["show", "report", "decision", "follow-up"],
@@ -69,8 +65,6 @@ fn save(store: &Store, context: &str, roles: &BTreeMap<String, Role>) -> Result<
     store.write_private(&roles_path(store, context)?, roles)
 }
 
-/// The pinned target for `name`: `None` for main (the original pane), the
-/// helper's target otherwise. An unknown role is refused, never guessed.
 pub(crate) fn resolve(store: &Store, name: &str) -> Result<Option<Target>> {
     if name == "main" {
         return Ok(None);
@@ -91,8 +85,6 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Starts a helper agent in a new, unfocused tab of this workspace and pins it.
-/// The provider defaults to main's (prefer another one for reviewers).
 pub(crate) async fn start(
     store: &Store,
     kind: RoleKind,
@@ -103,8 +95,6 @@ pub(crate) async fn start(
 ) -> Result<Value> {
     let context = session(store)?;
     let name = name.unwrap_or(kind.default_name());
-    // The helper may work in another folder (a sub-repository or a copy); its
-    // hgm commands still use this manager's goals and state.
     let cwd = match cwd {
         Some(dir) => dir
             .canonicalize()
@@ -115,6 +105,8 @@ pub(crate) async fn start(
         valid_name(name),
         "role names use a-z, 0-9 and -, up to 24 characters, and cannot be main"
     );
+    crate::model::validate_id(&context.key())?;
+    let _registration = store.wait_lock(&format!("{}-role-changes.lock", context.key()))?;
     let mut roles = load(store, &context.key())?;
     if let Some(existing) = roles.get(name)
         && live_pane(&existing.target.pane).await.is_ok()
@@ -149,7 +141,6 @@ pub(crate) async fn start(
     let mut agent_args = args(provider.full_access_args());
     match provider {
         Provider::Claude => {
-            // Herdr refuses multi-line agent arguments, so the guide goes in a file.
             let guide_file = directory.join(format!("{}-{name}-guide.md", context.id));
             std::fs::write(&guide_file, guide)
                 .with_context(|| format!("write the {name} guide"))?;
@@ -192,13 +183,9 @@ pub(crate) async fn start(
         agent_args.push("--model".into());
         agent_args.push(model.into());
     }
-    // Checked before a tab is opened, so a refused launch leaves nothing behind.
     single_line(&agent_args)?;
     let mut launcher = None;
     if provider == Provider::Codex {
-        // Codex takes its guide only inline, and the line Herdr types into the
-        // shell may not exceed 1024 bytes: a private launcher named `codex`,
-        // first on this tab's PATH, passes the arguments instead.
         let bin = directory.join(format!("{}-{name}-bin", context.id));
         let file = write_launcher(&bin, provider.name(), &std::mem::take(&mut agent_args))?;
         let path =
@@ -252,9 +239,6 @@ pub(crate) async fn start(
     ]);
     launch.extend(agent_args);
     if let Err(error) = herdr::json_query(&launch).await {
-        // The role is not registered, so nothing uses the tab. An agent left in
-        // it (waiting on the provider's own folder-trust question, which hgm
-        // cannot answer) would keep the role's Herdr name taken.
         let closed = !tab.is_empty() && herdr::query(&args(&["tab", "close", &tab])).await.is_ok();
         return Err(error).context(format!(
             "start {} in tab {tab} ({}); a provider that first asks whether to trust this folder must be trusted for it outside hgm, or start the role with another provider",
@@ -291,9 +275,12 @@ pub(crate) async fn start(
 
 /// Herdr types `<program> <arguments>` at the shell prompt, which reads at most
 /// 1024 bytes per line in canonical mode; longer launches fail after the tab opens.
-fn fits_shell_line(program: &str, arguments: &[String]) -> Result<()> {
-    // Each argument may gain quotes and a separator when Herdr encodes it.
-    let length = program.len() + arguments.iter().map(|a| a.len() + 3).sum::<usize>();
+pub(crate) fn fits_shell_line(program: &str, arguments: &[String]) -> Result<()> {
+    let length = program.len()
+        + arguments
+            .iter()
+            .map(|a| quote(a.as_ref()).len() + 1)
+            .sum::<usize>();
     ensure!(
         length < 1000,
         "the {program} launch line would take about {length} bytes; Herdr types it into a shell that reads at most 1024 bytes per line"
@@ -301,8 +288,6 @@ fn fits_shell_line(program: &str, arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Writes `bin/<program>`, which runs the real `program` found on PATH (outside
-/// `bin`) with `arguments` plus any arguments it receives.
 fn write_launcher(bin: &Path, program: &str, arguments: &[String]) -> Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let search = std::env::var_os("PATH").unwrap_or_default();
@@ -329,7 +314,7 @@ fn write_launcher(bin: &Path, program: &str, arguments: &[String]) -> Result<std
 
 /// Herdr encodes agent arguments for the target shell and refuses line breaks
 /// (`invalid_agent_argument`); multi-line text has to travel in a file.
-fn single_line(values: &[String]) -> Result<()> {
+pub(crate) fn single_line(values: &[String]) -> Result<()> {
     if let Some(value) = values.iter().find(|v| v.contains(['\n', '\r'])) {
         let head: String = value
             .lines()
@@ -345,7 +330,6 @@ fn single_line(values: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Pinned roles with their live state, main first.
 pub(crate) async fn list(store: &Store) -> Result<Value> {
     let context = session(store)?;
     let mut rows = vec![];
@@ -366,10 +350,10 @@ async fn row(name: &str, kind: Option<RoleKind>, target: &Target) -> Value {
     json!({"role": name, "kind": kind, "agent": target.agent, "pane": target.pane, "state": state})
 }
 
-/// Closes a role's tab (only tabs hgm opened) and unpins it. A working agent
-/// is left alone unless `force`.
 pub(crate) async fn stop(store: &Store, name: &str, force: bool) -> Result<Value> {
     let context = session(store)?;
+    crate::model::validate_id(&context.key())?;
+    let _registration = store.wait_lock(&format!("{}-role-changes.lock", context.key()))?;
     let mut roles = load(store, &context.key())?;
     let role = roles
         .get(name)
@@ -389,7 +373,6 @@ pub(crate) async fn stop(store: &Store, name: &str, force: bool) -> Result<Value
     Ok(json!({"role": name, "stopped": true}))
 }
 
-/// The calling role, from the environment hgm set when it started the agent.
 fn calling_role(store: &Store) -> Result<Role> {
     let name = std::env::var("HGM_ROLE").context("only a helper role runs this command")?;
     let context = crate::binding::session(store)?.key();
@@ -398,8 +381,6 @@ fn calling_role(store: &Store) -> Result<Role> {
         .with_context(|| format!("role {name} is not pinned in its manager"))
 }
 
-/// The helper role running this hgm, refused unless its kind may run
-/// `command`; `None` outside a helper role (main or the manager).
 pub(crate) fn caller(store: &Store, command: &str) -> Result<Option<String>> {
     if std::env::var_os("HGM_ROLE").is_none() {
         return Ok(None);
@@ -413,8 +394,6 @@ pub(crate) fn caller(store: &Store, command: &str) -> Result<Option<String>> {
     Ok(Some(role.name))
 }
 
-/// Points the manager at news from a helper: the next wake carries `note`.
-/// Returns whether a running watch of `goal` will carry it.
 fn nudge_manager(store: &Store, goal: &str, note: &str) -> Result<bool> {
     let context = crate::binding::session(store)?.key();
     if !crate::watch::watch_path(store, &context)?.exists() {
@@ -439,8 +418,6 @@ fn nudge_manager(store: &Store, goal: &str, note: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Sends a review request to a reviewer role, recording the workspace state it
-/// judges. The reviewer answers with `hgm review-submit`.
 pub(crate) async fn request_review(
     store: &Store,
     goal_id: &str,
@@ -503,7 +480,6 @@ pub(crate) async fn request_review(
     herdr::json_query(&args(&["agent", "prompt", &role.target.pane, &request]))
         .await
         .context("review request delivery uncertain; inspect the reviewer before resending")?;
-    // As with send: the input line must empty, or the review may not start.
     let agent = role.target.agent.as_deref().unwrap_or("");
     let consumed = crate::supervision::input_consumed(&role.target.pane, agent)
         .await
@@ -546,10 +522,6 @@ enum Severity {
     Advisory,
 }
 
-/// Records a reviewer's verdict for its own request. A verdict on a workspace
-/// that changed since the request is kept but marked stale. The person is
-/// notified; the manager learns it from its watch, or at once when no watch
-/// runs (the goal awaits the person's acceptance).
 pub(crate) async fn submit_review(
     store: &Store,
     goal_id: &str,
@@ -562,6 +534,8 @@ pub(crate) async fn submit_review(
         role.kind == RoleKind::Reviewer,
         "only a reviewer role submits reviews"
     );
+    crate::model::validate_id(goal_id)?;
+    let submission = store.wait_lock(&format!("{goal_id}-review-submit.lock"))?;
     let events = store.events(goal_id)?;
     let request = events
         .iter()
@@ -593,8 +567,6 @@ pub(crate) async fn submit_review(
         (verdict == Verdict::Revise) == (blocking > 0),
         "revise needs at least one blocking finding, and approve allows none"
     );
-    // The verdict keeps the state it was given for; once the work dir no
-    // longer has this fingerprint, the verdict is shown as stale.
     let fingerprint = crate::fingerprint::digest(store.load(goal_id)?.work_dir()?)?;
     let current = fingerprint == request.detail["digest"];
     store.record(
@@ -604,6 +576,7 @@ pub(crate) async fn submit_review(
                "verdict": verdict, "findings": findings, "current": current,
                "fingerprint": fingerprint}),
     )?;
+    drop(submission);
     let note = format!(
         "review {review} from {}: {verdict:?} with {blocking} blocking finding(s){}; read it with hgm log {goal_id}",
         role.name,
@@ -627,12 +600,6 @@ pub(crate) async fn submit_review(
     )
 }
 
-/// Every review verdict on a goal, oldest first, with whether it still
-/// describes the work: `current` when the work dir has the fingerprint the
-/// verdict was given for, `stale` when it changed since, `unknown` when the
-/// work dir cannot be read. A verdict submitted on a work dir that changed
-/// during its review is stale from the start. A verdict recorded before
-/// fingerprints were stored is compared through its request.
 pub(crate) fn review_states(
     goal: &crate::model::Goal,
     events: &[crate::events::Event],
@@ -672,11 +639,6 @@ pub(crate) fn review_states(
     states
 }
 
-/// Under `loop.require_review`, why the goal may not move to review yet, with
-/// the commands to run next; `None` when it may (or the setting is off). It
-/// needs a current approving verdict from a reviewer whose provider received
-/// none of the goal's linked assignments or corrections, and no reviewer's
-/// latest current verdict may ask for a revision.
 pub(crate) fn review_hold(
     goal: &crate::model::Goal,
     events: &[crate::events::Event],
@@ -738,17 +700,8 @@ pub(crate) fn review_hold(
     ))
 }
 
-/// Records an implementer's report and points the manager at it.
-/// The longest report, in words (two CJK characters count as one): a worker's
-/// full report with plan, changes and verification ran to a few thousand
-/// characters on 2026-11-15.
 pub(crate) const REPORT_WORD_BUDGET: usize = 3_000;
 
-/// Records a worker's report on the goal's timeline in full, from `text` or
-/// the file at `file`, so the manager reads it with `hgm log` or the packet
-/// instead of the provider's transcript. main, impl and the manager may
-/// report; a reviewer answers with `review-submit`. Like a decision, a report
-/// completes nothing.
 pub(crate) fn report(
     store: &Store,
     goal_id: &str,
@@ -775,8 +728,6 @@ pub(crate) fn report(
         detail["file"] = json!(file);
     }
     store.record(goal_id, "report", detail)?;
-    // A helper's report wakes the manager; main's goes with the wake its
-    // settling brings, among the events since the last one.
     if std::env::var_os("HGM_ROLE").is_some() {
         let short: String = text.chars().take(200).collect();
         nudge_manager(
@@ -841,7 +792,6 @@ mod tests {
         );
         events.push(verdict("r-2", "second", "codex", "approve"));
         assert_eq!(hold(&events), None);
-        // A current revise from any reviewer holds it again.
         events.push(verdict("r-3", "reviewer", "claude", "revise"));
         assert!(
             hold(&events)
@@ -861,7 +811,6 @@ mod tests {
                 .contains("approving review r-2 is stale")
         );
 
-        // Without the setting, nothing is held.
         let plain = store.add(
             serde_norway::from_str("objective: o\nacceptance: [a]\n")?,
             None,

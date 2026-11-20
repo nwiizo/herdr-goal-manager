@@ -1,5 +1,3 @@
-//! The watch over one goal's worker: observation, holds, settle checks and
-//! manager wakes. Arming lives in `supervision`; the driver loop in `monitor`.
 use crate::{
     binding::{Target, args, live_pane, operation_lease, path, session},
     herdr_cli as herdr,
@@ -48,6 +46,13 @@ pub(crate) struct Watch {
     pub last_sent: i64,
     pub last_change: i64,
     pub fingerprint: String,
+    /// Observation for which a provider continue was reserved before typing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_observation: Option<String>,
+    /// Last prepared delivery still awaiting a new worker turn. Zero means
+    /// Herdr did not supply a sequence and a working observation is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_after_seq: Option<u64>,
     pub pending: Option<String>,
     pub status: String,
     #[serde(default)]
@@ -145,23 +150,12 @@ pub(crate) struct Watch {
 fn default_idle_notice_secs() -> u64 {
     crate::config::DEFAULT_IDLE_NOTICE_SECS
 }
-/// Wakes delivered for one unchanged observation before the user is asked
-/// instead. Repeating an unchanged observation only spends the manager's turns.
 const MAX_SAME_WAKES: u32 = 2;
-/// Provider errors per hour that a short continue may answer; more go to the user.
 const MAX_PROVIDER_ERRORS_PER_HOUR: usize = 3;
-/// Why a watch ended when the goal's `loop.max_hours` was spent.
 pub(crate) const TIME_BUDGET_SPENT: &str = "time_budget_exhausted";
-/// How the reason starts when a goal's watch spent its wakes.
 pub(crate) const WAKE_BUDGET_SPENT: &str = "wake_budget_exhausted";
-/// New context-rot signs that wake the manager with their evidence.
 const ROT_SIGNS_PER_WAKE: u32 = 2;
-/// Characters of each screen line quoted as context-rot evidence.
 const ROT_EVIDENCE_CHARS: usize = 120;
-/// Asks the manager to judge the context-rot signs counted since the last such
-/// wake. Screen phrases also match ordinary work (a test run repeated across a
-/// long task), so the watch never hands off on them; the manager decides with
-/// `hgm handoff`. Only the context threshold sets `handoff_due`.
 fn rot_wake(watch: &mut Watch) {
     let count = watch.rot_signals as usize;
     let evidence = watch.rot_evidence[watch.rot_evidence.len().saturating_sub(count)..]
@@ -185,7 +179,6 @@ fn rot_wake(watch: &mut Watch) {
     watch.rot_signals = 0;
 }
 impl Watch {
-    /// The goals this watch serves, `goal` among them.
     pub(crate) fn members(&self) -> Vec<String> {
         if self.goals.is_empty() {
             vec![self.goal.clone()]
@@ -196,7 +189,6 @@ impl Watch {
     pub(crate) fn serves(&self, goal: &str) -> bool {
         self.members().iter().any(|member| member == goal)
     }
-    /// Adds `goal` to the goals served; wakes stay about the current one.
     pub(crate) fn join(&mut self, goal: &str) {
         let mut members = self.members();
         if !members.iter().any(|member| member == goal) {
@@ -204,8 +196,6 @@ impl Watch {
         }
         self.goals = members;
     }
-    /// Turns wakes to `goal`, a member. Each goal keeps its own wake count, and
-    /// a note waiting for the previous goal does not reach the next one.
     pub(crate) fn focus(&mut self, goal: &str) {
         if self.goal == goal {
             return;
@@ -217,8 +207,6 @@ impl Watch {
         self.pending = None;
         self.reanchored_for = None;
     }
-    /// Removes `goal`; true when no goal is left. Wakes turn to another member
-    /// when `goal` was the current one.
     pub(crate) fn leave(&mut self, goal: &str) -> bool {
         let members: Vec<String> = self
             .members()
@@ -236,12 +224,9 @@ impl Watch {
         self.goals = if members.len() > 1 { members } else { vec![] };
         false
     }
-    /// The same observation has already been delivered `MAX_SAME_WAKES` times.
     fn repeated(&self) -> bool {
         self.same_wakes >= MAX_SAME_WAKES && self.wake_fingerprint == self.fingerprint
     }
-    /// Counts a context-rot sign once: a sign that stays on screen across
-    /// observations is the same sign. Returns whether it was new.
     fn count_rot(&mut self, signal: &str, line: &str) -> bool {
         let evidence = format!("{signal}:{line}");
         if self.rot_evidence.contains(&evidence) {
@@ -254,7 +239,6 @@ impl Watch {
         self.rot_signals += 1;
         true
     }
-    /// Records a delivered wake for spin and budget accounting.
     fn mark_wake(&mut self, now: i64) {
         if self.wake_fingerprint == self.fingerprint {
             self.same_wakes += 1;
@@ -271,12 +255,10 @@ impl Watch {
         self.pending_stop = false;
         self.pending_at = 0;
     }
-    /// The patrol interval in minutes: `supervise --patrol-minutes`, else the goal's.
     pub(crate) fn patrol(&self, goal: &crate::model::Goal) -> u32 {
         self.patrol_minutes
             .unwrap_or(goal.spec.loop_policy.patrol_minutes)
     }
-    /// Seconds the worker has been settled, when it is.
     pub(crate) fn idle_for(&self, now: i64) -> Option<i64> {
         (self.active && self.idle_since > 0).then(|| now.saturating_sub(self.idle_since))
     }
@@ -284,15 +266,11 @@ impl Watch {
 pub(crate) fn watch_path(store: &Store, context: &str) -> Result<PathBuf> {
     path(store, context, "-watch.json")
 }
-/// Loads the watch kept under `key` (see `Session::key`). A record moved from
-/// a manager context is saved back under `key`.
 pub(crate) fn load_watch(store: &Store, key: &str) -> Result<Watch> {
     let mut watch: Watch = serde_json::from_slice(&std::fs::read(watch_path(store, key)?)?)?;
     watch.context = key.into();
     Ok(watch)
 }
-/// A manager reopened for the same terminal takes over its active watch: wakes
-/// go to the new manager pane from the next observation on.
 pub(crate) fn adopt_watch(store: &Store, key: &str, manager: Target) -> Result<Option<String>> {
     if !watch_path(store, key)?.exists() {
         return Ok(None);
@@ -319,29 +297,38 @@ pub(crate) fn save_watch(store: &Store, watch: &Watch) -> Result<()> {
 fn main_role() -> String {
     "main".into()
 }
-/// Every watch record of the workspace, in any manager context; one that does
-/// not parse (written by another build) is skipped.
 fn watch_records(store: &Store) -> Result<Vec<Watch>> {
     let mut records = Vec::new();
     for entry in std::fs::read_dir(store.private_directory("manager")?)? {
         let path = entry?.path();
-        if !path
+        let Some(key) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-watch.json"))
-        {
+            .and_then(|name| name.strip_suffix("-watch.json"))
+        else {
             continue;
-        }
-        if let Ok(watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) {
+        };
+        if let Ok(mut watch) = serde_json::from_slice::<Watch>(&std::fs::read(&path)?) {
+            watch.context = key.into();
             records.push(watch);
         }
     }
     Ok(records)
 }
-/// Ends every active watch record of `goal`, in any manager context. Pause,
-/// cancel and wait take effect even when no watch process is running to notice.
-pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result<()> {
-    for mut watch in watch_records(store)? {
+pub(crate) async fn release_watches(store: &Store, goal: &str, reason: &str) -> Result<()> {
+    for record in watch_records(store)? {
+        if !record.active || !record.serves(goal) {
+            continue;
+        }
+        let _operation = crate::binding::wait_operation_lease(store, &record.context)
+            .await
+            .with_context(|| {
+                format!(
+                    "goal {goal} stopped; could not release watch {}",
+                    record.context
+                )
+            })?;
+        let mut watch = load_watch(store, &record.context)?;
         if watch.active && watch.serves(goal) {
             drop_goal(store, &mut watch, goal, reason, false)?;
             save_watch(store, &watch)?;
@@ -349,7 +336,14 @@ pub(crate) fn release_watches(store: &Store, goal: &str, reason: &str) -> Result
     }
     Ok(())
 }
-/// A watched worker's current idle stretch.
+pub(crate) fn held_goals(store: &Store) -> Result<BTreeMap<String, String>> {
+    Ok(watch_records(store)?
+        .into_iter()
+        .filter(|w| w.active && w.held.is_some())
+        .filter_map(|w| Some((w.goal, w.held_cause?)))
+        .collect())
+}
+
 pub(crate) struct IdleStretch {
     pub role: String,
     pub secs: i64,
@@ -357,7 +351,6 @@ pub(crate) struct IdleStretch {
     /// Whether the person was told about it.
     pub noticed: bool,
 }
-/// Idle stretches of workers that running watches observe, by member goal.
 pub(crate) fn idle_stretches(store: &Store, now: i64) -> Result<BTreeMap<String, IdleStretch>> {
     let mut stretches = BTreeMap::new();
     for watch in watch_records(store)? {
@@ -381,7 +374,6 @@ pub(crate) fn idle_stretches(store: &Store, now: i64) -> Result<BTreeMap<String,
     }
     Ok(stretches)
 }
-/// The native goal each active watch recorded, by the goal it was set for.
 pub(crate) fn native_goals(
     store: &Store,
 ) -> Result<BTreeMap<String, crate::native_goal::NativeGoalState>> {
@@ -393,8 +385,6 @@ pub(crate) fn native_goals(
     }
     Ok(goals)
 }
-/// The Goal Manager's native goal recorded by each active watch, by the goals
-/// that watch serves.
 pub(crate) fn manager_goals(
     store: &Store,
 ) -> Result<BTreeMap<String, crate::manager_goal::ManagerGoalState>> {
@@ -408,7 +398,6 @@ pub(crate) fn manager_goals(
     }
     Ok(goals)
 }
-/// Whether a running watch, in any manager context, serves `goal`.
 pub(crate) fn watched(store: &Store, goal: &str) -> Result<bool> {
     let now = Utc::now().timestamp();
     for watch in watch_records(store)? {
@@ -418,8 +407,6 @@ pub(crate) fn watched(store: &Store, goal: &str) -> Result<bool> {
     }
     Ok(false)
 }
-/// Takes `goal` off the watch. The watch itself ends with `reason` only when
-/// no other goal shares it; otherwise only `goal`'s timeline records the end.
 fn drop_goal(
     store: &Store,
     watch: &mut Watch,
@@ -438,9 +425,6 @@ fn drop_goal(
     }
     Ok(())
 }
-/// Drops member goals that no longer want watching (paused, waiting, finished
-/// or ready for review) and turns wakes to the goal whose linked assignment
-/// reached the observed pane last. False once no goal is left: the watch ended.
 pub(crate) fn refocus(store: &Store, watch: &mut Watch) -> Result<bool> {
     let mut latest: Option<(chrono::DateTime<Utc>, String)> = None;
     for id in watch.members() {
@@ -478,11 +462,6 @@ pub(crate) fn refocus(store: &Store, watch: &mut Watch) -> Result<bool> {
     }
     Ok(true)
 }
-/// Ends the watch for a cause only the person can resolve: the goal waits for
-/// them with `reason`, so an unfinished goal is never left running unwatched.
-/// A watch otherwise ends only when its goal is completed, cancelled, paused
-/// or waiting.
-/// A cause on the observed pane blocks every goal sharing the watch.
 pub(crate) fn end_for_person(store: &Store, watch: &mut Watch, reason: &str) {
     for goal in watch.members() {
         if let Err(error) = store.update(&goal, |goal| goal.wait(reason.to_string())) {
@@ -491,7 +470,6 @@ pub(crate) fn end_for_person(store: &Store, watch: &mut Watch, reason: &str) {
     }
     end_watch(store, watch, reason, true);
 }
-/// Records why monitoring stopped; abnormal ends notify the user.
 pub(crate) fn end_watch(store: &Store, watch: &mut Watch, reason: &str, notify: bool) {
     watch.active = false;
     watch.status = reason.into();
@@ -503,24 +481,15 @@ pub(crate) fn end_watch(store: &Store, watch: &mut Watch, reason: &str, notify: 
         eprintln!("Could not record the end of monitoring: {error:#}");
     }
 }
-/// What one observation of the original agent showed.
 #[derive(Debug, PartialEq, Eq)]
 enum Seen {
     Changed,
     Unchanged,
-    /// Unchanged after `MAX_SAME_WAKES` wakes: ask the user, stop waking.
     Stalled,
 }
-/// Updates the watch from one observation. Any change releases a hold.
-///
-/// `sent_seq` is the worker's `state_change_seq` when the latest delivery to it
-/// was sent: a settled state that has not moved since then belongs to the
-/// previous turn and is not news.
 fn observe(watch: &mut Watch, live: &Value, screen: &str, now: i64, sent_seq: Option<u64>) -> Seen {
     let state = live["agent_status"].as_str().unwrap_or("");
     let working = state == "working";
-    // While a turn runs, spinners, timers and token counts move by
-    // themselves; only the rest of the screen shows progress.
     let basis = if working {
         crate::signals::progress_view(screen, live["agent"].as_str().unwrap_or(""))
     } else {
@@ -534,18 +503,28 @@ fn observe(watch: &mut Watch, live: &Value, screen: &str, now: i64, sent_seq: Op
         ))
     );
     let seq = live["state_change_seq"].as_u64();
+    if working
+        || watch
+            .prepared_after_seq
+            .zip(seq)
+            .is_some_and(|(sent, current)| sent > 0 && current > sent)
+    {
+        watch.prepared_after_seq = None;
+    }
+    if watch
+        .continued_observation
+        .as_ref()
+        .is_some_and(|last| last != &fingerprint)
+    {
+        watch.continued_observation = None;
+    }
     let moved_since_delivery = match (sent_seq, seq) {
         (Some(sent), Some(seq)) => seq > sent,
         _ => true,
     };
     let changed = fingerprint != watch.fingerprint;
     let settled = matches!(state, "idle" | "done");
-    // Only settling is a stop: a settled worker whose screen moves is not;
-    // a worker that settles after a stretch without progress is.
     let stopped = settled && (watch.idle_since == 0 || watch.stuck);
-    // An idle stretch starts when the worker settles (settle checks run
-    // inside it) or, while it works, at its last progress once it has shown
-    // none for `idle_secs`; progress or a dialog ends it.
     if stopped {
         watch.idle_since = now;
         watch.idle_noticed = false;
@@ -568,7 +547,6 @@ fn observe(watch: &mut Watch, live: &Value, screen: &str, now: i64, sent_seq: Op
             )
         {
             watch.pending = Some(format!("target state changed to {}", live["agent_status"]));
-            // Stopping after new work is news the manager acts on at once.
             watch.pending_stop |= stopped;
         }
     }
@@ -584,13 +562,9 @@ fn observe(watch: &mut Watch, live: &Value, screen: &str, now: i64, sent_seq: Op
             watch.clear_pending();
             return Seen::Stalled;
         }
-        // A wake still waiting (settle checks, a provider error) says more than
-        // the time without change, so it is kept.
         let idle = now - watch.last_change;
         watch.pending.get_or_insert_with(|| {
             if working {
-                // A long silent tool run looks the same: only a retry notice
-                // names a cause.
                 let cause = match &watch.retry {
                     Some(line) => format!("; the provider keeps retrying ({line})"),
                     None => "; it may be a long silent tool run or a hang".into(),
@@ -617,8 +591,6 @@ fn observe(watch: &mut Watch, live: &Value, screen: &str, now: i64, sent_seq: Op
         Seen::Unchanged
     }
 }
-/// Holds automatic wakeups until the original screen changes and tells the
-/// user, who is the only one able to resolve the cause.
 fn hold(store: &Store, watch: &mut Watch, cause: &str, reason: String) -> Result<()> {
     if watch.held_cause.as_deref() != Some(cause) {
         store.record(
@@ -629,20 +601,11 @@ fn hold(store: &Store, watch: &mut Watch, cause: &str, reason: String) -> Result
         watch.held_cause = Some(cause.into());
     }
     watch.held = Some(reason);
-    // The observation that found the cause may have queued a wake ("state
-    // changed to idle"); the manager learns nothing it can act on from it.
     watch.clear_pending();
     Ok(())
 }
-/// What the watch types into a settled worker after a provider error ended its
-/// turn. Fixed in the binary; it is not an assignment and adds no work.
 pub(crate) const PROVIDER_CONTINUE: &str =
     "Continue the current assignment from where it stopped; do not redo finished steps.";
-/// Reacts to why a settled original agent stopped. After a transient provider
-/// error the watch types the fixed continue itself (within the hourly cap) and
-/// the record travels with the next wake; repeated errors, sign-in, limits and
-/// dialogs go to the user and hold further wakeups. Returns whether the
-/// continue went out.
 async fn classify_stop(
     store: &Store,
     watch: &mut Watch,
@@ -674,6 +637,9 @@ async fn classify_stop(
         )
         .map(|()| false),
         Some(Stop::ProviderError(line)) => {
+            if watch.continued_observation.as_ref() == Some(&watch.fingerprint) {
+                return Ok(false);
+            }
             let recent = events
                 .iter()
                 .filter(|e| e.kind == "provider_error" && e.at.timestamp() >= now - 3600)
@@ -692,13 +658,9 @@ async fn classify_stop(
             }
             store.record(&watch.goal, "provider_error", json!({ "line": line }))?;
             watch.held_cause = None;
-            // A native goal retries a transient error itself: one loop only.
             if native_driving(watch, screen) {
                 return Ok(false);
             }
-            // No continue past a boundary: a spent wake budget, changed protected
-            // paths, a spent time budget or a stop condition ends or holds the
-            // loop instead (the steps after this one act on them).
             let goal = store.load(&watch.goal)?;
             if watch.wakes >= watch.max_wakes
                 || boundary_reached(&goal, events, now)?.is_some()
@@ -706,8 +668,6 @@ async fn classify_stop(
             {
                 return Ok(false);
             }
-            // Only into an empty input line of a settled agent, never a draft:
-            // as observed, and again right before typing.
             if can_prompt(live, screen) {
                 let (live, fresh) = fresh_worker(&watch.origin.pane).await?;
                 if can_prompt(&live, &fresh) {
@@ -721,14 +681,11 @@ async fn classify_stop(
             Ok(false)
         }
         None => {
-            // The cause left the screen: the next one is news again.
             watch.held_cause = None;
             Ok(false)
         }
     }
 }
-/// Types [`PROVIDER_CONTINUE`] into the watched worker and records it. A
-/// delivery that cannot be confirmed is reported to the manager, never retried.
 async fn continue_after_error(
     store: &Store,
     watch: &mut Watch,
@@ -736,6 +693,12 @@ async fn continue_after_error(
     line: &str,
 ) -> Result<bool> {
     let pane = watch.origin.pane.clone();
+    watch.continued_observation = Some(watch.fingerprint.clone());
+    watch.pending = Some(format!(
+        "A continue for {pane} may have been delivered; inspect the worker before sending anything."
+    ));
+    watch.pending_stop = true;
+    save_watch(store, watch)?;
     match herdr::query(&args(&["agent", "prompt", &pane, PROVIDER_CONTINUE])).await {
         Ok(_) => {
             let agent = live["agent"].as_str().unwrap_or("");
@@ -748,12 +711,9 @@ async fn continue_after_error(
                     "provider_continue",
                     json!({"line": line, "text": PROVIDER_CONTINUE, "role": watch.role, "consumed": true}),
                 )?;
-                // The next wake carries the record; nothing wakes the manager now.
                 watch.clear_pending();
                 return Ok(true);
             }
-            // The input line did not empty: the continue may sit there or
-            // have gone into something else on screen. Not typed again.
             store.record(
                 &watch.goal,
                 "provider_continue",
@@ -779,10 +739,7 @@ async fn continue_after_error(
         }
     }
 }
-/// The attention cause for a worker settled short of completion too long.
 pub(crate) const IDLE_NOTICE: &str = "idle_no_next_step";
-/// Whether a goal still has work for its worker: not awaiting review or
-/// finished, not waiting for the person, and not paused.
 pub(crate) fn short_of_completion(goal: &crate::model::Goal) -> bool {
     !matches!(
         goal.status,
@@ -790,11 +747,6 @@ pub(crate) fn short_of_completion(goal: &crate::model::Goal) -> bool {
     ) && goal.waiting.is_none()
         && goal.control == Control::Run
 }
-/// Tells the person, once per idle stretch, when the worker has sat short of
-/// completion longer than `idle_notice_secs`: settled with no next step
-/// prepared, or working without progress. Keeping it working is the
-/// manager's job, so a stretch that long needs a look. A hold already told
-/// them why it stopped.
 fn notice_idle(
     store: &Store,
     watch: &mut Watch,
@@ -816,7 +768,6 @@ fn notice_idle(
     watch.idle_noticed = true;
     let duration = crate::watch_view::duration(idle);
     let reason = if watch.stuck {
-        // Failure is not assumed: a long tool run looks the same.
         let cause = watch
             .retry
             .as_ref()
@@ -846,8 +797,6 @@ fn notice_idle(
         }),
     )
 }
-/// Whether the pending wake may go now. A stop after new work goes at once;
-/// the cooldown spaces patrols, unchanged screens and other notes.
 pub(crate) fn wake_ready(watch: &Watch, now: i64) -> bool {
     watch.active
         && watch.held.is_none()
@@ -855,15 +804,6 @@ pub(crate) fn wake_ready(watch: &Watch, now: i64) -> bool {
         && watch.wakes < watch.max_wakes
         && (watch.pending_stop || now.saturating_sub(watch.last_sent) >= watch.cooldown_secs as i64)
 }
-/// Whether work reached the worker after the pending wake's observation: an
-/// assignment, correction or goal check for a goal this watch serves, or for
-/// any goal whose delivery went to the watched pane (one that could not join
-/// the watch). The manager has acted, so the wake describes a past state.
-/// Dates a pending wake: the state it describes was seen when the worker last
-/// changed, so work sent after that makes it stale, and a change seen after
-/// such work makes it current again. Natively (2026-11-15) a wake held behind
-/// a manager draft kept its first date, and the settle after newer work, which
-/// replaced its text, was dropped with it as stale.
 fn stamp_pending(watch: &mut Watch, now: i64) {
     if watch.pending.is_none() {
         watch.clear_pending();
@@ -890,17 +830,12 @@ fn superseded(store: &Store, watch: &Watch) -> Result<bool> {
     }
     Ok(false)
 }
-/// Whether a working manager takes typed input as a queued message, under
-/// the rules of `send --interrupt`: a provider known to queue it, an empty
-/// input line and no dialog.
 pub(crate) fn takes_queued_input(manager: &Value, screen: &str) -> bool {
     let agent = manager["agent"].as_str().unwrap_or("");
     crate::supervision::QUEUES_WHILE_WORKING.contains(&agent)
         && (manager["agent_status"] == "working" || busy_on_screen(screen, agent))
         && input_refusal(manager, screen).is_none()
 }
-/// When the worker settles after new work, runs the goal's command checks so a
-/// missed acceptance turns into a correction now rather than at review.
 async fn settle_checks(
     store: &Store,
     watch: &mut Watch,
@@ -922,7 +857,6 @@ async fn settle_checks(
         return Ok(());
     }
     watch.checked_through = Some(latest);
-    // The state these checks judge, kept with their result.
     let fingerprint = crate::fingerprint::digest(goal.work_dir()?).ok();
     let (mut passed, mut failed) = (vec![], vec![]);
     for check in &goal.spec.checks {
@@ -954,9 +888,6 @@ async fn settle_checks(
         "settle_checks",
         json!({"role": watch.role, "passed": passed, "failed": failed, "fingerprint": fingerprint}),
     )?;
-    // Notes from this observation (a native goal's outcome read as the
-    // worker settled) stay behind the settle note; the generic state-change
-    // note says nothing the settle note does not.
     let note = settle_note(&watch.role, &failed, events);
     let earlier = watch.pending.take().map(|earlier| {
         if earlier.starts_with("target state changed") {
@@ -975,9 +906,6 @@ async fn settle_checks(
     watch.pending_stop = true;
     Ok(())
 }
-/// The wake note after settle checks. A failing check asks for a correction
-/// only when it passed at an earlier settle of the goal (`events`): a check
-/// that never passed may only show unfinished work, so it is listed instead.
 fn settle_note(role: &str, failed: &[Value], events: &[crate::events::Event]) -> String {
     if failed.is_empty() {
         return format!(
@@ -1027,8 +955,6 @@ fn settle_note(role: &str, failed: &[Value], events: &[crate::events::Event]) ->
     }
     note
 }
-/// The worker's native state in one `agent get`; the pane inventory (two
-/// listings) answers when that fails, e.g. for a pane without an agent.
 pub(crate) async fn worker_state(pane: &str) -> Result<Value> {
     match herdr::json_query(&args(&["agent", "get", pane])).await {
         Ok(reply) if reply["result"]["agent"]["pane_id"].as_str() == Some(pane) => {
@@ -1037,18 +963,12 @@ pub(crate) async fn worker_state(pane: &str) -> Result<Value> {
         _ => live_pane(pane).await,
     }
 }
-/// The worker's state and screen read again right before the watch types into
-/// it. The observation that decided to type can be seconds old, since checks
-/// run after it: Claude Code 2.1.325 opened a dialog in that time ("Teach auto
-/// mode about your environment?", listed by Herdr as done), and a line typed
-/// from the earlier observation went into it (2026-11-15).
 pub(crate) async fn fresh_worker(pane: &str) -> Result<(Value, String)> {
     let mut live = worker_state(pane).await?;
     let screen = crate::binding::screen(pane).await?;
     crate::signals::apply_screen_state(&mut live, &screen);
     Ok((live, screen))
 }
-/// The worker's `state_change_seq` when the latest delivery to `role` was sent.
 fn delivery_seq(events: &[crate::events::Event], role: &str) -> Option<u64> {
     events
         .iter()
@@ -1059,8 +979,6 @@ fn delivery_seq(events: &[crate::events::Event], role: &str) -> Option<u64> {
         })
         .and_then(|e| e.detail["seq"].as_u64())
 }
-/// Judges one observation of the worker (`target` state and `screen`) and wakes
-/// the manager when something needs it.
 pub(crate) async fn watch_once(
     store: &Store,
     watch: &mut Watch,
@@ -1085,7 +1003,6 @@ pub(crate) async fn watch_once(
         delivery_seq(&events, &watch.role),
     );
     if watch.stuck && !was_stuck {
-        // Whether the files still move while the screen does not.
         let changed_at = goal.work_dir().ok().and_then(|dir| {
             crate::fingerprint::Snapshot::take(dir)
                 .ok()
@@ -1101,7 +1018,7 @@ pub(crate) async fn watch_once(
     }
     settle_interrupted(store, watch, now)?;
     confirm_pending_goal(store, watch, target, screen, now)?;
-    if let Some(note) = crate::cross_check::poll(store, watch, now, false)? {
+    if let Some(note) = crate::cross_check::poll(store, watch, now, false).await? {
         append_note(watch, note);
         watch.pending_stop = true;
     }
@@ -1115,8 +1032,7 @@ pub(crate) async fn watch_once(
     if seen == Seen::Changed {
         observe_native(store, watch, screen)?;
         let continued = classify_stop(store, watch, &events, target, screen, now).await?;
-        // A stop condition found there ended the watch: nothing more runs.
-        if !watch.active {
+        if !watch.active || !watch.serves(&goal.id) {
             return Ok(());
         }
         let settled = matches!(target["agent_status"].as_str(), Some("idle" | "done"));
@@ -1125,7 +1041,6 @@ pub(crate) async fn watch_once(
         }
         if !continued && watch.held.is_none() && settled {
             settle_checks(store, watch, &goal, &events).await?;
-            // The same settle makes the cross check due, checks or none.
             watch.cross_due = true;
         }
         if let Some(line) = compaction_shown(screen) {
@@ -1155,15 +1070,10 @@ pub(crate) async fn watch_once(
             rot_wake(watch);
         }
     }
-    // The other provider checks settled work, apart from the settle checks:
-    // due from this observation's settle, or still due after a running check.
     let settled_now = matches!(target["agent_status"].as_str(), Some("idle" | "done"));
     if let Err(error) = crate::cross_check::request(store, watch, &goal, &events, settled_now) {
         append_note(watch, format!("the cross check could not start: {error:#}"));
     }
-    // The worker drives itself only while the goal its native goal is for has
-    // work here: on a shared watch, or after a watch armed again for another
-    // goal, that need not be the goal wakes are about.
     if let Some(state) = watch
         .native_goal
         .clone()
@@ -1188,12 +1098,11 @@ pub(crate) async fn watch_once(
         }
     }
     if watch.wakes >= watch.max_wakes {
-        // The budget is the goal's own: only it waits, other goals stay watched.
         let reason = format!(
             "{WAKE_BUDGET_SPENT}: the watch spent its {} wakes; decide whether to continue (supervise with a larger --max-wakes), revise, or stop",
             watch.max_wakes
         );
-        crate::native_goal::clear(store, watch, WAKE_BUDGET_SPENT).await?;
+        clear_goal_native(store, watch, &goal.id, WAKE_BUDGET_SPENT).await?;
         if let Err(error) = store.update(&goal.id, |goal| goal.wait(reason.clone())) {
             eprintln!("Could not set the goal waiting: {error:#}");
         }
@@ -1210,14 +1119,14 @@ pub(crate) async fn watch_once(
             "Protected paths changed: {}. Revert the change, or confirm the goal again if you accept it.",
             goal.spec.protected_paths.join(", ")
         );
-        crate::native_goal::clear(store, watch, "protected paths changed").await?;
+        clear_goal_native(store, watch, &goal.id, "protected paths changed").await?;
         store.record(
             &goal.id,
             "boundary_crossed",
             json!({ "paths": goal.spec.protected_paths }),
         )?;
         store.update(&goal.id, |g| g.wait(reason.clone()))?;
-        end_watch(store, watch, "boundary_crossed", false);
+        drop_goal(store, watch, &goal.id, "boundary_crossed", false)?;
         return Ok(());
     }
     let first_assignment = events.iter().find(|e| e.kind == "assigned").map(|e| e.at);
@@ -1227,20 +1136,18 @@ pub(crate) async fn watch_once(
         let reason = format!(
             "Time budget of {hours} h since the first assignment is spent. Decide whether to continue, revise, or stop."
         );
-        crate::native_goal::clear(store, watch, TIME_BUDGET_SPENT).await?;
+        clear_goal_native(store, watch, &goal.id, TIME_BUDGET_SPENT).await?;
         store.update(&goal.id, |g| g.wait(reason.clone()))?;
-        end_watch(store, watch, TIME_BUDGET_SPENT, false);
+        drop_goal(store, watch, &goal.id, TIME_BUDGET_SPENT, false)?;
         return Ok(());
     }
-    // A fresh native goal starts its own turn; a prepared step waits for the
-    // worker to settle again, so one loop drives it at a time.
-    if !set_native(store, watch, &goal, target, screen).await?
-        && deliver_prepared(store, watch, &goal, target, screen).await?
+    let native_acted = set_native(store, watch, &goal, target, screen).await?;
+    if !watch.active
+        || !watch.serves(&goal.id)
+        || (!native_acted && deliver_prepared(store, watch, &goal, target, screen).await?)
     {
         return Ok(());
     }
-    // Re-read the goal periodically and after compaction, restart or scope
-    // change. Delivered once per trigger; held states wait for a change.
     let events = store.events(&goal.id)?;
     if watch.held.is_none()
         && let Some((reason, at)) = crate::admission::reanchor_due(&goal, &events, Utc::now())
@@ -1257,9 +1164,6 @@ pub(crate) async fn watch_once(
         });
     }
     let patrol = watch.patrol(&goal);
-    // Stop checks run at every patrol, whether or not it wakes anyone: a quiet
-    // patrol (`patrol_wake: finding`) would otherwise leave a stop condition
-    // unseen until another cause wakes the manager.
     let mut stop_checked = false;
     if patrol > 0
         && watch.pending.is_none()
@@ -1267,7 +1171,6 @@ pub(crate) async fn watch_once(
         && target["agent_status"] == "working"
         && now - watch.last_patrol >= i64::from(patrol) * 60
     {
-        // Progress is visible when the screen changed since the previous patrol.
         let progressed = watch.last_change > watch.last_patrol;
         watch.last_patrol = now;
         if stop_condition(store, watch, &goal).await? {
@@ -1291,8 +1194,6 @@ pub(crate) async fn watch_once(
         );
         watch.pending = Some(note.clone());
         compare_scope(store, watch, &goal, &events);
-        // No progress, a stuck worker, a context-rot sign or a regressed check
-        // each make their own wake; here only a write-scope note can join.
         let finding = watch.pending.as_deref() != Some(note.as_str());
         let quiet = goal.spec.loop_policy.patrol_wake == crate::contract::PatrolWake::Finding
             && progressed
@@ -1325,15 +1226,12 @@ pub(crate) async fn watch_once(
     watch.manager.check(&manager)?;
     let manager_screen = crate::binding::screen_lines(&watch.manager.pane, 30).await?;
     let free = can_prompt(&manager, &manager_screen);
-    // A stop after new work also reaches a busy manager that queues input.
     let queued = !free && watch.pending_stop && takes_queued_input(&manager, &manager_screen);
     if !free && !queued {
         watch.status = "waiting_for_manager".into();
         if watch.manager_unavailable_since == 0 {
             watch.manager_unavailable_since = now;
         }
-        // Nobody answers the manager's own approval dialog unattended; queued
-        // wakes would wait silently, so the user is told once.
         if !watch.manager_notified
             && now - watch.manager_unavailable_since >= watch.idle_secs as i64
             && needs_human(&manager, &manager_screen)
@@ -1368,8 +1266,6 @@ pub(crate) async fn watch_once(
     herdr::query(&args(&["agent", "prompt", &watch.manager.pane, &notice]))
         .await
         .context("manager wake admission uncertain; no automatic resend")?;
-    // As with send: the input line must empty again. Text left there is
-    // reported, never typed a second time.
     let agent = manager["agent"].as_str().unwrap_or("");
     let consumed = crate::supervision::input_consumed(&watch.manager.pane, agent)
         .await
@@ -1388,10 +1284,6 @@ pub(crate) async fn watch_once(
     watch.status = "watching".into();
     record_wake(store, watch, &reason, via)
 }
-/// Hands the ready wake to the manager's running `hgm await` instead of typing
-/// it: the same notice, so a draft in the manager's input no longer holds it
-/// back. Returns whether the step ends here (handed, or an earlier handed
-/// wake still waits to be taken); without an await the wake is typed as before.
 fn hand_to_await(
     store: &Store,
     watch: &mut Watch,
@@ -1426,10 +1318,6 @@ fn hand_to_await(
         }
     }
 }
-/// A native goal input the watch was typing when it stopped: `sending` or
-/// `clearing`, saved right before typing and replaced right after, is left
-/// only by a watch that stopped in between. It may have arrived, so it is
-/// recorded as uncertain once and never typed again.
 pub(crate) fn settle_interrupted(store: &Store, watch: &mut Watch, now: i64) -> Result<()> {
     let typing = |outcome: Option<&str>| matches!(outcome, Some("sending" | "clearing"));
     let why = "the watch stopped while typing it";
@@ -1476,8 +1364,6 @@ pub(crate) fn settle_interrupted(store: &Store, watch: &mut Watch, now: i64) -> 
     }
     Ok(())
 }
-/// Whether the native goal hgm set still drives the worker: no outcome yet and
-/// the screen shows it active or retrying by itself.
 fn native_driving(watch: &Watch, screen: &str) -> bool {
     use crate::signals::NativeGoal as N;
     watch
@@ -1489,14 +1375,6 @@ fn native_driving(watch: &Watch, screen: &str) -> bool {
             Some(N::Active | N::Retrying(_))
         )
 }
-/// Records what the native goal shows on screen: its outcome (met, judged
-/// impossible, paused, cleared after an error or by hand) or that `/goal` is
-/// unavailable. Each is an observation only; an outcome wakes the manager as
-/// for any stop, and no task completes or goal is accepted by it.
-/// Settles a native goal queued with the assignment: set once the worker shows
-/// `Goal set:` for this goal and task, uncertain when the worker has sat
-/// settled without it (the queued line runs as soon as the assignment's turn
-/// ends, so a few seconds are enough). An uncertain one is never typed again.
 fn confirm_pending_goal(
     store: &Store,
     watch: &mut Watch,
@@ -1550,13 +1428,6 @@ fn confirm_pending_goal(
     }
     Ok(())
 }
-/// Records the end of a set native goal whose outcome showed where reading
-/// from the bottom does not find it: a goal queued with the assignment and met
-/// at the stop that ran it prints its outcome above the echoed `Goal set:`
-/// (seen natively on the Goal Manager, 2026-11-16). A settled worker without
-/// the `◎ /goal active` indicator above its input line runs no goal. Checked at
-/// every observation, since the screen may not change again; the outcome is an
-/// observation only, and a pending wake carries it.
 fn notice_unseen_end(
     store: &Store,
     watch: &mut Watch,
@@ -1570,7 +1441,6 @@ fn notice_unseen_end(
         return Ok(());
     };
     let settled = matches!(target["agent_status"].as_str(), Some("idle" | "done"));
-    // An outcome below the newest `Goal set:` is read by `observe_native`.
     let below = !matches!(
         crate::signals::native_goal(screen),
         Some(N::Active | N::Retrying(_)) | None
@@ -1653,8 +1523,6 @@ fn observe_native(store: &Store, watch: &mut Watch, screen: &str) -> Result<()> 
             "the native goal reports {outcome} ({line}); that is the provider's verdict, not evidence: check the result against the contract"
         ),
     );
-    // The goal went on working after the first settle: what it left is
-    // checked again, by the settle checks and the cross check.
     watch.checked_through = None;
     watch.cross_through = None;
     watch.pending_stop = true;
@@ -1664,11 +1532,6 @@ fn observe_native(store: &Store, watch: &mut Watch, screen: &str) -> Result<()> 
     });
     Ok(())
 }
-/// Sets the native goal once the worker has settled after a linked non-plan
-/// assignment that has none yet, when the contract wants one and nothing
-/// holds. Setting it starts a turn at once, so the stop checks run first.
-/// Returns whether it acted: set it, or found a stop condition that ended
-/// the watch.
 async fn set_native(
     store: &Store,
     watch: &mut Watch,
@@ -1698,21 +1561,30 @@ async fn set_native(
         .native_goal
         .as_ref()
         .is_some_and(|state| state.goal == goal.id && state.assigned_at >= assigned.at);
-    if assigned.detail["plan"] == true || done {
+    let handled = events
+        .iter()
+        .rev()
+        .take_while(|event| event.at > assigned.at)
+        .any(|event| {
+            matches!(
+                event.kind.as_str(),
+                "native_goal_set" | "native_goal_queued" | "restarted"
+            )
+        });
+    if assigned.detail["plan"] == true || done || handled {
         return Ok(false);
     }
-    // A /goal starts new work at once: a stop condition that holds comes
-    // first, as it does before a prepared step.
     if stop_condition(store, watch, goal).await? {
         return Ok(true);
     }
-    // The settle checks ran since the observation: look again before typing.
     let (live, fresh) = fresh_worker(&watch.origin.pane).await?;
     if !can_prompt(&live, &fresh) {
         return Ok(false);
     }
     let task = assigned.detail["task"].as_str().map(String::from);
-    crate::native_goal::set(store, watch, goal, task.as_deref(), assigned.at, agent).await?;
+    if !crate::native_goal::set(store, watch, goal, task.as_deref(), assigned.at, agent).await? {
+        return Ok(false);
+    }
     append_note(
         watch,
         format!(
@@ -1723,13 +1595,14 @@ async fn set_native(
     );
     Ok(true)
 }
-/// Runs the goal's stop checks; one that holds makes the goal wait for the
-/// person and ends the watch. Returns whether one held.
-/// The name of the first stop check of `goal` whose command succeeds now.
 pub(crate) async fn stop_check_holding(
     store: &Store,
     goal: &crate::model::Goal,
 ) -> Result<Option<String>> {
+    ensure!(
+        goal.spec.loop_policy.stop_checks.is_empty() || goal.confirmed.is_some(),
+        "confirm the goal contract before running stop checks"
+    );
     for check in &goal.spec.loop_policy.stop_checks {
         let command = crate::model::CommandSpec {
             program: "sh".into(),
@@ -1737,21 +1610,29 @@ pub(crate) async fn stop_check_holding(
             prompt_stdin: false,
         };
         let id = format!("stop-{}", uuid::Uuid::new_v4());
-        if crate::process::execute(
-            store,
-            goal.work_dir()?,
-            &id,
-            &command,
-            "",
-            check.timeout_secs,
-        )
-        .await
-        .is_ok()
+        if crate::process::predicate(store, goal.work_dir()?, &id, &command, check.timeout_secs)
+            .await
+            .with_context(|| format!("evaluate stop check {}", check.name))?
         {
             return Ok(Some(check.name.clone()));
         }
     }
     Ok(None)
+}
+async fn clear_goal_native(
+    store: &Store,
+    watch: &mut Watch,
+    goal: &str,
+    reason: &str,
+) -> Result<()> {
+    if watch
+        .native_goal
+        .as_ref()
+        .is_some_and(|state| state.goal == goal)
+    {
+        crate::native_goal::clear(store, watch, reason).await?;
+    }
+    Ok(())
 }
 async fn stop_condition(
     store: &Store,
@@ -1762,14 +1643,12 @@ async fn stop_condition(
         return Ok(false);
     };
     let reason = format!("Stop condition {name} holds. Decide whether to revise the goal or stop.");
-    crate::native_goal::clear(store, watch, "a stop condition holds").await?;
+    clear_goal_native(store, watch, &goal.id, "a stop condition holds").await?;
     store.record(&goal.id, "stop_condition", json!({ "check": name }))?;
     store.update(&goal.id, |g| g.wait(reason.clone()))?;
-    end_watch(store, watch, "stop_condition", false);
+    drop_goal(store, watch, &goal.id, "stop_condition", false)?;
     Ok(true)
 }
-/// Checks failing at the latest settle after the latest assignment or
-/// correction that passed at an earlier settle of the goal.
 fn regressed(events: &[crate::events::Event]) -> Vec<String> {
     let work = events
         .iter()
@@ -1798,8 +1677,6 @@ fn regressed(events: &[crate::events::Event]) -> Vec<String> {
         .map(String::from)
         .collect()
 }
-/// Adds changes outside the current task's write_paths to the wake. A failed
-/// comparison is reported and never ends the watch; writes are never blocked.
 fn compare_scope(
     store: &Store,
     watch: &mut Watch,
@@ -1812,8 +1689,6 @@ fn compare_scope(
         Err(error) => eprintln!("Write scope not compared: {error:#}"),
     }
 }
-/// What the work dir says about a worker that shows no progress since
-/// `screen_since`: whether its files changed after the screen stopped.
 fn work_dir_note(changed_at: Option<i64>, screen_since: i64, now: i64) -> String {
     let Some(changed) = changed_at else {
         return "when its working directory last changed could not be read".into();
@@ -1838,9 +1713,6 @@ fn append_note(watch: &mut Watch, note: String) {
         None => note,
     });
 }
-/// Adds the work dir note to a pending no-progress wake, replacing an earlier
-/// one: a watch reloaded into a new build sees a changed screen and can go
-/// stuck again before the wake goes out (seen natively, 2026-11-16).
 fn note_work_dir(watch: &mut Watch, note: String) {
     if let Some(pending) = watch.pending.as_mut() {
         for marker in [
@@ -1857,7 +1729,6 @@ fn note_work_dir(watch: &mut Watch, note: String) {
     }
     append_note(watch, note);
 }
-/// Keeps the prepared step and tells the manager why, once per reason.
 fn keep_prepared(
     store: &Store,
     watch: &mut Watch,
@@ -1882,9 +1753,6 @@ fn keep_prepared(
     watch.prepared_held = Some(reason);
     Ok(())
 }
-/// Whether a prepared step's delivery for this goal is uncertain with no
-/// manager action since: the next step may build on one that never arrived,
-/// so it waits until the manager prepares, withdraws or sends.
 fn uncertain_delivery(events: &[crate::events::Event]) -> bool {
     let Some(at) = events
         .iter()
@@ -1899,10 +1767,6 @@ fn uncertain_delivery(events: &[crate::events::Event]) -> bool {
         ) || (e.kind == "assigned" && e.detail["via"].as_str() != Some("watch"))
     })
 }
-/// Why `goal`'s own boundaries stop its work now: its protected paths changed
-/// since the contract was confirmed, or its time budget is spent. The watch
-/// ends for these on the goal wakes are about; a prepared step of another
-/// goal sharing the watch is held for them instead.
 pub(crate) fn boundary_reached(
     goal: &crate::model::Goal,
     events: &[crate::events::Event],
@@ -1930,13 +1794,6 @@ pub(crate) fn boundary_reached(
     }
     Ok(None)
 }
-/// Hands the step the manager prepared for the watched role to the worker
-/// once it has settled, through normal admission, when no check regressed, no
-/// stop condition, protected path or budget holds, the goal still has work
-/// and the worker's input is free; the manager is woken about it all the
-/// same. Otherwise the step stays and the manager hears why. A delivery that
-/// cannot be confirmed is never repeated. Returns whether a stop condition
-/// ended the watch. (Protected paths and the time budget were checked before.)
 async fn deliver_prepared(
     store: &Store,
     watch: &mut Watch,
@@ -1949,8 +1806,6 @@ async fn deliver_prepared(
         return Ok(false);
     };
     if let Some(since) = step.sending_at {
-        // The watch stopped while typing this step: whether it arrived is
-        // unknown, so it is recorded as uncertain and never typed again.
         crate::prepared::remove(store, &watch.context, &watch.role)?;
         store.record(
             &step.goal,
@@ -1967,7 +1822,9 @@ async fn deliver_prepared(
         );
         return Ok(false);
     }
-    if !matches!(target["agent_status"].as_str(), Some("idle" | "done")) {
+    if watch.prepared_after_seq.is_some()
+        || !matches!(target["agent_status"].as_str(), Some("idle" | "done"))
+    {
         return Ok(false);
     }
     let step_goal = if step.goal == goal.id {
@@ -1977,7 +1834,6 @@ async fn deliver_prepared(
     };
     let step_events = store.events(&step.goal)?;
     let regressed = regressed(&step_events);
-    // The step may build on an uncertain step of any goal on this watch.
     let mut shared = Vec::new();
     let goals: std::collections::BTreeSet<String> = watch
         .members()
@@ -2010,8 +1866,6 @@ async fn deliver_prepared(
             "goal {} is not running (it awaits review, waits for the person, is paused or finished)",
             step.goal
         ))
-    // Checked only for a goal still served and running, so a stopped goal's
-    // removed checkout holds its step instead of failing the watch.
     } else if let Some(reason) = boundary_reached(&step_goal, &step_events, Utc::now().timestamp())
         .unwrap_or_else(|error| Some(format!("{error:#}")))
     {
@@ -2034,10 +1888,11 @@ async fn deliver_prepared(
     let helper = crate::roles::resolve(store, &step.to)?;
     let task = step.task.as_deref().unwrap_or("the goal");
     crate::prepared::mark_sending(store, &watch.context, &watch.role, Some(Utc::now()))?;
+    watch.prepared_after_seq = Some(target["state_change_seq"].as_u64().unwrap_or(0));
+    save_watch(store, watch)?;
     match crate::supervision::send(store, &step.text, step.assignment(), helper.as_ref()).await {
         Ok(result) => {
             watch.prepared_held = None;
-            // A native goal queued behind the step lives in this watch record.
             if let Ok(state) = serde_json::from_value(result["native_goal"].clone()) {
                 watch.native_goal = Some(state);
             }
@@ -2065,23 +1920,16 @@ async fn deliver_prepared(
             );
         }
         Err(error) => {
-            // Refused before anything was typed: it may go later.
             crate::prepared::mark_sending(store, &watch.context, &watch.role, None)?;
+            watch.prepared_after_seq = None;
             keep_prepared(store, watch, &step, format!("{error:#}"))?;
             return Ok(false);
         }
     }
     watch.pending_stop = true;
-    // The delivery was recorded after this observation; the wake about it
-    // is still current.
     watch.pending_at = Utc::now().timestamp();
     Ok(false)
 }
-/// Lines on screen since the previous wake, and the anchor for the next one.
-/// Only the transcript counts: the input line and what Herdr draws below it
-/// (status bars) are left out, as are lines without a letter or digit
-/// (rules, frames). The anchor is the last two such lines; when the previous
-/// anchor is gone (first wake, cleared or scrolled screen), the last lines stand in.
 fn new_output(screen: &str, anchor: &str) -> (String, String) {
     const FALLBACK: usize = 8;
     const MAX_LINES: usize = 20;
@@ -2125,9 +1973,6 @@ fn new_output(screen: &str, anchor: &str) -> (String, String) {
     };
     (text, next)
 }
-/// A wake that carries only what changed: the goal and task, the latest
-/// assignment in full only on its first wake, events since the previous wake
-/// and new screen lines. The contract stays one command away.
 fn wake_notice(
     goal: &crate::model::Goal,
     events: &[crate::events::Event],
@@ -2161,7 +2006,6 @@ fn wake_notice(
             }
         }
     };
-    // Before the first wake, what happened since the assignment is the news.
     let start = last_wake.or(assigned).map_or(0, |i| i + 1);
     let since: Vec<String> = events[start..]
         .iter()
@@ -2197,9 +2041,6 @@ fn wake_notice(
         .take(200)
         .collect();
     let pending = watch.pending.as_deref().unwrap_or("state observation");
-    // Standing rules live in the manager guide; a wake adds only the one
-    // instruction its cause lacks (2026-11-15: about thirty wakes repeated a
-    // 110-word rule list that changed no action).
     let next = if pending.starts_with("target state changed") {
         "Next: check what the worker finished against the contract, then send the next step, or wait with the reason if only the user can decide.\n"
     } else {
@@ -2219,9 +2060,6 @@ fn wake_notice(
         pane = watch.origin.pane,
     )
 }
-/// A line when the latest goal check has no restatement reported after it:
-/// on 2026-11-16 three goal checks reached main and none was answered, and
-/// nothing said so.
 fn restatement_due(events: &[crate::events::Event]) -> String {
     let Some(check) = events.iter().rposition(|e| e.kind == "reanchor") else {
         return String::new();
@@ -2234,10 +2072,6 @@ fn restatement_due(events: &[crate::events::Event]) -> String {
         crate::events::local_clock(events[check].at)
     )
 }
-/// Records a delivered wake on the goal timeline, to measure wakes per
-/// assignment and how many led to a manager action. `via` is "prompt" for a
-/// wake typed into the manager pane, "hook" for one returned by its Stop hook
-/// and "await" for one handed to its running `hgm await`.
 fn record_wake(store: &Store, watch: &Watch, reason: &str, via: &str) -> Result<()> {
     store.record(
         &watch.goal,
@@ -2245,16 +2079,11 @@ fn record_wake(store: &Store, watch: &Watch, reason: &str, via: &str) -> Result<
         json!({"reason": reason, "role": watch.role, "mode": watch.mode, "observed_at": watch.last_change, "via": via}),
     )
 }
-/// Delivers `note` about `goal` to the Goal Manager at once, for news that no
-/// running watch carries (a review verdict on a goal awaiting the person's
-/// acceptance). Only a manager whose input is free receives it; otherwise the
-/// person's notification has to do. Returns whether it was delivered.
 pub(crate) async fn wake_manager_now(store: &Store, goal: &str, note: &str) -> Result<bool> {
     let context = session(store)?;
     let notice = format!(
         "Goal Manager observation for {goal}: {note}. Read it with hgm log {goal}, tell the person what it says, and continue: a review is input to their decision, not acceptance."
     );
-    // A running `hgm await` takes it whatever the manager's input holds.
     if crate::wake_await::hand_over(store, &context.key(), goal, &notice)?
         == crate::wake_await::Offer::Taken
     {
@@ -2329,8 +2158,6 @@ pub(crate) fn stop_hook(store: &Store, input: &Value) -> Result<Value> {
     }
     let now = Utc::now().timestamp();
     if watch.active && !watch_running(store, &watch, now)? {
-        // The watch process ended (a closed tab, a crash, an old build) while
-        // the record still says watching: no wake would ever come.
         return Ok(json!({"decision":"block","reason":format!(
             "Goal {goal} is not being watched: its watch record is active but no watch process runs, so nothing wakes you when {role} settles. Run hgm supervise {goal} now (it keeps the wake count), or hgm wait/pause the goal if it should not be watched.",
             goal = watch.goal,
@@ -2361,21 +2188,20 @@ pub(crate) fn stop_hook(store: &Store, input: &Value) -> Result<Value> {
     watch.mark_wake(now);
     watch.status = "hook_continuation".into();
     save_watch(store, &watch)?;
-    // The wake is already counted; a failed record must not withhold it.
     if let Err(error) = record_wake(store, &watch, &pending, "hook") {
         eprintln!("Could not record the wake on the timeline: {error:#}");
     }
     Ok(json!({"decision":"block","reason":reason}))
 }
 
-/// How long a newly armed watch may take to start its process.
 const START_GRACE_SECS: i64 = 30;
-/// Whether a watch process runs `watch` (it holds the lease), or the watch was
-/// just armed and its process may still be starting. An active record without
-/// either is orphaned: nothing wakes the manager.
 pub(crate) fn watch_running(store: &Store, watch: &Watch, now: i64) -> Result<bool> {
-    if watch_lease(store, &watch.context)?.try_lock().is_err() {
-        return Ok(true);
+    match watch_lease(store, &watch.context)?.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(error).context("inspect watch lease");
+        }
     }
     Ok(watch.last_observation_at == 0 && now - watch.last_change < START_GRACE_SECS)
 }
@@ -2388,9 +2214,6 @@ pub(crate) fn watch_lease(store: &Store, context: &str) -> Result<std::fs::File>
         .write(true)
         .open(path(store, context, "-watch.lock")?)?)
 }
-/// Points the main watch at the fresh session `successor` and records the
-/// restart (with `detail`, such as how it was adopted) on the watched goal,
-/// which makes a goal check due. Returns that goal, if a main watch exists.
 pub(crate) fn rebind_watch(
     store: &Store,
     context: &str,
@@ -2401,6 +2224,12 @@ pub(crate) fn rebind_watch(
         && let Ok(mut watch) = load_watch(store, context)
         && watch.role == "main"
     {
+        if let Some(old) = watch.native_goal.take() {
+            detail["previous_native_goal"] = json!(old);
+        }
+        watch.native_unavailable = false;
+        watch.continued_observation = None;
+        watch.prepared_after_seq = None;
         watch.origin = successor.clone();
         watch.handoff_due = false;
         watch.rot_signals = 0;
@@ -2411,7 +2240,6 @@ pub(crate) fn rebind_watch(
         watch.fingerprint.clear();
         watch.status = "watching".into();
         save_watch(store, &watch)?;
-        // A fresh session has none of the predecessor's reading of the goal.
         detail["pane"] = json!(successor.pane);
         detail["session"] = json!(successor.session);
         store.record(&watch.goal, "restarted", detail)?;
@@ -2457,12 +2285,10 @@ mod tests {
         for id in [&active, &waiting] {
             store.record(id, "assigned", json!({"pane": watch.origin.pane}))?;
         }
-        // The waiting goal received the newest assignment, yet never takes the watch.
         store.update(&waiting, |goal| goal.wait("Ask the user".into()))?;
         assert!(refocus(&store, &mut watch)?);
         assert_eq!((watch.goal.as_str(), watch.wakes), (active.as_str(), 2));
         assert_eq!(watch.members(), std::slice::from_ref(&active));
-        // Switching goals keeps each goal's own wake count.
         watch.join(&waiting);
         watch.focus(&waiting);
         assert_eq!(watch.wakes, 0);
@@ -2482,7 +2308,6 @@ mod tests {
             json!({"name":"build","detail":"exit 1"}),
             json!({"name":"e2e","detail":"exit 2"}),
         ];
-        // build passed at the earlier settle: a regression to correct.
         let note = settle_note("main", &failed, &earlier);
         assert!(
             note.contains("checks that passed before now fail (build: exit 1)")
@@ -2490,7 +2315,6 @@ mod tests {
                 && note.contains("Not yet passing: e2e"),
             "{note}"
         );
-        // e2e never passed: listed, without asking for a correction.
         let note = settle_note("main", &failed[1..], &earlier);
         assert!(
             note.contains("not yet passing (e2e: exit 2)") && !note.contains("hgm correct"),
@@ -2527,6 +2351,8 @@ mod tests {
             last_sent: 0,
             last_change: 0,
             fingerprint: String::new(),
+            continued_observation: None,
+            prepared_after_seq: None,
             pending: None,
             status: "watching".into(),
             handoff_due: false,
@@ -2617,7 +2443,6 @@ mod tests {
     }
     #[test]
     fn previous_turn_state_is_not_news_after_a_delivery() {
-        // Sent at seq 7 while the worker showed `done` from its last turn.
         let mut watch = watch();
         let before = json!({"agent_status":"done","state_change_seq":7});
         assert_eq!(
@@ -2634,7 +2459,6 @@ mod tests {
             watch.pending.as_deref(),
             Some("target state changed to \"done\"")
         );
-        // Never picked up: the idle wake says so instead of a generic stall.
         let mut stuck = super::tests::watch();
         observe(&mut stuck, &before, "› ", 1000, Some(7));
         observe(&mut stuck, &before, "› ", 1061, Some(7));
@@ -2652,7 +2476,6 @@ mod tests {
         let mut watch = watch();
         let done = json!({"agent_status":"done","state_change_seq":3});
         observe(&mut watch, &done, "Finished\n› ", 1000, Some(2));
-        // Settle checks ran; the wake waits for the manager's cooldown.
         watch.pending = Some("main settled and every command check passes".into());
         observe(&mut watch, &done, "Finished\n› ", 1400, Some(2));
         assert_eq!(
@@ -2690,7 +2513,6 @@ mod tests {
         assert!(pending.contains("replace that helper"), "{pending}");
         assert!(!watch.handoff_due);
         assert_eq!(watch.rot_signals, 0);
-        // Only signs counted after this wake make the next one.
         watch.pending = None;
         watch.count_rot("reflexive_agreement", "You're absolutely right");
         watch.count_rot("repeated_tool_call", "$ cargo build");
@@ -2715,11 +2537,9 @@ mod tests {
         assert!(wake_ready(&watch, 1020), "within the cooldown");
         watch.mark_wake(1020);
         assert!(!watch.pending_stop && watch.pending_at == 0);
-        // A patrol or unchanged-screen note keeps the cooldown.
         watch.pending = Some("3-minute check of main".into());
         assert!(!wake_ready(&watch, 1100));
         assert!(wake_ready(&watch, 1200));
-        // A blocked worker is news, but not a stop after new work.
         let mut watch = self::watch();
         watch.last_sent = 1000;
         let blocked = json!({"agent_status":"blocked","state_change_seq":3});
@@ -2771,7 +2591,6 @@ mod tests {
         assert_eq!(told(&store)?, 1, "once per stretch");
         let reason = store.events(&goal.id)?.pop().unwrap().detail["reason"].clone();
         assert!(reason.as_str().unwrap().contains("idle for 3m"), "{reason}");
-        // A new stretch is told again; a goal waiting for the person is not.
         watch.idle_noticed = false;
         let waiting = store.update(&goal.id, |g| g.wait("Ask the user".into()))?;
         notice_idle(&store, &mut watch, &waiting, false, 2000)?;
@@ -2795,13 +2614,10 @@ mod tests {
         watch.pending = Some("target state changed to idle".into());
         watch.pending_at = Utc::now().timestamp() - 5;
         assert!(!superseded(&store, &watch)?);
-        // Another goal's work to another pane says nothing about this worker.
         store.record(&other.id, "assigned", json!({"pane": "w9:p9"}))?;
         assert!(!superseded(&store, &watch)?);
-        // A goal outside the watch whose assignment reached the watched pane.
         store.record(&other.id, "assigned", json!({"pane": watch.origin.pane}))?;
         assert!(superseded(&store, &watch)?);
-        // A goal check for a member goal, recorded before the observation, does not.
         watch.pending_at = Utc::now().timestamp() + 5;
         store.record(&member.id, "reanchor", json!({}))?;
         assert!(!superseded(&store, &watch)?);
@@ -2845,7 +2661,6 @@ mod tests {
         let now = Utc::now().timestamp();
         let mut watch = watch();
         watch.goal = member.id.clone();
-        // A wake held behind a manager draft, about a settle before new work.
         watch.pending = Some("main settled and every command check passes".into());
         watch.pending_at = now - 20;
         watch.last_change = now - 20;
@@ -2855,7 +2670,6 @@ mod tests {
             superseded(&store, &watch)?,
             "nothing seen since the new work"
         );
-        // The worker settles after that work: the same text now describes it.
         watch.last_change = now + 5;
         stamp_pending(&mut watch, now + 5);
         assert_eq!(watch.pending_at, now + 5);
@@ -2907,7 +2721,6 @@ mod tests {
         Ok(())
     }
 
-    /// The transcript main showed from 10:49 on 2026-11-15.
     const STUCK_TOP: &str = "⏺ Running unit tests after the gate changes\n  ⎿  $ cargo test --locked --bin hgm 2>&1 | grep -E \"test\n     result|FAILED|panicked|^error\" -A8 | head -60\n\n";
 
     #[test]
@@ -2932,7 +2745,6 @@ mod tests {
             pending.contains("no progress for 3m") && pending.contains("API error · Retrying"),
             "{pending}"
         );
-        // Thinking with moving timers and token counts, then a tip: still none.
         let thinking = |t: &str| {
             format!(
                 "{STUCK_TOP}✽ Nebulizing… ({t} · ↓ 31.4k tokens · thinking with xhigh effort)\n  ⎿  Tip: Use /clear to start fresh\n"
@@ -2948,11 +2760,9 @@ mod tests {
             pending.contains("long silent tool run"),
             "no cause named: {pending}"
         );
-        // New output lines are progress: the stretch ends.
         let more = format!("{}  ⎿  test result: ok. 66 passed\n", thinking("56m"));
         observe(&mut watch, &working, &more, 1210, None);
         assert!(!watch.stuck && watch.idle_since == 0);
-        // Settling after a stretch without progress is a stop.
         let idle = json!({"agent":"claude","agent_status":"idle","state_change_seq":5});
         watch.stuck = true;
         watch.idle_since = 900;
@@ -2971,7 +2781,6 @@ mod tests {
         watch.idle_since = 1000;
         watch.stuck = true;
         watch.retry = Some("API error · Retrying in 0s · attempt 1/10".into());
-        // A prepared step does not cover a worker that works without progress.
         notice_idle(&store, &mut watch, &goal, true, 1200)?;
         notice_idle(&store, &mut watch, &goal, true, 1500)?;
         let told: Vec<_> = store

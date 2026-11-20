@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.3 (2026-11-20)
+
+- A stop condition holds the affected goal while a shared watch continues to
+  supervise its other goals. Stop predicates use the command's exit status
+  and report errors that prevent execution.
+- Linked assignments check the goal and task dependencies again before
+  delivery. Concurrent role changes retain both results. A watch restart
+  preserves a reserved provider continuation.
+- Each cross-check supervisor owns the process group it stops. For older
+  records, hgm reports an unconfirmed stop until it finds an exit record.
+- Acceptance after a wait rechecks the result. Reports retain their original
+  text in JSON and filter terminal control characters in human-readable views.
+- The manual form of `hgm add` no longer accepts `--check`. Put commands in
+  the goal file's `checks` list and register it with `hgm add --file PATH`.
+- Protected-path checks track symlink destinations, including dangling links.
+  Project prompt includes must resolve inside the workspace.
+
 ## 0.1.2 (2026-11-18)
 
 Interaction design (verified with controlled executables):

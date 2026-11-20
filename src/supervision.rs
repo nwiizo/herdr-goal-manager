@@ -1,4 +1,3 @@
-//! Origin-bound dispatch and arming of the watch; no automatic task completion.
 pub(crate) use crate::binding::{
     Target, args, capture_origin, live_pane, operation_lease, origin_terminal, path, screen,
     session, wait_operation_lease,
@@ -15,9 +14,6 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
-/// The pinned original agent: its binding, live state and screen. `lines`
-/// asks for that many recent lines from Herdr's scrollback instead of the
-/// visible screen, so a long report that scrolled away can be read.
 pub(crate) async fn target(
     store: &Store,
     start: Option<&str>,
@@ -74,8 +70,6 @@ pub(crate) async fn target(
     crate::signals::apply_screen_state(&mut live, &screen);
     let mut result = json!({"binding":session.origin,"live":live,"screen":screen});
     if let Some(lines) = lines {
-        // The state above is judged from the visible screen; the longer read
-        // is only for the manager to read.
         let recent = crate::binding::recent_lines(&pane, lines).await?;
         result["lines"] = json!(recent.lines().count());
         result["screen"] = json!(recent);
@@ -85,8 +79,6 @@ pub(crate) async fn target(
     }
     Ok(result)
 }
-/// Checks the pinned original agent. A new session in its tab (the user
-/// restarted it) gets a pointer to adoption instead of a bare refusal.
 fn check_main(origin: &Target, live: &Value) -> Result<()> {
     origin.check(live).map_err(|error| {
         if error.to_string() == SESSION_CHANGED {
@@ -98,10 +90,6 @@ fn check_main(origin: &Target, live: &Value) -> Result<()> {
         }
     })
 }
-/// Rebinds the pinned tab to the agent session now running in it, when the
-/// user restarted the original agent outside `hgm restart`. The terminal and
-/// tab must be the pinned ones and no handoff may be in flight. The fresh
-/// session gets a goal check; `evidence` records why it continues the work.
 fn adopt_session(
     store: &Store,
     session: &mut Session,
@@ -149,15 +137,8 @@ fn adopt_session(
     ))
 }
 pub(crate) use crate::admission::{Assignment, Delivery};
-/// Providers observed to queue input typed while they work: Claude Code reads
-/// it at its next step, Copilot (1.0.110) lists it above its input line and
-/// runs it after the current step. Others are added only after a native check.
 pub(crate) const QUEUES_WHILE_WORKING: [&str; 2] = ["claude", "copilot"];
-/// How a send says the text left for the recipient without a confirmed
-/// admission: whoever sent it must not send it again.
 pub(crate) const DELIVERY_UNCONFIRMED: &str = "delivery not confirmed";
-/// Whether the recipient took the text out of its input line: the composer is
-/// empty again shortly after delivery. Text left there is never resent.
 pub(crate) async fn input_consumed(pane: &str, agent: &str) -> Result<bool> {
     for _ in 0..6 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -167,8 +148,6 @@ pub(crate) async fn input_consumed(pane: &str, agent: &str) -> Result<bool> {
     }
     Ok(false)
 }
-/// The recipient's live state and screen: the pinned original agent (`None`)
-/// or a helper role's target.
 async fn observe_recipient(store: &Store, helper: Option<&Target>) -> Result<(Value, String)> {
     let Some(helper) = helper else {
         let observed = target(store, None, None, None).await?;
@@ -185,7 +164,6 @@ async fn observe_recipient(store: &Store, helper: Option<&Target>) -> Result<(Va
     crate::signals::apply_screen_state(&mut live, &screen);
     Ok((live, screen))
 }
-/// Sends to `main` (the pinned original agent) or to a helper role's target.
 pub(crate) async fn send(
     store: &Store,
     text: &str,
@@ -195,8 +173,6 @@ pub(crate) async fn send(
     let goal = assignment.goal.map(String::from);
     let (command, to) = (assignment.kind.command(), assignment.to.to_string());
     let result = deliver(store, text, assignment, helper).await;
-    // A linked delivery refused before anything was typed is recorded, so
-    // attention accounting can count refusals; the refusal itself is unchanged.
     if let (Err(error), Some(goal)) = (&result, goal.as_deref()) {
         let reason = format!("{error:#}");
         if !reason.contains(DELIVERY_UNCONFIRMED) && store.load(goal).is_ok() {
@@ -218,10 +194,6 @@ pub(crate) async fn send(
     }
     result
 }
-/// Queues the native goal behind an assignment to main when a watch of this
-/// tab observes that pane, and keeps its pending state in the watch record.
-/// From the watch's own delivery (`by_watch`) the caller keeps the state: the
-/// watch holds the operation lease and its record in memory.
 async fn queue_native_goal(
     store: &Store,
     context: &Session,
@@ -235,7 +207,6 @@ async fn queue_native_goal(
     let Ok(watch) = load_watch(store, &key) else {
         return Ok(None);
     };
-    // A provider seen without /goal gets none with later assignments either.
     if !watch.active
         || watch.native_unavailable
         || !watch.serves(goal)
@@ -250,8 +221,6 @@ async fn queue_native_goal(
     else {
         return Ok(None);
     };
-    // The caller holds the operation lease: the manager's delivery took it
-    // before admission, and the watch's own step holds it.
     if !by_watch {
         let mut watch = load_watch(store, &key)?;
         watch.native_goal = Some(state.clone());
@@ -269,45 +238,44 @@ async fn deliver(
         (assignment.kind == Delivery::Reanchor || !text.trim().is_empty()) && text.len() <= 32_768,
         "assignment must contain 1..32768 bytes"
     );
-    // The manager's own delivery holds the operation lease from admission to
-    // the native goal it queues. The watch types prepared steps, clears and
-    // wakes under it, so the two never type into one input at once, what
-    // admission counts (budgets, the goal's state) cannot move meanwhile, and
-    // the steps a direct send supersedes change under the lease that prepare
-    // and withdraw take. The watch's own delivery runs inside its step, which
-    // holds the lease already.
-    // Stop checks run before the lease: they may take long, and one that calls
-    // hgm must not wait for this send. The other boundaries and admission are
-    // checked under the lease, after them.
-    if assignment.kind == Delivery::Assignment
-        && let Some(goal_id) = assignment.goal
-        && let Some(check) = crate::watch::stop_check_holding(store, &store.load(goal_id)?).await?
-    {
-        anyhow::bail!(
-            "stop condition {check} holds; nothing was sent. Decide with the user whether to revise the goal or stop"
-        );
-    }
-    let arming = match assignment.via {
-        None => Some(wait_operation_lease(store, &session(store)?.key()).await?),
+    let context = session(store)?;
+    let key = context.key();
+    let mut arming = match assignment.via {
+        None => Some(wait_operation_lease(store, &key).await?),
         Some(_) => None,
     };
-    let delivered = crate::admission::admit(store, &assignment, text)?;
-    // New linked work stops at the goal's boundaries as the watch does: a
-    // spent time budget, changed protected paths or a stop condition.
+    let mut delivered = crate::admission::admit(store, &assignment, text)?;
     if assignment.kind == Delivery::Assignment
         && let Some(goal_id) = assignment.goal
     {
-        let goal = store.load(goal_id)?;
-        let events = store.events(goal_id)?;
-        if let Some(reason) =
-            crate::watch::boundary_reached(&goal, &events, Utc::now().timestamp())?
-        {
-            anyhow::bail!(
-                "{reason}; nothing was sent. Decide with the user whether to revise the goal or stop"
-            );
+        let within_bounds = || -> Result<_> {
+            let goal = store.load(goal_id)?;
+            let events = store.events(goal_id)?;
+            if let Some(reason) =
+                crate::watch::boundary_reached(&goal, &events, Utc::now().timestamp())?
+            {
+                bail!(
+                    "{reason}; nothing was sent. Decide with the user whether to revise the goal or stop"
+                );
+            }
+            Ok(goal)
+        };
+        let goal = within_bounds()?;
+        // Prepared delivery checked the predicate in its watch step. Direct
+        // sends release the lease while user commands run (they may call hgm)
+        // and recheck admission under the lease before typing.
+        if arming.is_some() && !goal.spec.loop_policy.stop_checks.is_empty() {
+            drop(arming.take());
+            if let Some(check) = crate::watch::stop_check_holding(store, &goal).await? {
+                bail!(
+                    "stop condition {check} holds; nothing was sent. Decide with the user whether to revise the goal or stop"
+                );
+            }
+            arming = Some(wait_operation_lease(store, &key).await?);
+            delivered = crate::admission::admit(store, &assignment, text)?;
+            within_bounds()?;
         }
     }
-    let context = session(store)?;
     let transfer_path = path(store, &context.key(), "-handoff.json")?;
     if helper.is_none() && transfer_path.exists() {
         let transfer: Value = serde_json::from_slice(&std::fs::read(transfer_path)?)?;
@@ -321,18 +289,22 @@ async fn deliver(
     let watch = load_watch(store, &context.key())
         .ok()
         .filter(|watch| watch.active);
-    let watched = assignment.goal.is_some_and(|goal| {
-        watch
-            .as_ref()
-            .is_some_and(|watch| watch.serves(goal) && watch.role == assignment.to)
-    });
     let (live, screen) = observe_recipient(store, helper).await?;
+    let watched = match (&watch, assignment.goal) {
+        (Some(w), Some(goal))
+            if w.serves(goal)
+                && w.role == assignment.to
+                && w.origin.check(&live).is_ok()
+                && live["pane_id"] == w.origin.pane =>
+        {
+            watch_running(store, w, Utc::now().timestamp())?
+        }
+        _ => false,
+    };
     let agent = live["agent"].as_str().unwrap_or("");
     let working = live["agent_status"] == "working";
     let interrupting = working && (assignment.interrupt || assignment.kind != Delivery::Assignment);
     if interrupting {
-        // The provider reads input typed during a turn at its next step. It
-        // still never goes into a draft, a dialog, or an unknown screen.
         ensure!(
             QUEUES_WHILE_WORKING.contains(&agent),
             "{} ({agent}) is working and is not known to queue input typed during a turn; send when its turn settles",
@@ -353,9 +325,6 @@ async fn deliver(
         );
     }
     let pane = live["pane_id"].as_str().context("missing pane")?;
-    // A task with write_paths starts its scope window before the text goes
-    // out, so every change the assignment leads to is compared. A snapshot
-    // that fails is reported; it never stops the delivery.
     let scope = match (assignment.kind, assignment.goal, assignment.task) {
         (Delivery::Assignment, Some(goal), Some(task)) => {
             crate::scope::begin(store, &store.load(goal)?, task).err()
@@ -375,8 +344,6 @@ async fn deliver(
                 receipt_path.display()
             )
         })?;
-    // The text is delivered: from here on, failures are reported in the result
-    // and never returned, so nobody resends what the recipient already has.
     let mut warnings = vec![];
     if let Some(error) = scope {
         warnings.push(format!(
@@ -408,8 +375,6 @@ async fn deliver(
         result["timeline_error"] = format!("{error:#}").into();
         unrecorded.push(format!("timeline: {error:#}"));
     }
-    // New work for a role settles its queued steps: the watch's own delivery
-    // used up the next one, the manager's direct send supersedes them all.
     if assignment.kind == Delivery::Assignment {
         let key = context.key();
         let settled = match assignment.via {
@@ -437,23 +402,13 @@ async fn deliver(
             _ if watched => "already_active".into(),
             None => "already_active".into(),
             Some(_operation) => {
-                match arm(
-                    store,
-                    goal,
-                    assignment.to,
-                    helper.cloned(),
-                    Pacing::default(),
-                )
-                .await
-                {
+                match arm(store, goal, assignment.to, helper.cloned(), None).await {
                     Ok(_) => "armed".into(),
                     Err(error) => format!("not armed: {error:#}").into(),
                 }
             }
         };
     }
-    // `loop.native_goal: assignment`: the native goal follows the assignment
-    // as queued input, pending until the watch reads it (see native_goal).
     if assignment.kind == Delivery::Assignment
         && !assignment.plan
         && assignment.to == "main"
@@ -481,8 +436,6 @@ async fn deliver(
     Ok(result)
 }
 
-/// Watch timings asked for with `supervise`. A new watch takes the unset ones
-/// from the config; a running watch keeps them as they are.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Pacing {
     pub idle_secs: Option<u64>,
@@ -491,8 +444,6 @@ pub(crate) struct Pacing {
     pub idle_notice_secs: Option<u64>,
     pub patrol_minutes: Option<u32>,
 }
-/// Applies `pacing` to a running watch and records the change on `goal`'s
-/// timeline. Returns what was applied and, with the reason, what was not.
 fn apply_pacing(store: &Store, watch: &mut Watch, goal: &str, pacing: Pacing) -> Result<Value> {
     let before = json!({
         "idle_secs": watch.idle_secs,
@@ -544,10 +495,6 @@ fn apply_pacing(store: &Store, watch: &mut Watch, goal: &str, pacing: Pacing) ->
     }
     Ok(json!({"applied": applied, "not_applied": not_applied}))
 }
-/// Watches `role` (`main`, or a helper whose target is `helper`) for `goal`.
-/// One watch per manager context: a linked send to another role retargets it.
-/// Timings given for a running watch apply to it at its next step; the
-/// result says which did not.
 pub(crate) async fn supervise(
     store: &Store,
     goal: &str,
@@ -556,19 +503,24 @@ pub(crate) async fn supervise(
     pacing: Pacing,
 ) -> Result<(Watch, Value)> {
     let _operation = wait_operation_lease(store, &session(store)?.key()).await?;
-    arm(store, goal, role, helper, pacing).await
+    arm(store, goal, role, helper, Some(pacing)).await
 }
-/// Arms the watch; the caller holds the supervision lock.
 async fn arm(
     store: &Store,
     goal: &str,
     role: &str,
     helper: Option<Target>,
-    pacing: Pacing,
+    requested: Option<Pacing>,
 ) -> Result<(Watch, Value)> {
+    let linked = requested.is_none();
+    let pacing = requested.unwrap_or_default();
     let context = session(store)?;
     let key = context.key();
     let goal_state = store.load(goal)?;
+    ensure!(
+        !linked || crate::watch::short_of_completion(&goal_state),
+        "goal stopped before supervision could start"
+    );
     ensure!(
         !matches!(
             goal_state.status,
@@ -598,18 +550,48 @@ async fn arm(
         "supervise must be called by the native manager agent"
     );
     let now = Utc::now().timestamp();
-    let previous = if watch_path(store, &key)?.exists() {
+    let mut previous = if watch_path(store, &key)?.exists() {
         Some(load_watch(store, &key)?)
     } else {
         None
     };
-    if let Some(watch) = &previous {
-        // One watch per tab: a running (or just armed) watch is reused, so a
-        // second Goal watch tab never opens for it. Another goal whose work
-        // goes to the watched pane joins it; wakes follow the latest assignment.
+    if let Some(watch) = &mut previous {
         let running = watch.active && watch_running(store, watch, now)?;
+        if linked
+            && !running
+            && watch.active
+            && watch.serves(goal)
+            && watch.role == role
+            && watch.origin == origin
+        {
+            let mut watch = watch.clone();
+            watch.manager = manager;
+            watch.last_change = now;
+            watch.last_observation_at = 0;
+            let report = apply_pacing(store, &mut watch, goal, pacing)?;
+            save_watch(store, &watch)?;
+            open_monitor(store, &context).await?;
+            return Ok((watch, report));
+        }
         let joins = running && !watch.serves(goal) && watch.origin.pane == origin.pane;
-        if running && (watch.serves(goal) || joins) {
+        ensure!(
+            !running || watch.serves(goal) || joins,
+            "another goal is already supervised on another pane; wait/pause it first"
+        );
+        let retarget = watch.role != role || watch.origin != origin;
+        if retarget
+            && watch
+                .native_goal
+                .as_ref()
+                .is_some_and(crate::native_goal::NativeGoalState::is_set)
+        {
+            ensure!(
+                crate::native_goal::clear(store, watch, "changing the watched worker").await?,
+                "the current worker's native goal could not be cleared; wait for its input to be free before switching roles"
+            );
+            save_watch(store, watch)?;
+        }
+        if running {
             let mut watch = watch.clone();
             if joins {
                 watch.join(goal);
@@ -620,7 +602,11 @@ async fn arm(
                     json!({"pane": watch.origin.pane, "goals": watch.members()}),
                 )?;
             }
-            if watch.role != role {
+            if retarget {
+                watch.native_goal = None;
+                watch.native_unavailable = false;
+                watch.prepared_after_seq = None;
+                watch.continued_observation = None;
                 watch.role = role.into();
                 watch.origin = origin;
                 watch.fingerprint.clear();
@@ -632,14 +618,7 @@ async fn arm(
             let report = apply_pacing(store, &mut watch, goal, pacing)?;
             return Ok((watch, report));
         }
-        ensure!(
-            !running,
-            "another goal is already supervised on another pane; wait/pause it first"
-        );
         if watch.active && watch.members() != [goal] {
-            // An active record with no watch process holding its lease is stale
-            // (its tab closed or the server restarted): end it for every goal
-            // it served and continue.
             let mut stale = watch.clone();
             for member in stale.members() {
                 if member != goal && member != stale.goal {
@@ -652,7 +631,6 @@ async fn arm(
             }
             end_watch(store, &mut stale, "stale_recovered", false);
             save_watch(store, &stale)?;
-            // No process keeps the stale watch's sidebar current any more.
             if let Err(error) =
                 herdr::query(&crate::watch_view::clear_args(&stale.origin.pane)).await
             {
@@ -662,12 +640,6 @@ async fn arm(
     }
     let config = crate::config::load(&store.workspace)?;
     let limit = pacing.max_wakes.unwrap_or(config.max_wakes());
-    // The manager keeps its goal across watches: a goal still set, or one
-    // the spin guard cleared, belongs to this manager session.
-    // A native goal main may still run (a stop could not clear it) stays with
-    // the pane, so this watch clears it unless its goal is served again.
-    // Only the same agent session: a session started in the pane since has
-    // no goal hgm set, and its own /goal is not hgm's to clear.
     let same_worker = |w: &&Watch| {
         w.origin.pane == origin.pane
             && w.origin.terminal == origin.terminal
@@ -675,18 +647,9 @@ async fn arm(
             && w.origin.session.is_some()
             && w.origin.session == origin.session
     };
-    let native_goal = previous
-        .as_ref()
-        .filter(same_worker)
-        .and_then(|w| w.native_goal.clone())
-        // One left half-typed is kept too, so the next watch records it as
-        // uncertain instead of typing it again.
-        .filter(|s| s.is_set() || matches!(s.outcome.as_deref(), Some("sending" | "clearing")));
-    // A check still running reports to the next watch of the same pane.
-    let cross_check = previous
-        .as_ref()
-        .filter(same_worker)
-        .and_then(|w| w.cross_check.clone());
+    let same_session = previous.as_ref().filter(same_worker);
+    let native_goal = same_session.and_then(|w| w.native_goal.clone());
+    let cross_check = same_session.and_then(|w| w.cross_check.clone());
     let manager_goal = previous
         .as_ref()
         .and_then(|w| w.manager_goal.clone())
@@ -716,7 +679,7 @@ async fn arm(
         retry: None,
         prepared_held: None,
         native_goal,
-        native_unavailable: false,
+        native_unavailable: same_session.is_some_and(|w| w.native_unavailable),
         manager_goal,
         cross_check,
         cross_through: None,
@@ -731,6 +694,8 @@ async fn arm(
             .map_or(0, |w| w.last_sent),
         last_change: now,
         fingerprint: String::new(),
+        continued_observation: same_session.and_then(|w| w.continued_observation.clone()),
+        prepared_after_seq: same_session.and_then(|w| w.prepared_after_seq),
         pending: None,
         status: "watching".into(),
         handoff_due: false,
@@ -750,7 +715,7 @@ async fn arm(
         watch.wakes < limit,
         "wake budget exhausted; inspect results before explicitly increasing --max-wakes"
     );
-    if goal_state.control == Control::Pause {
+    if !linked && goal_state.control == Control::Pause {
         store.update(goal, |g| g.request(Control::Run))?;
     }
     save_watch(store, &watch)?;
@@ -768,9 +733,6 @@ async fn arm(
     Ok((watch, report))
 }
 
-/// Opens the Goal watch tab for `context`. Call it only when no watch process
-/// runs for the tab: an earlier Goal watch tab then only shows its end, and is
-/// closed so the tab keeps one Goal watch.
 pub(crate) async fn open_monitor(store: &Store, context: &Session) -> Result<()> {
     crate::monitor::close_ended_monitor(store, &context.key()).await;
     let workspace = std::env::var("HERDR_WORKSPACE_ID").context("workspace ID missing")?;

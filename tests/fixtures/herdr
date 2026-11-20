@@ -6,14 +6,15 @@ case "$1 $2" in
   "agent list") cat "$FIXTURE_ROOT/agents.json" ;;
   "agent read")
     if [ "$3" = w1:p1 ]; then
+      if [ -f "$FIXTURE_ROOT/dialog-when-sending" ] && grep -q '"outcome": "sending"' "$(cat "$FIXTURE_ROOT/dialog-when-sending")"; then
+        cat "$FIXTURE_ROOT/dialog.screen"
+        exit 0
+      fi
       if [ "$5" = recent-unwrapped ] && [ -f "$FIXTURE_ROOT/target.recent" ]; then cat "$FIXTURE_ROOT/target.recent"; else cat "$FIXTURE_ROOT/target.screen"; fi
-      # What the worker shows from the next read on: a screen that changed
-      # after an observation (a dialog opening while checks run).
       if [ -f "$FIXTURE_ROOT/after-read.screen" ]; then mv "$FIXTURE_ROOT/after-read.screen" "$FIXTURE_ROOT/target.screen"; fi
     else cat "$FIXTURE_ROOT/manager.screen"; fi ;;
   "agent prompt")
     printf '%s\n%s\n' "$3" "$4" >> "$FIXTURE_ROOT/sent.txt"
-    # The prepared queue as it stands while main is typed into.
     if [ "$3" = w1:p1 ] && [ -f "$FIXTURE_ROOT/snapshot-prepared" ]; then
       cp "$(cat "$FIXTURE_ROOT/snapshot-prepared")" "$FIXTURE_ROOT/prepared-at-prompt.json" 2>/dev/null || true
     fi
@@ -21,8 +22,6 @@ case "$1 $2" in
     if [ -f "$FIXTURE_ROOT/fail-send-$3" ]; then exit 1; fi
     if [ -f "$FIXTURE_ROOT/after-prompt.screen" ]; then cp "$FIXTURE_ROOT/after-prompt.screen" "$FIXTURE_ROOT/target.screen"; fi
     if [ "$3" != w1:p1 ] && [ -f "$FIXTURE_ROOT/after-prompt-manager.screen" ]; then cp "$FIXTURE_ROOT/after-prompt-manager.screen" "$FIXTURE_ROOT/manager.screen"; fi
-    # Claude Code answers a /goal line it takes as a command (not one it took
-    # as pasted text: goal-pasted).
     if [ "$3" = w1:p1 ] && [ ! -f "$FIXTURE_ROOT/goal-pasted" ]; then
       case "$4" in
         "/goal clear") answer="  ⎿  Goal cleared: (fixture)" ;;
@@ -34,7 +33,6 @@ case "$1 $2" in
         mv "$FIXTURE_ROOT/target.answer" "$FIXTURE_ROOT/target.screen"
       fi
     fi
-    # A Claude Code Goal Manager answers its own /goal the same way.
     if [ "$3" = w1:p2 ]; then
       case "$4" in
         "/goal clear") answer="  ⎿  Goal cleared: (fixture)" ;;
@@ -52,13 +50,11 @@ case "$1 $2" in
     fi
     printf '{"result":{"type":"admitted"}}\n' ;;
   "agent start")
-    # Like Herdr: arguments with a line break cannot be encoded for the shell.
     for arg in "$@"; do
       case "$arg" in *"
 "*) printf '{"error":{"code":"invalid_agent_argument"}}\n' >&2; exit 1 ;; esac
     done
     printf '%s\n' "$@" >> "$FIXTURE_ROOT/started.txt"
-    # A provider stopped at its own first-run question never becomes ready.
     if [ -f "$FIXTURE_ROOT/fail-start" ]; then printf '{"error":{"code":"agent_blocked"}}\n' >&2; exit 1; fi
     if [ -f "$FIXTURE_ROOT/successor.json" ]; then
       cp "$FIXTURE_ROOT/successor.json" "$FIXTURE_ROOT/panes.json"
@@ -78,8 +74,8 @@ case "$1 $2" in
   "tab create") printf '%s\n' "$@" >> "$FIXTURE_ROOT/created.txt"; cat "$FIXTURE_ROOT/tab-create.json" ;;
   "tab close") printf '%s\n' "$3" >> "$FIXTURE_ROOT/closed.txt"; printf '{"result":{"type":"ok"}}\n' ;;
   "worktree create"|"worktree open"|"worktree remove")
-    # Like Herdr 0.9.5: a real Git worktree, reported as a workspace.
     printf '%s\n' "$*" >> "$FIXTURE_ROOT/worktree.txt"
+    while [ -e "$FIXTURE_ROOT/hold-worktree" ]; do sleep 0.05; done
     action=$2; shift 2
     cwd=; branch=; base=; path=; workspace=; kind=
     while [ $# -gt 0 ]; do

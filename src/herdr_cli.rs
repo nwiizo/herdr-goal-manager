@@ -1,12 +1,9 @@
-//! Native Herdr transport, with bounded calls and opaque argument values.
 use anyhow::{Context, Result, ensure};
 use std::{ffi::OsString, process::Stdio, time::Duration};
 
 fn binary() -> OsString {
     std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into())
 }
-/// Herdr requests made by this process (CLI calls and event subscriptions),
-/// reported by the watch to compare event watching with polling.
 static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) fn count_call() {
     CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -30,8 +27,6 @@ pub(crate) async fn query(args: &[String]) -> Result<String> {
     );
     Ok(String::from_utf8(output.stdout)?)
 }
-/// Explains a refused Herdr socket: the CLI cannot reach Herdr any other way,
-/// so the fix is to let this process open the socket.
 fn socket_hint(stderr: &str) -> String {
     if !(stderr.contains("PermissionDenied") || stderr.contains("Operation not permitted")) {
         return String::new();

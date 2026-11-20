@@ -1,6 +1,3 @@
-//! The manager's binding to Herdr: the pinned target, the saved manager
-//! context, private state paths and leases, and the pane reads that dispatch
-//! and the watch both build on.
 use crate::{
     herdr_cli as herdr,
     store::{LOCK_RETRY, LOCK_WAIT, Store},
@@ -13,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Target {
     pub pane: String,
     pub tab: String,
@@ -55,9 +52,7 @@ impl Target {
         Ok(())
     }
 }
-/// The pane is no longer in Herdr's inventory (it exited or was closed).
 pub(crate) const PANE_GONE: &str = "bound pane no longer exists";
-/// The pinned tab runs another agent session than the bound one.
 pub(crate) const SESSION_CHANGED: &str = "bound agent session changed";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Session {
@@ -67,9 +62,6 @@ pub(crate) struct Session {
     pub origin: Option<Target>,
 }
 impl Session {
-    /// Where the watch, the handoff transfer, roles and their leases are kept:
-    /// the pinned terminal, so a manager reopened for the same tab finds them.
-    /// A manager without an original pane keeps them under its own context.
     pub(crate) fn key(&self) -> String {
         self.origin.as_ref().map_or_else(
             || self.id.clone(),
@@ -77,10 +69,7 @@ impl Session {
         )
     }
 }
-/// State kept per pinned terminal (see [`Session::key`]).
 const TERMINAL_STATE: [&str; 3] = ["-watch.json", "-handoff.json", "-roles.json"];
-/// Moves state an earlier build saved under the manager context to the
-/// terminal key, unless the terminal already has its own.
 fn adopt_context_state(store: &Store, session: &Session) -> Result<()> {
     let key = session.key();
     if key == session.id {
@@ -123,8 +112,6 @@ pub(crate) fn path(store: &Store, id: &str, suffix: &str) -> Result<PathBuf> {
         .private_directory("manager")?
         .join(format!("{id}{suffix}")))
 }
-/// A new manager context for this launch; [`save_context`] keeps it once the
-/// launch is allowed, so a refused launch leaves no file behind.
 pub(crate) fn prepare_context(store: &Store) -> Result<Session> {
     let origin = match std::env::var("HGM_ORIGIN_JSON") {
         Ok(text) => Some(serde_json::from_str(&text).context("parse original pane binding")?),
@@ -150,8 +137,6 @@ fn read_session(store: &Store, id: &str) -> Result<Session> {
         .with_context(|| format!("manager context {id} is not saved for this workspace"))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
-/// The current manager's original terminal: it scopes briefs and goal ownership.
-/// Without a Herdr-bound manager context the workspace is shared (`None`).
 pub(crate) fn origin_terminal(store: &Store) -> Result<Option<String>> {
     let Ok(id) = std::env::var("HGM_CONTEXT") else {
         return Ok(None);
@@ -179,7 +164,6 @@ pub(crate) fn session(store: &Store) -> Result<Session> {
     adopt_context_state(store, &session)?;
     Ok(session)
 }
-/// The Goal Manager open for a pinned tab: one per original terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ManagerRecord {
     pub context: String,
@@ -188,7 +172,6 @@ pub(crate) struct ManagerRecord {
     #[serde(default)]
     pub registered_at: i64,
 }
-/// Records `manager` as the Goal Manager open for `session`'s tab.
 pub(crate) fn register_manager(store: &Store, session: &Session, manager: &Target) -> Result<()> {
     store.write_private(
         &path(store, &session.key(), "-manager.json")?,
@@ -199,12 +182,7 @@ pub(crate) fn register_manager(store: &Store, session: &Session, manager: &Targe
         },
     )
 }
-/// How long a registered manager counts as running before Herdr shows its
-/// agent (the provider is still starting in the pane).
 const LAUNCH_GRACE_SECS: i64 = 30;
-/// Whether a Goal Manager still runs in `manager`'s pane: the same terminal,
-/// with an agent in it, or registered so recently that its agent may not show
-/// yet. The manager pane closes when its process exits.
 async fn manager_runs(manager: &Target, registered_at: i64) -> bool {
     let starting = chrono::Utc::now().timestamp() - registered_at < LAUNCH_GRACE_SECS;
     live_pane(&manager.pane).await.is_ok_and(|live| {
@@ -212,9 +190,6 @@ async fn manager_runs(manager: &Target, registered_at: i64) -> bool {
             && (starting || live.get("agent").is_some())
     })
 }
-/// Serializes Goal Manager launches for the tab of `terminal` across every
-/// folder under `root`, so checking for a running manager and registering the
-/// new one cannot interleave with another launch. Waits up to 10 seconds.
 pub(crate) async fn launch_lease(root: &Path, terminal: &str) -> Result<std::fs::File> {
     let name = format!("t-{terminal}");
     crate::model::validate_id(&name)?;
@@ -237,17 +212,11 @@ pub(crate) async fn launch_lease(root: &Path, terminal: &str) -> Result<std::fs:
     }
     anyhow::bail!("another Goal Manager is starting for this tab; retry in a moment")
 }
-/// What already serves the tab `origin` when Goal Manager is opened from it.
 #[derive(Debug)]
 pub(crate) enum Existing {
-    /// The running Goal Manager of this tab, or `origin` is that manager.
     Manager(Target),
-    /// `origin` is a helper role's tab (impl or reviewer) of some manager.
     Helper(String),
 }
-/// Finds what already serves `origin`, in every folder's state under `root`:
-/// a running manager recorded for its terminal (or named by the terminal's
-/// watch, for managers of earlier builds), the manager itself, or a helper.
 pub(crate) async fn existing_manager(root: &Path, origin: &Target) -> Result<Option<Existing>> {
     let tab = format!("t-{}", origin.terminal);
     let Ok(workspaces) = std::fs::read_dir(root.join("workspaces")) else {
@@ -286,7 +255,6 @@ pub(crate) async fn existing_manager(root: &Path, origin: &Target) -> Result<Opt
             let Ok(manager) = serde_json::from_value::<Target>(value["manager"].clone()) else {
                 continue;
             };
-            // Watch records (managers of earlier builds) carry no registration time.
             let registered_at = value["registered_at"].as_i64().unwrap_or(0);
             if (key == tab || manager.terminal == origin.terminal)
                 && manager_runs(&manager, registered_at).await
@@ -305,17 +273,12 @@ fn operation_lock(store: &Store, context: &str) -> Result<std::fs::File> {
         .write(true)
         .open(path(store, context, "-operation.lock")?)?)
 }
-/// The supervision lock, taken at once or not at all: the watch skips a step
-/// when a manager command holds it.
 pub(crate) fn operation_lease(store: &Store, context: &str) -> Result<std::fs::File> {
     let file = operation_lock(store, context)?;
     file.try_lock()
         .context("supervision state is busy; retry the operation")?;
     Ok(file)
 }
-/// The supervision lock for a manager command. A watch step holds it for a
-/// few seconds, so a busy lock is retried for up to [`LOCK_WAIT`] before the
-/// command fails with nothing delivered or changed.
 pub(crate) async fn wait_operation_lease(store: &Store, context: &str) -> Result<std::fs::File> {
     let file = operation_lock(store, context)?;
     let deadline = std::time::Instant::now() + LOCK_WAIT;
@@ -339,18 +302,12 @@ pub(crate) async fn wait_operation_lease(store: &Store, context: &str) -> Result
 pub(crate) async fn screen(pane: &str) -> Result<String> {
     screen_lines(pane, 60).await
 }
-/// The last `lines` visible rows of `pane` as text. Read with styles, so a
-/// faint input suggestion is not taken for a draft (see `plain_screen`).
-/// Up to `lines` recent lines of `pane` from Herdr's scrollback, soft wraps
-/// joined; as many as Herdr has when it holds fewer.
 pub(crate) async fn recent_lines(pane: &str, lines: u32) -> Result<String> {
     read_plain(pane, "recent-unwrapped", lines).await
 }
 pub(crate) async fn screen_lines(pane: &str, lines: u32) -> Result<String> {
     read_plain(pane, "visible", lines).await
 }
-/// `lines` of `pane` from Herdr's `source`, read with styles and returned as
-/// plain text (see `signals::plain_screen`).
 async fn read_plain(pane: &str, source: &str, lines: u32) -> Result<String> {
     let lines = lines.to_string();
     let ansi = herdr::query(&args(&[

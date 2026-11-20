@@ -1,5 +1,3 @@
-//! A goal's own checkout: a Git worktree opened as a Herdr workspace, so the
-//! work stays apart from the managed workspace and visible in Herdr.
 use crate::{
     binding::args,
     herdr_cli as herdr,
@@ -20,7 +18,6 @@ fn git(directory: &Path, arguments: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("run git in {}", directory.display()))
 }
 
-/// The worktree that has `branch` checked out, if any.
 fn worktree_of(repository: &Path, branch: &str) -> Result<Option<PathBuf>> {
     let output = git(repository, &["worktree", "list", "--porcelain"])?;
     ensure!(
@@ -40,10 +37,6 @@ fn worktree_of(repository: &Path, branch: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Creates the checkout the contract asks for with `herdr worktree create`, or
-/// reopens the worktree that already holds its branch. A branch without a
-/// worktree is refused: whether its commits belong to this goal is the
-/// person's call.
 pub(crate) async fn prepare(goal: &Goal) -> Result<Checkout> {
     let spec = goal
         .spec
@@ -132,9 +125,6 @@ pub(crate) async fn prepare(goal: &Goal) -> Result<Checkout> {
     })
 }
 
-/// Removes a goal's checkout with `herdr worktree remove` (never `--force`).
-/// Uncommitted changes, a running watch or a running goal refuse it; the
-/// branch and the goal's record of the checkout stay.
 pub(crate) async fn remove(store: &Store, id: &str) -> Result<Goal> {
     let goal = store.load(id)?;
     let checkout = goal

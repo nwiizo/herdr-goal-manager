@@ -1,5 +1,3 @@
-//! Command-line interface. Machine-readable output contains only JSON.
-
 use crate::view::{print_goal, print_list};
 use crate::{
     model::*,
@@ -320,6 +318,9 @@ pub(crate) enum Action {
     HookStop,
     #[command(hide = true)]
     HookSession,
+    /// Own one cross-check process group until the run exits or is stopped.
+    #[command(hide = true)]
+    CrossCheckWorker { run: String, reviewer: String },
     /// Open the optional status board in a Herdr tab
     HerdrBoard,
     /// Write an editable goal template without overwriting existing files
@@ -333,12 +334,10 @@ pub(crate) enum Action {
     Add {
         #[arg(required_unless_present = "file", conflicts_with = "file")]
         objective: Option<String>,
-        #[arg(long, conflicts_with_all = ["criterion", "check"])]
+        #[arg(long, conflicts_with = "criterion")]
         file: Option<PathBuf>,
         #[arg(long, required_unless_present = "file")]
         criterion: Vec<String>,
-        #[arg(long)]
-        check: Vec<String>,
         /// Report the contract's problems and words per field without registering it
         #[arg(long, conflicts_with = "replace")]
         validate: bool,
@@ -415,13 +414,9 @@ pub(crate) struct RunArgs {
     pub max_repairs: u32,
 }
 
-/// Goals of the current manager's original tab plus unowned ones; `all` lifts the filter.
-/// Brief, what needs the user, this tab's goals, and revision lessons.
 fn overview(store: &Store, all: bool, json: bool) -> Result<()> {
     let goals = visible_goals(store, all)?;
     let brief = store.brief(crate::supervision::origin_terminal(store)?.as_deref())?;
-    // Rejected results are the raw material for project rules (every
-    // repeated mistake should become a line in AGENTS.md).
     let mut lessons: Vec<&Evidence> = goals
         .iter()
         .flat_map(|goal| &goal.guidance)
@@ -432,7 +427,6 @@ fn overview(store: &Store, all: bool, json: bool) -> Result<()> {
     let factory = crate::factory::Factory::load(store)?;
     let needs_you = inbox_rows(store, &goals, factory.as_ref())?;
     let rows = status_rows(store, &goals, factory.as_ref())?;
-    // Queued work behind an open gate waits for the manager, not the person.
     let queue = match &factory {
         Some(factory) => factory.ready_line()?,
         None => None,
@@ -466,8 +460,6 @@ fn overview(store: &Store, all: bool, json: bool) -> Result<()> {
     }
     Ok(())
 }
-/// `hgm show`: the goal, plus its queue item and run class when it was taken
-/// from the factory queue while factory mode is on.
 fn show(store: &Store, goal: &Goal, json: bool) -> Result<()> {
     let factory = crate::factory::Factory::load(store)?;
     let described = factory.map(|f| f.describe(&goal.id)).transpose()?.flatten();
@@ -478,9 +470,6 @@ fn show(store: &Store, goal: &Goal, json: bool) -> Result<()> {
     let events = store.events(&goal.id)?;
     let mut fingerprints = crate::fingerprint::Fingerprints::default();
     let reviews = crate::roles::review_states(goal, &events, &mut fingerprints);
-    // A check that passed on an earlier state of the work dir verifies
-    // nothing now. Results kept before fingerprints (unknown) appear only in
-    // the packet, so older goals print as before.
     let earlier: Vec<String> = crate::packet::check_states(goal, &events, &mut fingerprints)
         .iter()
         .filter(|c| c["result"] == "passed" && c["state"] == "stale")
@@ -553,8 +542,6 @@ fn show(store: &Store, goal: &Goal, json: bool) -> Result<()> {
     }
     Ok(())
 }
-/// The native goal hgm set for `goal`, with whether it is set and its last
-/// recorded outcome, while a watch keeps it.
 fn native_view(store: &Store, goal: &str) -> Result<Option<serde_json::Value>> {
     Ok(crate::watch::native_goals(store)?.get(goal).map(|state| {
         serde_json::json!({"set": state.is_set(), "outcome": state.outcome, "task": state.task})
@@ -568,8 +555,6 @@ pub(crate) fn native_text(native: &serde_json::Value) -> String {
         _ => "not set".into(),
     }
 }
-/// Status rows, with each factory goal's run class while factory mode is on.
-/// Also shows how long a watched worker has sat settled short of completion.
 fn status_rows(
     store: &Store,
     goals: &[Goal],
@@ -584,7 +569,6 @@ fn status_rows(
     let manager = crate::watch::manager_goals(store)?;
     let mut fingerprints = crate::fingerprint::Fingerprints::default();
     for (row, goal) in rows.iter_mut().zip(goals) {
-        // The latest verdict, and whether the work dir still matches it.
         let events = store.events(&goal.id)?;
         if let Some(review) = crate::roles::review_states(goal, &events, &mut fingerprints).pop() {
             row["review"] = review;
@@ -605,8 +589,6 @@ fn status_rows(
     }
     Ok(rows)
 }
-/// Inbox rows, with the factory queue's hold while factory mode is on, and a
-/// row for each watched worker the person was told sits idle short of completion.
 fn inbox_rows(
     store: &Store,
     goals: &[Goal],
@@ -650,8 +632,6 @@ fn visible_goals(store: &Store, all: bool) -> Result<Vec<Goal>> {
     Ok(goals)
 }
 
-/// Where `plugin-folder` puts the plugin by default: under the user's data
-/// folder, next to nothing else hgm writes.
 fn default_plugin_folder() -> Result<PathBuf> {
     if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| PathBuf::from(d).is_absolute())
     {
@@ -716,8 +696,6 @@ impl Cli {
             return Ok(());
         }
         let store = self.store()?;
-        // Helper roles run hgm only to read the contract and report back; each
-        // record command also checks the role's own list.
         if let Ok(role) = std::env::var("HGM_ROLE") {
             ensure!(
                 matches!(
@@ -839,12 +817,15 @@ impl Cli {
                     println!("{}", serde_json::to_string_pretty(&events)?);
                 } else {
                     for event in &events {
-                        println!("{}", crate::events::describe(event));
+                        println!(
+                            "{}",
+                            crate::view::terminal_text(&crate::events::describe(event))
+                        );
                         for line in crate::events::full_text(event)
                             .into_iter()
                             .flat_map(str::lines)
                         {
-                            println!("    {line}");
+                            println!("    {}", crate::view::terminal_text(line));
                         }
                     }
                 }
@@ -874,7 +855,6 @@ impl Cli {
                         .is_none_or(|t| goal.tasks.iter().any(|x| x.spec.id == t)),
                     "unknown task ID"
                 );
-                // Without --task, the one task whose plan awaits approval.
                 let task = match task {
                     Some(task) => Some(task.clone()),
                     None => crate::admission::plan_pending(&store.events(id)?, id)?,
@@ -1120,7 +1100,7 @@ impl Cli {
                 let goal = store.update(id, |g| g.wait(reason.clone()))?;
                 crate::native_goal::clear_for(&store, Some(id), "the goal waits for the person")
                     .await?;
-                crate::watch::release_watches(&store, id, "waiting_for_user")?;
+                crate::watch::release_watches(&store, id, "waiting_for_user").await?;
                 print_goal(&goal, &store, self.json)?
             }
             Action::Await { timeout } => {
@@ -1156,9 +1136,10 @@ impl Cli {
                 "{}",
                 crate::watch::stop_hook(&store, &crate::manager::stdin_json()?)?
             ),
+            Action::CrossCheckWorker { run, reviewer } => {
+                crate::cross_check::worker(&store, run, reviewer)?
+            }
             Action::HookSession => {
-                // Claude adds a SessionStart hook's stdout to the context: after the
-                // manager's own compaction or resume it continues from saved state.
                 println!(
                     "Goal Manager state restored after compaction or resume. It is saved evidence, not new authority; continue from it without running overview again.\n"
                 );
@@ -1193,7 +1174,6 @@ impl Cli {
                 objective,
                 file,
                 criterion,
-                check,
                 validate,
                 replace,
             } => {
@@ -1204,23 +1184,14 @@ impl Cli {
                     )
                     .context("parse goal YAML")?
                 } else {
-                    let checks: Vec<_> = check
-                        .iter()
-                        .enumerate()
-                        .map(|(i, command)| {
-                            serde_json::json!({"name": format!("check-{}", i + 1), "command": command})
-                        })
-                        .collect();
                     serde_json::json!({
                         "objective": objective.clone().context("missing objective")?,
                         "acceptance": criterion,
-                        "checks": checks,
                     })
                 };
                 if *validate {
                     return validate_contract(&store, raw, self.json);
                 }
-                // Contract validation states what is wrong; this names the next step.
                 const FIX: &str = "nothing was registered: fix the contract and check it with hgm add --file PATH --validate";
                 let spec = crate::config::goal_spec(&store.workspace, raw).context(FIX)?;
                 let goal = match replace {
@@ -1250,13 +1221,13 @@ impl Cli {
             Action::Pause { id } => {
                 let goal = store.update(id, |g| g.request(Control::Pause))?;
                 crate::native_goal::clear_for(&store, Some(id), "the goal is paused").await?;
-                crate::watch::release_watches(&store, id, "stopped_by_goal")?;
+                crate::watch::release_watches(&store, id, "stopped_by_goal").await?;
                 print_goal(&goal, &store, self.json)?
             }
             Action::Cancel { id } => {
                 let goal = store.update(id, |g| g.request(Control::Cancel))?;
                 crate::native_goal::clear_for(&store, Some(id), "the goal is cancelled").await?;
-                crate::watch::release_watches(&store, id, "stopped_by_goal")?;
+                crate::watch::release_watches(&store, id, "stopped_by_goal").await?;
                 print_goal(&goal, &store, self.json)?
             }
             Action::Note { id, text } => print_goal(
@@ -1333,10 +1304,6 @@ impl Cli {
     }
 }
 
-/// Manager-facing commands with exact arguments, generated from this build's
-/// CLI so the agent acts directly instead of rediscovering them with --help.
-/// The factory queue commands are listed only where factory mode is on, so
-/// the reference stays the same for everyone else.
 pub(crate) fn command_reference(factory: bool) -> String {
     const NOT_FOR_MANAGER: [&str; 6] = [
         "manager",
@@ -1369,7 +1336,6 @@ pub(crate) fn command_reference(factory: bool) -> String {
     }
     lines.join("\n")
 }
-/// One reference line: the command with its arguments, then what it does.
 fn reference_line(prefix: &str, command: &clap::Command) -> String {
     let mut usage = prefix.to_string();
     for arg in command.get_arguments() {
@@ -1434,8 +1400,6 @@ pub(crate) enum QueueAction {
     Next,
 }
 
-/// Runs a factory queue command; each change holds the queue lock and first
-/// settles any claim a stopped dispatch left.
 async fn queue(store: &Store, action: &QueueAction, json: bool) -> Result<()> {
     let config = crate::config::load(&store.workspace)?;
     config.require_factory()?;
@@ -1472,7 +1436,6 @@ async fn queue(store: &Store, action: &QueueAction, json: bool) -> Result<()> {
             .into_iter()
             .find(|s| s.state == crate::queue::State::Queued)
             .context("no queued item to dispatch; queue an agreed contract with hgm queue add")?;
-        // The goal belongs to the manager taking the item out (R1).
         let owner = crate::supervision::origin_terminal(store)?;
         let own = crate::factory::OwnCheckout::new(&config, &store.workspace);
         let (_, goal) = locked
@@ -1598,8 +1561,6 @@ pub(crate) enum RoleAction {
     },
 }
 
-/// What add, confirm, complete, run and resume print: the short result, or
-/// the whole goal with `--verbose`; `--json` prints the goal as before.
 fn print_result(goal: &crate::model::Goal, store: &Store, json: bool, verbose: bool) -> Result<()> {
     if json || verbose {
         return print_goal(goal, store, json);
@@ -1608,9 +1569,6 @@ fn print_result(goal: &crate::model::Goal, store: &Store, json: bool, verbose: b
     Ok(())
 }
 
-/// `add --validate`: the contract's problems and words per field, with nothing
-/// registered. What confirmation would refuse (autonomy auto without a command
-/// check) counts as a problem too. Fails when there is one.
 fn validate_contract(store: &Store, raw: serde_json::Value, json: bool) -> Result<()> {
     use crate::model::SPEC_WORD_BUDGET;
     let mut problems: Vec<String> = vec![];
@@ -1621,7 +1579,6 @@ fn validate_contract(store: &Store, raw: serde_json::Value, json: bool) -> Resul
             if let Err(error) = crate::model::Goal::new(spec.clone(), store.workspace.clone()) {
                 problems.push(format!("{error:#}"));
             }
-            // A budget refusal ends validation early; look past it for the rest.
             let over = spec.words() > SPEC_WORD_BUDGET
                 && spec
                     .long_spec_reason
@@ -1680,8 +1637,6 @@ fn validate_contract(store: &Store, raw: serde_json::Value, json: bool) -> Resul
     Ok(())
 }
 
-/// `goals` without completed and cancelled ones unless `keep`, and how many
-/// were left out: status and list show what is still open by default.
 fn without_finished(goals: Vec<Goal>, keep: bool) -> (Vec<Goal>, usize) {
     if keep {
         return (goals, 0);
@@ -1694,14 +1649,10 @@ fn without_finished(goals: Vec<Goal>, keep: bool) -> (Vec<Goal>, usize) {
     let hidden = total - open.len();
     (open, hidden)
 }
-/// The line that says how many finished goals `command` left out.
 fn hidden_line(command: &str, hidden: usize) -> String {
     format!("({hidden} completed or cancelled goal(s) hidden; hgm {command} --finished shows them)")
 }
 
-/// A warning, never a refusal, when other confirmed goals that are not finished
-/// work in the same directory as `goal`: their uncommitted changes mix in one
-/// tree (2026-11-15: five goals in one tree). Names the checkout option.
 fn shared_work_dir(store: &Store, goal: &Goal) -> Result<Option<String>> {
     let Ok(dir) = goal.work_dir() else {
         return Ok(None);

@@ -1,4 +1,3 @@
-//! Durable, origin-bound handoff before a graceful native process restart.
 use crate::{
     herdr_cli as herdr,
     store::Store,
@@ -21,8 +20,6 @@ struct Transfer {
     ready: PathBuf,
     acknowledged: PathBuf,
     digest: Option<String>,
-    /// The original agent's process id at the request, so a successor without a
-    /// session identity yet is known to be another process.
     #[serde(default)]
     predecessor_pid: Option<u64>,
 }
@@ -41,7 +38,6 @@ pub(crate) fn inspect(store: &Store) -> Result<Value> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
-/// Read only an unambiguous native footer, never percentages in generated prose.
 pub(crate) fn context_used(agent: &str, screen: &str) -> Option<f64> {
     for line in screen.lines().rev().take(4) {
         let value = match agent {
@@ -84,6 +80,8 @@ pub(crate) fn context_used(agent: &str, screen: &str) -> Option<f64> {
 }
 
 fn validate_arguments(provider: &str, arguments: &[String]) -> Result<()> {
+    crate::roles::single_line(arguments)?;
+    crate::roles::fits_shell_line(provider, arguments)?;
     let valued: &[&str] = match provider {
         "codex" => &[
             "-c",
@@ -157,7 +155,6 @@ fn validate_arguments(provider: &str, arguments: &[String]) -> Result<()> {
     }
     Ok(())
 }
-/// The one foreground process of `provider` in `pane` (its `argv` and `pid`).
 async fn provider_process(pane: &str, provider: &str) -> Result<Value> {
     let info = herdr::json_query(&[
         "pane".into(),
@@ -185,8 +182,6 @@ async fn provider_process(pane: &str, provider: &str) -> Result<Value> {
     );
     Ok(candidates[0].clone())
 }
-/// The original agent's launch options and process id, for a restart with
-/// the same options and for telling its successor apart from it.
 async fn recipe(origin: &Target) -> Result<(Vec<String>, Option<u64>)> {
     let provider = origin.agent.as_deref().context("no original agent")?;
     let process = provider_process(&origin.pane, provider).await?;
@@ -204,9 +199,6 @@ async fn recipe(origin: &Target) -> Result<(Vec<String>, Option<u64>)> {
     validate_arguments(provider, &arguments)?;
     Ok((arguments, process["pid"].as_u64()))
 }
-/// The shell variable through which a provider's agent can read its own session
-/// identity, for providers whose session Herdr reports only after a first turn.
-/// Others are added only after a native check.
 fn session_variable(provider: &str) -> Option<&'static str> {
     match provider {
         "copilot" => Some("COPILOT_AGENT_SESSION_ID"),
@@ -216,7 +208,6 @@ fn session_variable(provider: &str) -> Option<&'static str> {
 
 /// Reserve the request before delivery; a transport error never causes a replay.
 pub(crate) async fn request(store: &Store) -> Result<Value> {
-    // The worker must stop driving itself before it hands over.
     crate::native_goal::clear_for(store, None, "before a handoff").await?;
     let context = supervision::session(store)?;
     let _lease = supervision::wait_operation_lease(store, &context.key()).await?;
@@ -274,9 +265,6 @@ pub(crate) async fn request(store: &Store) -> Result<Value> {
     .context("handoff request delivery uncertain; inspect target, do not resend")?;
     transfer.phase = "awaiting_handoff".into();
     persist(store, &context.key(), &transfer)?;
-    // The watch advances the transfer. When none runs for this tab (its goal
-    // ended before the handoff), open it again; without a watch record the
-    // manager advances the transfer with `hgm restart`.
     if let Ok(watch) = crate::watch::load_watch(store, &context.key())
         && !crate::watch::watch_running(store, &watch, chrono::Utc::now().timestamp())?
         && let Err(error) = supervision::open_monitor(store, &context).await
@@ -287,8 +275,6 @@ pub(crate) async fn request(store: &Store) -> Result<Value> {
     }
     Ok(serde_json::to_value(transfer)?)
 }
-/// The handoff request typed into the original agent: where to save the
-/// document, which receipt to write once nothing depends on the CLI.
 pub(crate) fn handoff_prompt(document: &Path, ready: &Value, ready_path: &Path) -> String {
     format!(
         "Goal Manager handoff request. Do not compact. Stop new assignments and reach a safe boundary. Save a complete handoff at {} containing the goal, current instructions and permissions, scope, verified results and paths, pending work, failed approaches, live workers and the next action. Finish any process/subagent that depends on this CLI, or report why restart is unsafe. Only when the document is saved and no work depends on this CLI, atomically write {} to {}. Then finish this turn; Goal Manager will restart this same tab. Do not exit yourself.",
@@ -316,7 +302,6 @@ fn read_receipt(path: &std::path::Path) -> Result<Value> {
     );
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
-/// One bounded transition. The monitor retries observations, never uncertain mutations.
 pub(crate) async fn advance(store: &Store) -> Result<Value> {
     let mut context = supervision::session(store)?;
     let _lease = supervision::wait_operation_lease(store, &context.key()).await?;
@@ -351,6 +336,14 @@ pub(crate) async fn advance(store: &Store) -> Result<Value> {
                 return Ok(serde_json::to_value(transfer)?);
             }
             transfer.digest = Some(document_digest(&transfer)?);
+            validate_arguments(
+                transfer
+                    .predecessor
+                    .agent
+                    .as_deref()
+                    .context("missing provider")?,
+                &transfer.arguments,
+            )?;
             transfer.phase = "exit_delivery_uncertain".into();
             persist(store, &context.key(), &transfer)?;
             herdr::query(&[
@@ -402,11 +395,6 @@ pub(crate) async fn advance(store: &Store) -> Result<Value> {
             );
             let successor = Target::from_value(&live)?;
             let provider = successor.agent.clone().context("missing provider")?;
-            // Some providers get a session identity only with their first turn
-            // (Copilot). Such a successor is adopted before it has one only as
-            // another process in the predecessor's terminal, started after the
-            // predecessor exited (this phase follows the observed exit); its
-            // session is checked against Herdr's report after that turn.
             let variable = session_variable(&provider).filter(|_| successor.session.is_none());
             if variable.is_some() {
                 let pid = provider_process(&successor.pane, &provider).await?["pid"].as_u64();
@@ -470,9 +458,6 @@ pub(crate) async fn advance(store: &Store) -> Result<Value> {
             if !transfer.acknowledged.exists() {
                 return Ok(serde_json::to_value(transfer)?);
             }
-            // The session Herdr reports now. A successor adopted before its
-            // first turn must have one by the time it acknowledges, distinct
-            // from the predecessor's and equal to the one it wrote.
             let Some(reported) = live
                 .get("agent_session")
                 .filter(|session| session["value"].is_string())
@@ -531,5 +516,7 @@ mod tests {
         assert!(validate_arguments("codex", &["resume".into(), "previous".into()]).is_err());
         assert!(validate_arguments("copilot", &["--session-id=previous".into()]).is_err());
         assert!(validate_arguments("claude", &["--model".into()]).is_err());
+        assert!(validate_arguments("claude", &["--model".into(), "one\ntwo".into()]).is_err());
+        assert!(validate_arguments("codex", &["--model".into(), "m".repeat(1100)]).is_err());
     }
 }

@@ -1,4 +1,3 @@
-//! Real CLI user flows in private non-Git workspaces, with no provider credentials.
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -6,8 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a test waits for a state another process records; slow CI hosts
-/// must not turn a late state into a failure.
 const WAIT: Duration = Duration::from_secs(30);
 
 struct Sandbox {
@@ -196,19 +193,93 @@ fn repair_history_is_retained_and_acceptance_rechecks_current_state() {
 #[test]
 fn planner_cannot_inject_a_command_or_unknown_runner() {
     let sandbox = Sandbox::new();
-    let malicious = r#"[{"id":"bad","instruction":"Do work","runner":"unconfigured"}]"#;
-    let id = sandbox.add(json!({
+    for plan in [
+        json!([{"id":"work","instruction":"Do work","runner":"unconfigured"}]),
+        json!([{"id":"work","instruction":"Do work","runner":"configured","command":"true"}]),
+    ] {
+        let id = sandbox.add(json!({
         "objective":"Plan only trusted commands", "acceptance":["Only configured runners execute"],
         "planner":"planner",
-        "runners":{"planner":{"program":"printf","args":["%s",malicious]}}
+        "runners":{"planner":{"program":"printf","args":["%s",plan.to_string()]},
+                   "configured":{"program":"true"}}
     }));
-    assert!(!sandbox.call(&["run", &id]).status.success());
-    let goal = sandbox.show(&id);
-    assert_eq!(goal["status"], "needs_input");
-    assert_eq!(goal["plans"][0]["status"], "failed");
-    assert!(goal["tasks"].as_array().unwrap().is_empty());
+        assert!(!sandbox.call(&["run", &id]).status.success());
+        let goal = sandbox.show(&id);
+        assert_eq!(goal["status"], "needs_input");
+        assert_eq!(goal["plans"][0]["status"], "failed");
+        assert!(goal["tasks"].as_array().unwrap().is_empty());
+    }
     let invalid = sandbox.call(&["add", "Empty", "--criterion", ""]);
     assert!(!invalid.status.success());
+}
+
+#[test]
+fn acceptance_after_wait_rechecks_the_result() {
+    let sandbox = Sandbox::new();
+    let id = sandbox.add(json!({"objective":"Review","acceptance":["Reviewed"],
+        "checks":[{"name":"ready","command":"true"}]}));
+    sandbox.success(&["complete", &id, "work", "--evidence", "Done"]);
+    sandbox.success(&["run", &id]);
+    sandbox.success(&["wait", &id, "--reason", "Review"]);
+    let accepted = sandbox.success(&["accept", &id, "--evidence", "Reviewed"]);
+    assert_eq!(accepted["status"], "completed");
+    assert!(accepted["waiting"].is_null());
+}
+
+#[test]
+fn project_prompt_files_resolve_inside_the_workspace() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.workspace.join(".hgm");
+    std::fs::create_dir(&config).unwrap();
+    let external = sandbox.root.path().join("example.txt");
+    std::fs::write(&external, "Fixture").unwrap();
+    std::os::unix::fs::symlink(&external, config.join("guide.md")).unwrap();
+    std::fs::write(
+        config.join("config.yaml"),
+        "prompts: {manager_append: [guide.md]}",
+    )
+    .unwrap();
+    let output = sandbox.call(&["config"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inside the workspace"));
+}
+
+#[test]
+fn reports_keep_the_original_text_and_print_without_terminal_controls() {
+    let sandbox = Sandbox::new();
+    let id = sandbox.add(json!({"objective":"Review","acceptance":["Reviewed"]}));
+    let report = "First line\nSecond\rline\u{7}.";
+    sandbox.success(&["report", &id, report]);
+    assert_eq!(
+        sandbox.success(&["packet", &id])["reports"][0]["text"],
+        report
+    );
+    for cmd in ["packet", "log"] {
+        let out = sandbox.plain(&[cmd, &id]);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("Secondline."));
+        assert!(!text.contains(['\r', '\u{7}']));
+    }
+}
+
+#[test]
+fn manual_goal_arguments_only_register_data() {
+    let sandbox = Sandbox::new();
+    assert!(
+        !sandbox
+            .call(&[
+                "add",
+                "Review",
+                "--criterion",
+                "Reviewed",
+                "--check",
+                "true"
+            ])
+            .status
+            .success()
+    );
+    assert_eq!(sandbox.success(&["list"]), json!([]));
 }
 
 #[test]
@@ -288,8 +359,16 @@ fn pause_stops_owned_processes_and_preserves_interrupted_attempt() {
         assert!(Instant::now() < deadline, "runner did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
+    let replaced = sandbox.call(&[
+        "add",
+        "--replace",
+        &id,
+        "Changed objective",
+        "--criterion",
+        "Changed",
+    ]);
+    assert!(!replaced.status.success(), "lost an active attempt");
     sandbox.success(&["pause", &id]);
-    // The run notices the pause on its own poll, records it, and exits.
     let deadline = Instant::now() + WAIT;
     let goal = loop {
         let goal = sandbox.show(&id);
@@ -640,7 +719,6 @@ fn a_cancelled_goal_leaves_the_inbox_despite_its_saved_wait() {
     assert_eq!(goal["waiting"]["note"], "Ask whether to keep it");
     assert_eq!(sandbox.success(&["inbox"]), json!([]));
     assert_eq!(sandbox.success(&["overview"])["needs_you"], json!([]));
-    // Status still lists the goal but no longer says it waits for anyone.
     assert!(sandbox.success(&["status"])[0]["waiting_for"].is_null());
     assert!(sandbox.success(&["overview"])["goals"][0]["waiting_for"].is_null());
 }
@@ -683,7 +761,6 @@ fn a_plugin_folder_links_this_binary_and_leaves_other_builds_alone() {
             .output()
             .unwrap()
     };
-    // An hgm installed on its own (from crates.io) becomes a linkable plugin.
     let folder = sandbox.root.path().join("plugin folder");
     for _ in 0..2 {
         let output = setup(&folder);
@@ -707,7 +784,6 @@ fn a_plugin_folder_links_this_binary_and_leaves_other_builds_alone() {
         std::fs::canonicalize(&binary).unwrap(),
         std::fs::canonicalize(env!("CARGO_BIN_EXE_hgm")).unwrap()
     );
-    // A folder holding an hgm build, or another plugin, is left alone.
     let built = sandbox.root.path().join("built");
     std::fs::create_dir_all(built.join("target/release")).unwrap();
     std::fs::write(built.join("target/release/hgm"), "build").unwrap();
@@ -723,17 +799,14 @@ fn a_plugin_folder_links_this_binary_and_leaves_other_builds_alone() {
     assert!(!other.join("target").exists());
 }
 
-/// A contract the factory queue accepts: an `auto` loop with a command check.
 const QUEUED: &str = "objective: Write summary.json\nacceptance: [summary.json has the totals]\nchecks:\n  - {name: summary, command: test -f summary.json}\n";
 
 impl Sandbox {
-    /// Writes the user config hgm reads under this sandbox's HOME.
     fn user_config(&self, yaml: &str) {
         let directory = self.root.path().join(".config/herdr-goal-manager");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("config.yaml"), yaml).unwrap();
     }
-    /// The human-readable output of a command (no --json).
     fn plain(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hgm"))
             .env_clear()
@@ -749,7 +822,6 @@ impl Sandbox {
             .output()
             .unwrap()
     }
-    /// A contract file outside the workspace, so queueing writes nothing there.
     fn contract(&self, name: &str, text: &str) -> String {
         let path = self.root.path().join(name);
         std::fs::write(&path, text).unwrap();
@@ -763,7 +835,6 @@ impl Sandbox {
         files.sort();
         files
     }
-    /// Queue directories under the private state root.
     fn queue_directories(&self) -> Vec<PathBuf> {
         let Ok(workspaces) = std::fs::read_dir(self.state.join("workspaces")) else {
             return vec![];
@@ -827,7 +898,6 @@ fn factory_settings_leave_existing_output_unchanged() {
         capture() == before,
         "factory off changed an existing output"
     );
-    // Switched on with an empty queue, only the guide gains its queue section.
     sandbox.user_config("factory: {enabled: true}\n");
     let on = capture();
     assert!(
@@ -872,7 +942,6 @@ fn queue_add_list_park_unpark_and_remove_keep_history_in_private_state() {
     assert_eq!(item["agreement"], "Yes, run it after the review");
     assert_eq!(item["agreement_age"], "0m");
     assert_eq!(item["objective"], "Write summary.json");
-    // Layout, comments and key order do not make it a different contract.
     let same = sandbox.contract(
         "same.yaml",
         "# the same contract\nacceptance:\n  - summary.json has the totals\nchecks: [{command: test -f summary.json, name: summary}]\nobjective: Write summary.json\n",
@@ -912,7 +981,6 @@ fn queue_add_list_park_unpark_and_remove_keep_history_in_private_state() {
         .map(|entry| entry["kind"].clone())
         .collect();
     assert_eq!(kinds, ["added", "parked", "unparked", "removed"]);
-    // A removed contract may be queued again with a new agreement.
     let again = sandbox.success(&["queue", "add", "--file", &same, "--evidence", "Yes, again"]);
     assert_ne!(again["id"], id);
     assert_eq!(
@@ -945,7 +1013,6 @@ fn a_project_may_switch_factory_mode_on_but_not_raise_its_limits() {
     refused(&sandbox.call(&["queue", "list"]), "factory.max_active");
 }
 
-/// A queueable contract whose command check always passes.
 fn passing_contract(objective: &str) -> String {
     format!(
         "objective: {objective}\nacceptance: [{objective} is done]\nchecks:\n  - {{name: ok, command: 'true'}}\n"
@@ -964,7 +1031,6 @@ fn queue_next_dispatches_once_when_two_processes_claim_the_same_item() {
     sandbox.user_config("factory: {enabled: true, max_active: 5}\n");
     let file = sandbox.contract("one.yaml", &passing_contract("Only once"));
     let item = sandbox.success(&["queue", "add", "--file", &file, "--evidence", "Yes"]);
-    // Both processes wait on the held queue lock, then race for the one item.
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1043,7 +1109,6 @@ fn queue_next_stops_while_review_or_work_is_behind_and_says_why() {
     assert!(confirmed.contains("Yes, queue it") && confirmed.contains("Queued agreement"));
     assert_eq!(first["goal"]["status"], "ready");
 
-    // Work in progress holds the queue; inbox and overview say the same.
     let held = sandbox.call(&["queue", "next"]);
     refused(&held, "factory.max_active (1)");
     refused(&held, &goal);
@@ -1061,7 +1126,6 @@ fn queue_next_stops_while_review_or_work_is_behind_and_says_why() {
         "no dispatch line while held"
     );
 
-    // A result awaiting review holds it next.
     sandbox.success(&["complete", &goal, "work", "--evidence", "Written"]);
     sandbox.success(&["run", &goal]);
     refused(
@@ -1077,7 +1141,6 @@ fn queue_next_stops_while_review_or_work_is_behind_and_says_why() {
             .is_none()
     );
 
-    // Accepting it opens the gate again; the run class comes from events.
     sandbox.success(&["accept", &goal, "--evidence", "Reviewed the summary"]);
     let shown = sandbox.success(&["show", &goal]);
     assert_eq!(shown["factory"]["item"], first["item"]["id"]);
@@ -1118,7 +1181,6 @@ fn a_check_that_passed_on_an_earlier_state_is_not_verified_in_show_and_the_packe
     }));
     sandbox.success(&["complete", &id, "write", "--evidence", "Read report.txt"]);
     assert_eq!(sandbox.success(&["run", &id])["status"], "ready_for_review");
-    // The pass describes the work dir as it is: nothing extra in show.
     let shown = sandbox.show(&id);
     assert!(shown.get("not_verified").is_none(), "{shown}");
     assert!(shown["verifications"][0]["fingerprint"].is_string());
@@ -1126,7 +1188,6 @@ fn a_check_that_passed_on_an_earlier_state_is_not_verified_in_show_and_the_packe
     assert_eq!(packet["checks"][0]["state"], "current");
     assert_eq!(packet["not_verified"], json!([]));
 
-    // The work dir changes after the checks: the pass is of an earlier state.
     std::fs::write(sandbox.workspace.join("report.txt"), "final version").unwrap();
     let shown = sandbox.show(&id);
     let earlier = shown["not_verified"][0].as_str().unwrap();
@@ -1138,7 +1199,6 @@ fn a_check_that_passed_on_an_earlier_state_is_not_verified_in_show_and_the_packe
     let packet = sandbox.success(&["packet", &id]);
     assert_eq!(packet["checks"][0]["state"], "stale");
     assert_eq!(packet["not_verified"][0]["what"], earlier);
-    // Acceptance reruns the checks on the current state, as before.
     let accepted = sandbox.success(&["accept", &id, "--evidence", "Read the final report"]);
     assert_eq!(accepted["status"], "completed");
     assert!(sandbox.show(&id).get("not_verified").is_none());
@@ -1195,7 +1255,6 @@ fn factory_checkout_outside_git_dispatches_in_the_workspace_and_says_why() {
     assert!(!stdout.contains("Checkout: "), "{stdout}");
 }
 
-/// The human-readable output of a command in time zone `tz` (no --json).
 fn plain_in(sandbox: &Sandbox, tz: &str, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_hgm"))
         .env_clear()
@@ -1267,7 +1326,6 @@ fn add_validate_reports_problems_and_words_per_field_without_registering() {
         text.contains("Words by field: acceptance 600, notes 300"),
         "{text}"
     );
-    // The plain add refuses with the same breakdown; nothing was registered.
     let refused = sandbox.call(&["add", "--file", "draft.yaml"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("by field: acceptance 600"));
     assert_eq!(sandbox.success(&["list"]).as_array().unwrap().len(), 0);
@@ -1298,7 +1356,6 @@ fn an_unconfirmed_goal_is_replaced_in_place_and_a_confirmed_one_never() {
     assert_eq!(replaced["id"], goal.as_str());
     assert_eq!(replaced["spec"]["objective"], "Corrected draft");
     assert_eq!(replaced["tasks"][0]["spec"]["id"], "docs");
-    // No cancelled draft is left behind, and the timeline says what happened.
     let all = sandbox.success(&["list", "--finished"]);
     assert_eq!(all.as_array().unwrap().len(), 1);
     let events = sandbox.success(&["log", &goal]);
@@ -1339,7 +1396,6 @@ fn status_and_list_hide_finished_goals_and_say_how_many() {
             all.contains("Dropped draft") && !all.contains("hidden"),
             "{all}"
         );
-        // JSON keeps every goal for scripts.
         assert_eq!(sandbox.success(&[command]).as_array().unwrap().len(), 2);
     }
     let _ = open;
@@ -1375,7 +1431,6 @@ fn add_confirm_complete_and_run_print_a_short_result_and_confirm_warns_on_a_shar
         "{confirmed}"
     );
     let completed = lines(&["complete", &id, "work", "--evidence", "Done by hand"]);
-    // docs/design.md, principle 6: the default result is at most three lines.
     assert!(
         completed.contains(&format!("hgm run {id}")) && completed.lines().count() <= 3,
         "{completed}"
@@ -1386,14 +1441,12 @@ fn add_confirm_complete_and_run_print_a_short_result_and_confirm_warns_on_a_shar
         "{ran}"
     );
     assert!(ran.lines().count() <= 3, "{ran}");
-    // --verbose prints the whole goal; --json is unchanged.
     let verbose = lines(&["show", &id]);
     assert!(verbose.contains("AC1: a"));
     let full = lines(&["--verbose", "add", "--file", "goal.yaml"]);
     assert!(full.contains("AC1: a"), "{full}");
     assert!(sandbox.success(&["show", &id])["spec"].is_object());
 
-    // A second confirmed goal in the same tree is confirmed with a warning.
     let other = sandbox.add(json!({"objective":"Same tree","acceptance":["a"],
         "checks":[{"name":"c","command":"true"}]}));
     let output = sandbox.plain(&["confirm", &other, "--evidence", "User: go"]);

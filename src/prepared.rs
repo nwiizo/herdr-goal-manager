@@ -1,7 +1,3 @@
-//! Next steps the manager prepares while its worker works: a short queue of
-//! linked assignments per role, each checked like any send when it is
-//! stored, handed over by the watch one at a time as the worker settles (see
-//! `watch`). Each manager context keeps its own queues next to its watch record.
 use crate::{
     admission::{self, Assignment, Delivery},
     binding::{path, session, wait_operation_lease},
@@ -15,11 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-/// Steps a role's queue holds at most: on 2026-11-15 the manager wanted two to
-/// four in a row, sent ahead with `--interrupt` for lack of a queue.
 pub(crate) const MAX_PREPARED: usize = 5;
 
-/// The step the watch delivers to `to` when it settles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Prepared {
@@ -59,8 +52,6 @@ fn file(store: &Store, context: &str, role: &str) -> Result<PathBuf> {
     validate_id(role)?;
     path(store, context, &format!("-prepared-{role}.json"))
 }
-/// The steps queued for `role` in manager context `context`, next first. A
-/// single step stored by an earlier build reads as a queue of one.
 pub(crate) fn queue(store: &Store, context: &str, role: &str) -> Result<Vec<Prepared>> {
     let bytes = match std::fs::read(file(store, context, role)?) {
         Ok(bytes) => bytes,
@@ -85,12 +76,9 @@ fn save(store: &Store, context: &str, role: &str, steps: &[Prepared]) -> Result<
     }
     store.write_private(&file(store, context, role)?, &steps)
 }
-/// The next step for `role` in manager context `context`, if any.
 pub(crate) fn load(store: &Store, context: &str, role: &str) -> Result<Option<Prepared>> {
     Ok(queue(store, context, role)?.into_iter().next())
 }
-/// Marks the next step for `role` as being typed now (`at`), or no longer
-/// (`None`, when it was refused before anything was typed).
 pub(crate) fn mark_sending(
     store: &Store,
     context: &str,
@@ -104,8 +92,6 @@ pub(crate) fn mark_sending(
     }
     Ok(())
 }
-/// Takes the next step for `role` off its queue without a timeline record
-/// (it was delivered, or its delivery is recorded as uncertain).
 pub(crate) fn remove(store: &Store, context: &str, role: &str) -> Result<()> {
     let mut steps = queue(store, context, role)?;
     if !steps.is_empty() {
@@ -113,8 +99,6 @@ pub(crate) fn remove(store: &Store, context: &str, role: &str) -> Result<()> {
     }
     save(store, context, role, &steps)
 }
-/// Removes the queued steps for `role` (one, by its 1-based place, or all)
-/// and records why on each step's goal. Returns the steps removed.
 pub(crate) fn drop_steps(
     store: &Store,
     context: &str,
@@ -146,12 +130,6 @@ pub(crate) fn drop_steps(
     Ok(dropped)
 }
 
-/// Queues `text` as a next step for `assignment.to`, after any already
-/// queued, up to [`MAX_PREPARED`]. Every refusal of a send applies now
-/// (confirmation, word limit, plan approval, `ask` approval, budget, one owner
-/// per task), so a step that could never be admitted is not kept. The watch of
-/// this tab must observe that role; a goal it does not serve yet joins it,
-/// since the step goes to the pane it watches.
 pub(crate) async fn prepare(
     store: &Store,
     assignment: &Assignment<'_>,
@@ -204,7 +182,6 @@ pub(crate) async fn prepare(
     };
     steps.push(step.clone());
     save(store, &key, assignment.to, &steps)?;
-    // The watch tells its next reason to keep the next step afresh.
     watch.prepared_held = None;
     save_watch(store, &watch)?;
     store.record(
@@ -229,7 +206,6 @@ pub(crate) async fn prepare(
         ),
     }))
 }
-/// Withdraws the steps queued for `role`: the one at 1-based `place`, or all.
 pub(crate) async fn withdraw(store: &Store, role: &str, place: Option<usize>) -> Result<Value> {
     let key = session(store)?.key();
     let _operation = wait_operation_lease(store, &key).await?;

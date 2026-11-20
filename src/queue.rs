@@ -1,13 +1,5 @@
-//! The optional factory queue: user-authored contracts the user agreed to,
-//! kept with that agreement until one is turned into a confirmed goal.
-//!
-//! Everything lives in the private state directory: one immutable file per
-//! item (`queue/items/<id>.json`) and an append-only ledger
-//! (`queue/ledger.ndjson`) whose entries decide each item's state. Every
-//! change holds `queue/claim.lock`. The operating system releases that lock
-//! when its holder exits, so the next holder finds a claim the previous one
-//! left unfinished and settles it ([`Locked::recover`]): the goal of a claim
-//! has the ID `g-<claim>`, so the goal file alone shows whether it was made.
+//! Queue mutations hold `queue/claim.lock`. After a crash, [`Locked::recover`]
+//! checks for goal `g-<claim>` to decide whether dispatch created it.
 use crate::{
     config::{self, LoopDefaults},
     model::{Control, Evidence, Goal, GoalStatus, validate_id},
@@ -21,10 +13,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs::File, path::PathBuf};
 
-/// The lock every queue change holds, relative to the workspace state.
 const LOCK: &str = "queue/claim.lock";
 
-/// One queued contract, written once and never changed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Item {
@@ -44,7 +34,6 @@ pub(crate) struct Item {
     pub agreement: Evidence,
 }
 
-/// What a ledger entry records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Kind {
@@ -58,7 +47,6 @@ pub(crate) enum Kind {
     DispatchFailed,
 }
 
-/// One line of the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Entry {
@@ -69,7 +57,6 @@ pub(crate) struct Entry {
     pub detail: Value,
 }
 
-/// An item's state, decided by its ledger entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum State {
@@ -77,12 +64,10 @@ pub(crate) enum State {
     Parked,
     Claimed,
     Dispatched,
-    /// A dispatch was refused; the person queues it again or removes it.
     Failed,
     Removed,
 }
 impl State {
-    /// The state `kind` leads to from this one, or `None` when it cannot.
     fn after(self, kind: Kind) -> Option<Self> {
         use self::{Kind as K, State as S};
         Some(match (self, kind) {
@@ -107,7 +92,6 @@ impl State {
     }
 }
 
-/// An item as its ledger entries describe it, in queueing order.
 #[derive(Debug, Clone)]
 pub(crate) struct Status {
     pub id: String,
@@ -121,9 +105,6 @@ pub(crate) struct Status {
     pub history: Vec<Entry>,
 }
 
-/// Content fingerprint of a parsed contract: SHA-256 of its JSON form. Object
-/// keys serialize in sorted order (serde_json without `preserve_order`), so
-/// layout, comments and key order do not change it.
 pub(crate) fn fingerprint(raw: &Value) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(raw)?)))
 }
@@ -132,19 +113,14 @@ fn parse_contract(text: &str) -> Result<Value> {
     serde_norway::from_str(text).context("parse contract YAML")
 }
 
-/// The goal a claim creates; its file shows whether the claim got that far.
 fn goal_id(claim: &str) -> String {
     format!("g-{claim}")
 }
 
-/// The branch of the checkout `queue next` makes for item `id`: `hgm/` and
-/// the item id up to its first eight hex digits (`hgm/q-1a2b3c4d`).
 pub(crate) fn branch_for(id: &str) -> String {
     format!("hgm/{}", &id[..id.len().min(10)])
 }
 
-/// Where a factory checkout starts: the workspace's current branch, or its
-/// commit when HEAD is detached. A repository without a commit has none.
 fn current_base(workspace: &std::path::Path) -> Result<String> {
     let git = |args: &[&str]| -> Result<String> {
         let output = std::process::Command::new("git")
@@ -171,7 +147,6 @@ fn current_base(workspace: &std::path::Path) -> Result<String> {
     }
 }
 
-/// Folds ledger entries into item states; an impossible step is refused.
 fn fold(entries: &[Entry]) -> Result<Vec<Status>> {
     let mut items: Vec<Status> = vec![];
     for (index, entry) in entries.iter().enumerate() {
@@ -222,7 +197,6 @@ fn fold(entries: &[Entry]) -> Result<Vec<Status>> {
     Ok(items)
 }
 
-/// The queue of one workspace, read without the lock.
 pub(crate) struct Queue<'a> {
     store: &'a Store,
     directory: PathBuf,
@@ -304,7 +278,6 @@ impl<'a> Queue<'a> {
             .ok()
             .and_then(|raw| raw["objective"].as_str().map(String::from));
         let minutes = (now - item.agreement.recorded_at).num_minutes().max(0);
-        // Where the item's goal works, when it has its own checkout.
         let checkout = status
             .goal
             .as_deref()
@@ -342,7 +315,6 @@ impl<'a> Queue<'a> {
     }
 }
 
-/// Minutes as a short age: `45m`, `5h`, `3d`.
 pub(crate) fn age(minutes: i64) -> String {
     match minutes {
         ..60 => format!("{minutes}m"),
@@ -351,7 +323,6 @@ pub(crate) fn age(minutes: i64) -> String {
     }
 }
 
-/// The queue with its lock held; every change goes through here.
 pub(crate) struct Locked<'a> {
     queue: Queue<'a>,
     _lock: File,
@@ -372,7 +343,6 @@ impl Locked<'_> {
         };
         self.store.append_private(&self.ledger_path(), &[entry])
     }
-    /// Checks that `kind` may follow the item's state, then records it.
     fn step(&self, id: &str, kind: Kind, detail: Value) -> Result<Status> {
         let status = self.status(id)?;
         if status.state.after(kind).is_none() {
@@ -456,8 +426,6 @@ impl Locked<'_> {
                 recorded_at: now,
             },
         };
-        // The item file comes first: a stop before the ledger line leaves an
-        // unlisted file, never a listed item without its contract.
         self.store
             .write_private(&self.item_path(&item.id)?, &item)?;
         self.append(
@@ -531,8 +499,6 @@ impl Locked<'_> {
         let goal = self.finish(&item, &claim, &goal).await?;
         Ok((item, goal))
     }
-    /// Confirms a claimed item's goal with the stored agreement and records
-    /// the outcome.
     async fn finish(&self, item: &Item, claim: &str, goal: &str) -> Result<Goal> {
         let evidence = format!(
             "Queued agreement {} ({}): {}",
@@ -552,9 +518,6 @@ impl Locked<'_> {
             Err(error) => Err(self.fail(&item.id, Some(claim), Some(goal), error)),
         }
     }
-    /// Records a refused dispatch; the returned error says what happened. A
-    /// goal already registered for it is cancelled with the reason: its
-    /// record stays as evidence and it no longer waits to be started.
     fn fail(
         &self,
         id: &str,
@@ -920,12 +883,9 @@ mod tests {
             Ok((id, claim))
         };
         let spec = || config::goal_spec_with(parse_contract(CONTRACT)?, &LoopDefaults::default());
-        // Stopped before registering a goal.
         let (none, _) = claim(CONTRACT)?;
-        // Stopped after registering, before confirming.
         let (unconfirmed, c2) = claim(&CONTRACT.replace("totals", "sums"))?;
         f.store.add_with_id(spec()?, None, &goal_id(&c2))?;
-        // Stopped after confirming, before recording the dispatch.
         let (confirmed, c3) = claim(&CONTRACT.replace("totals", "counts"))?;
         f.store.add_with_id(spec()?, None, &goal_id(&c3))?;
         runner::confirm_goal(&f.store, &goal_id(&c3), "yes").await?;
@@ -948,7 +908,6 @@ mod tests {
         let f = fixture()?;
         let id = add(&f.store, CONTRACT)?.id;
         let (workspace, root) = (f.store.workspace.clone(), f.store.root.clone());
-        // Both claimers wait on the held lock, then race for the one item.
         let held = f.store.wait_lock(LOCK)?;
         let claimers: Vec<_> = (0..2)
             .map(|_| {

@@ -1,9 +1,3 @@
-//! What a goal's working directory holds, as one digest. A review verdict
-//! describes the state it was given for; once the digest changes, the verdict
-//! is stale. In a Git repository the digest covers HEAD, the status, the diff
-//! against HEAD and the untracked files Git does not ignore (so ignored build
-//! output never counts); elsewhere it covers each file's path, size and
-//! modification time, skipping the directories in [`SKIPPED`].
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,8 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Directory names a folder outside Git never fingerprints: version control
-/// data and the usual build and dependency output.
 pub(crate) const SKIPPED: [&str; 3] = [".git", "target", "node_modules"];
 
 /// Runs a read-only git command. Optional locks stay off, so reading the
@@ -26,42 +18,67 @@ fn git(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
         .output()
 }
 
-/// Whether `dir` is inside a Git work tree.
 pub(crate) fn is_git(dir: &Path) -> bool {
     git(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|output| output.status.success())
 }
 
-/// The digest of what `dir` holds now.
 pub(crate) fn digest(dir: &Path) -> Result<String> {
     anyhow::ensure!(dir.is_dir(), "{} is not a directory", dir.display());
     if is_git(dir) {
         git_digest(dir)
     } else {
+        anyhow::ensure!(
+            !dir.ancestors().any(|p| p.join(".git").exists()),
+            "could not inspect the Git work tree at {}",
+            dir.display()
+        );
         files_digest(dir)
     }
 }
 
-/// Unchanged from the digest review requests have always recorded, so
-/// verdicts given before fingerprints were shown stay comparable.
 fn git_digest(dir: &Path) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let checked = |args: &[&str]| -> Result<Vec<u8>> {
+        let output = git(dir, args)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(output.stdout)
+    };
     let mut hasher = Sha256::new();
-    for args in [
-        &["rev-parse", "HEAD"][..],
-        &["status", "--porcelain=v1", "-uall"],
-        &["diff", "HEAD", "--binary"],
-    ] {
-        hasher.update(git(dir, args)?.stdout);
+    let head = git(dir, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    let status = checked(&["status", "--porcelain=v1", "-uall"])?;
+    if head.status.success() {
+        hasher.update(head.stdout);
+        hasher.update(status);
+        hasher.update(checked(&["diff", "HEAD", "--binary"])?);
+    } else {
+        anyhow::ensure!(head.status.code() == Some(1), "could not resolve Git HEAD");
+        hasher.update(checked(&["symbolic-ref", "HEAD"])?);
+        hasher.update(status);
+        hasher.update(checked(&["diff", "--cached", "--binary"])?);
+        hasher.update(checked(&["diff", "--binary"])?);
     }
-    let untracked = git(dir, &["ls-files", "--others", "--exclude-standard", "-z"])?.stdout;
+    let untracked = checked(&["ls-files", "--others", "--exclude-standard", "-z"])?;
     for file in untracked.split(|b| *b == 0).filter(|f| !f.is_empty()) {
-        let name = String::from_utf8_lossy(file);
+        let path = dir.join(std::ffi::OsStr::from_bytes(file));
         hasher.update(file);
-        hasher.update(std::fs::read(dir.join(name.as_ref())).unwrap_or_default());
+        if path.symlink_metadata()?.is_symlink() {
+            hasher.update(b"\0symlink\0");
+            hasher.update(std::fs::read_link(&path)?.as_os_str().as_bytes());
+        } else {
+            hasher.update(
+                std::fs::read(&path)
+                    .with_context(|| format!("read untracked file {}", path.display()))?,
+            );
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Path, size and modification time of every file outside [`SKIPPED`].
 fn files_digest(dir: &Path) -> Result<String> {
     let mut stamps = vec![];
     stamp_files(dir, dir, &mut stamps)?;
@@ -76,8 +93,6 @@ fn files_digest(dir: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// `(relative path, "size:mtime")` for each file under `path`; a symbolic
-/// link is stamped with its target and never followed.
 pub(crate) fn stamp_files(root: &Path, path: &Path, out: &mut Vec<(String, String)>) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -115,10 +130,6 @@ pub(crate) fn stamp_files(root: &Path, path: &Path, out: &mut Vec<(String, Strin
     Ok(())
 }
 
-/// Per-file stamps of a work dir, to tell which paths changed between two
-/// moments and when it last changed. In a repository: HEAD and each path Git
-/// reports as changed or untracked (not ignored), stamped with size and
-/// modification time or `deleted`; elsewhere every file outside [`SKIPPED`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Snapshot {
     pub git: bool,
@@ -155,7 +166,6 @@ impl Snapshot {
             let entry = String::from_utf8_lossy(entry);
             let (code, path) = entry.split_at(entry.len().min(3));
             paths.push(path.to_string());
-            // A rename or copy is followed by the path it came from.
             if code.contains(['R', 'C'])
                 && let Some(from) = entries.next()
             {
@@ -178,9 +188,6 @@ impl Snapshot {
         })
     }
 
-    /// Workspace-relative paths whose state differs from `earlier`, sorted:
-    /// a changed stamp, a path that appeared or went, and in a repository the
-    /// files of commits between the two HEADs.
     pub(crate) fn changed_since(&self, earlier: &Self, dir: &Path) -> Vec<String> {
         let mut changed: std::collections::BTreeSet<String> = self
             .files
@@ -211,10 +218,6 @@ impl Snapshot {
         changed.into_iter().collect()
     }
 
-    /// When the work dir last changed, in seconds since the epoch: the newest
-    /// modification time among the stamped files (a deleted file counts by its
-    /// folder's) and of the work dir itself, and in a repository also of the
-    /// last commit or checkout.
     pub(crate) fn last_change(&self, dir: &Path) -> Option<i64> {
         let modified = |path: &Path| {
             std::fs::symlink_metadata(path)
@@ -240,15 +243,10 @@ impl Snapshot {
                 let log = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 modified(&dir.join(log))
             });
-        // The folder itself changes when an entry is added or removed, which
-        // also dates a work dir with no stamped file.
         files.chain(head).chain(modified(dir)).max()
     }
 }
 
-/// Digests computed once per directory within one command, so a listing of
-/// several goals in one folder fingerprints it once. A directory that cannot
-/// be read (a removed checkout) has no digest.
 #[derive(Default)]
 pub(crate) struct Fingerprints(HashMap<PathBuf, Option<String>>);
 impl Fingerprints {
@@ -293,6 +291,12 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "target/\n")?;
         std::fs::write(dir.path().join("a.txt"), "one")?;
         run(&["add", "."]);
+        let staged = digest(dir.path())?;
+        std::fs::write(dir.path().join("a.txt"), "two")?;
+        run(&["add", "a.txt"]);
+        assert_ne!(digest(dir.path())?, staged);
+        std::fs::write(dir.path().join("a.txt"), "one")?;
+        run(&["add", "a.txt"]);
         run(&[
             "-c",
             "user.name=t",

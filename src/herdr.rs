@@ -1,5 +1,3 @@
-//! Herdr is the terminal layer; the manager owns goal state and acceptance.
-
 use crate::binding::Existing;
 use crate::{
     model::*,
@@ -11,10 +9,6 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{io::Write, path::Path};
 
 use crate::herdr_cli::call;
-/// Opens a plugin tab for the focused pane. Goal Manager opens once per tab:
-/// from a tab that already has one, from that manager, or from a helper's tab
-/// it switches to the running manager or refuses instead of starting another.
-/// `state_root` holds every folder's saved managers.
 pub(crate) async fn open_panel(entrypoint: &str, state_root: &Path) -> Result<()> {
     ensure!(
         std::env::var("HERDR_ENV").as_deref() == Ok("1"),
@@ -75,23 +69,14 @@ pub(crate) async fn open_panel(entrypoint: &str, state_root: &Path) -> Result<()
         format!("HGM_WORKSPACE={workspace}"),
         "--env".into(),
         format!("HGM_ORIGIN_JSON={origin}"),
-        // The new pane uses the state this command searched.
         "--env".into(),
         format!("HGM_STATE_DIR={}", state_root.display()),
     ];
     call(&args).await
 }
 
-/// The plugin manifest this build ships, for a plugin folder around an
-/// installed binary (see [`plugin_folder`]).
 const PLUGIN_MANIFEST: &str = include_str!("../herdr-plugin.toml");
 
-/// Makes `dir` a Herdr plugin folder for this binary, so an `hgm` installed
-/// without the plugin (for example from crates.io) can be added with
-/// `herdr plugin link`: it writes the manifest and links `target/release/hgm`
-/// to this executable, so upgrading the binary upgrades the plugin. A folder
-/// that holds another plugin's manifest, or an hgm build as a regular file
-/// (an archive or a checkout), is left alone.
 pub(crate) fn plugin_folder(dir: &Path) -> Result<serde_json::Value> {
     let executable = std::env::current_exe()?.canonicalize()?;
     let manifest = dir.join("herdr-plugin.toml");
@@ -112,7 +97,6 @@ pub(crate) fn plugin_folder(dir: &Path) -> Result<serde_json::Value> {
         );
     }
     std::fs::create_dir_all(&release).with_context(|| format!("create {}", release.display()))?;
-    // Replace any earlier link by rename, so the plugin never sees no binary.
     let temporary = release.join(format!(".hgm-{}", std::process::id()));
     let _ = std::fs::remove_file(&temporary);
     std::os::unix::fs::symlink(&executable, &temporary)?;
@@ -126,15 +110,11 @@ pub(crate) fn plugin_folder(dir: &Path) -> Result<serde_json::Value> {
     }))
 }
 
-/// Herdr shows an unnamed tab by its number. A tab the user named keeps its name.
 fn unnamed(label: &str) -> bool {
     let label = label.trim();
     label.is_empty() || label.chars().all(|c| c.is_ascii_digit())
 }
-/// The label hgm gives the watch tab.
 pub(crate) const WATCH_TAB: &str = "Goal watch";
-/// The tab's label. An unnamed original tab is named `main`, so the pinned
-/// target is easy to find next to the Goal Manager tab.
 async fn tab_label(tab: &str) -> Result<String> {
     let info = crate::herdr_cli::json_query(&["tab".into(), "get".into(), tab.into()]).await?;
     Ok(info["result"]["tab"]["label"]
@@ -236,7 +216,7 @@ async fn panel_command(store: &Store, goals: &[Goal], line: &str) -> Result<()> 
                 Control::Cancel
             };
             let goal = store.update(&goal.id, |g| g.request(control))?;
-            crate::watch::release_watches(store, &goal.id, "stopped_by_goal")?;
+            crate::watch::release_watches(store, &goal.id, "stopped_by_goal").await?;
             goal
         }
         "note" => store.update(&goal.id, |g| g.note(rest.trim().into()))?,

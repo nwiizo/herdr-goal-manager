@@ -1,4 +1,3 @@
-//! Shared human-readable goal views.
 use crate::{
     model::{Attempt, Control, Goal},
     store::Store,
@@ -112,8 +111,6 @@ fn print_attempts(attempts: &[Attempt]) {
     }
 }
 
-/// One row per goal with its next useful action. A completed or cancelled
-/// goal waits for nobody, whatever wait reason it kept as history.
 pub(crate) fn status_rows(goals: &[Goal]) -> Vec<serde_json::Value> {
     use crate::model::GoalStatus;
     goals
@@ -143,7 +140,6 @@ pub(crate) fn status_rows(goals: &[Goal]) -> Vec<serde_json::Value> {
         })
         .collect()
 }
-/// Rows as JSON, an empty-state sentence, or one rendered entry per row.
 fn print_rows(
     rows: &[serde_json::Value],
     json_output: bool,
@@ -164,8 +160,6 @@ fn print_rows(
 fn text(row: &serde_json::Value, key: &str) -> String {
     row[key].as_str().unwrap_or_default().to_string()
 }
-/// Prints status rows; a row with `run_class` (a goal taken from the factory
-/// queue) also shows how it ran, `pending` while nothing decides it.
 pub(crate) fn print_status_rows(rows: &[serde_json::Value], json_output: bool) -> Result<()> {
     print_rows(
         rows,
@@ -215,22 +209,34 @@ pub(crate) fn print_status_rows(rows: &[serde_json::Value], json_output: bool) -
     )
 }
 
-/// What needs a human now, most blocking first: an agent dialog or stopped
-/// monitoring, then results to review, manager questions, and missing input.
-/// Completed and cancelled goals need nobody: cancelling keeps the saved wait
-/// reason and the last event as history, so neither may surface them here.
+pub(crate) fn terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
 pub(crate) fn inbox_rows(store: &Store, goals: &[Goal]) -> Result<Vec<serde_json::Value>> {
     use crate::model::GoalStatus;
     let mut rows = vec![];
+    let holds = crate::watch::held_goals(store)?;
     for goal in goals {
         if matches!(goal.status, GoalStatus::Completed | GoalStatus::Cancelled) {
             continue;
         }
-        // An idle worker is listed from its watch while the stretch lasts.
-        let blocking = store.events(&goal.id)?.pop().filter(|event| {
-            (event.kind == "attention" && event.detail["cause"] != crate::watch::IDLE_NOTICE)
-                || (event.kind == "watch_ended" && event.detail["notify"] == true)
-        });
+        let events = store.events(&goal.id)?;
+        let blocking = events
+            .last()
+            .filter(|event| {
+                (event.kind == "attention" && event.detail["cause"] != crate::watch::IDLE_NOTICE)
+                    || (event.kind == "watch_ended" && event.detail["notify"] == true)
+            })
+            .or_else(|| {
+                let cause = holds.get(&goal.id)?;
+                events
+                    .iter()
+                    .rev()
+                    .find(|e| e.kind == "attention" && e.detail["cause"].as_str() == Some(cause))
+            });
         let message = || goal.message.clone().unwrap_or_default();
         let waiting = goal.waiting.as_ref().map(|w| w.note.clone());
         let (kind, reason, since) = if let Some(event) = &blocking {
@@ -279,10 +285,6 @@ pub(crate) fn print_inbox_rows(rows: &[serde_json::Value], json_output: bool) ->
     })
 }
 
-/// The short result of add, confirm, complete, run and resume: the goal, its
-/// state and the next command, plus the goal's message when it has one (a
-/// refusal naming its next steps). The whole goal is `hgm show ID` or
-/// `--verbose` away; `--json` is unchanged.
 pub(crate) fn print_short(goal: &Goal) {
     let status = serde_json::to_value(goal.status)
         .ok()
@@ -293,7 +295,6 @@ pub(crate) fn print_short(goal: &Goal) {
         println!("  {message}");
     }
 }
-/// The command that moves `goal` on from where it is.
 fn next_step(goal: &Goal) -> String {
     use crate::model::GoalStatus;
     let id = &goal.id;

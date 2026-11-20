@@ -1,4 +1,3 @@
-//! Native-command boundary tests: isolated homes and controlled provider/Herdr binaries.
 #![cfg(unix)]
 use serde_json::{Value, json};
 use std::{
@@ -55,7 +54,6 @@ impl Bridge {
         value.context = std::fs::read_to_string(value.root.path().join("context")).unwrap();
         value
     }
-    /// The fake Herdr socket path; nothing listens unless a test binds it.
     fn socket(&self) -> PathBuf {
         self.root.path().join("herdr.sock")
     }
@@ -96,17 +94,11 @@ impl Bridge {
         serde_json::from_slice(&output.stdout).unwrap()
     }
     fn goal(&self) -> String {
-        self.ok(&[
-            "add",
-            "Useful result",
-            "--criterion",
-            "Recipient can proceed",
-            "--check",
-            "true",
-        ])["id"]
-            .as_str()
-            .unwrap()
-            .into()
+        add_file(
+            self,
+            json!({"objective":"Useful result","acceptance":["Recipient can proceed"],
+            "checks":[{"name":"check-1","command":"true"}]}),
+        )
     }
     fn hook(&self, input: Value) -> Value {
         let mut child = self
@@ -137,7 +129,6 @@ fn dispatch_keeps_original_pane_and_rejects_drafts_and_replacements() {
     bridge.ok(&["send", "Inspect report.txt and test the stated outcome"]);
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.starts_with("w1:p1\n"));
-    // A refusal names the one cause observed and what to do about it.
     let refused = |bridge: &Bridge| {
         let output = bridge.call(&["send", "do not append this"]);
         assert!(!output.status.success());
@@ -177,7 +168,6 @@ fn watcher_wakes_manager_but_does_not_complete_work_and_pause_stops_it() {
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.starts_with("w1:p2\n"));
-    // Standing rules live in the guide; the wake points to the contract.
     assert!(sent.contains("Contract: hgm show g-"), "{sent}");
     assert!(!sent.contains("idle/done is not acceptance"));
     assert_eq!(bridge.ok(&["show", &goal])["status"], "ready");
@@ -202,7 +192,6 @@ fn stop_hook_continues_once_only_for_pending_observation_and_respects_human_wait
     bridge.inventory("done", "working", "original");
     bridge.ok(&["supervise", &goal]);
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
-    // A watch process is running (it holds the tab's watch lease).
     let _running = hold_watch_lease(&bridge);
     let wakes = |bridge: &Bridge| -> Vec<Value> {
         let log = bridge.ok(&["log", &goal]);
@@ -225,7 +214,6 @@ fn stop_hook_continues_once_only_for_pending_observation_and_respects_human_wait
     );
     assert_eq!(response["decision"], "block");
     assert_eq!(bridge.hook(json!({"stop_hook_active":false})), json!({}));
-    // A wake delivered through the hook is on the timeline once, like a typed one.
     let recorded = wakes(&bridge);
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     let detail = &recorded[0]["detail"];
@@ -497,7 +485,6 @@ fn restart_requires_saved_handoff_and_matching_successor_receipt() {
 
 #[test]
 fn a_successor_without_a_session_yet_is_adopted_and_checked_against_the_session_it_reports() {
-    // main is Copilot, whose session Herdr reports only after a first turn.
     let bridge = Bridge::new();
     let context_path = manager_dir(&bridge).join(format!("{}.json", bridge.context));
     let mut context: Value =
@@ -569,10 +556,8 @@ fn a_successor_without_a_session_yet_is_adopted_and_checked_against_the_session_
     assert_eq!(bridge.ok(&["restart"])["phase"], "awaiting_exit");
     assert_eq!(bridge.ok(&["restart"])["phase"], "awaiting_successor");
     let sent = || std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap_or_default();
-    // Still the predecessor's process: no adoption request.
     assert_eq!(bridge.ok(&["restart"])["phase"], "awaiting_successor");
     assert!(!sent().contains("fresh-session handoff"));
-    // Another process with no session yet gets the request with its own id.
     process(200);
     let adoption = bridge.ok(&["restart"]);
     assert_eq!(adoption["phase"], "awaiting_acknowledgement");
@@ -586,9 +571,7 @@ fn a_successor_without_a_session_yet_is_adopted_and_checked_against_the_session_
         .unwrap();
     };
     acknowledge("fresh");
-    // Herdr has not reported the session yet: wait.
     assert_eq!(bridge.ok(&["restart"])["phase"], "awaiting_acknowledgement");
-    // The predecessor's session, or another one than written, stops the transfer.
     show(&main_as(Some("worker")));
     acknowledge("worker");
     assert!(!bridge.call(&["restart"]).status.success());
@@ -622,7 +605,6 @@ fn linked_send_records_the_assignment_arms_monitoring_and_alerts_once_on_approva
     let refused = bridge.call(&["send", "--goal", &goal, "--task", "missing", "x"]);
     assert!(!refused.status.success());
 
-    // Herdr reports `done` while an approval dialog is visible.
     bridge.write(
         "target.screen",
         "Create file\nDo you want to create summary.json?\n❯ 1. Yes\n  2. No",
@@ -634,7 +616,6 @@ fn linked_send_records_the_assignment_arms_monitoring_and_alerts_once_on_approva
     assert_eq!(notified().matches("Original agent needs you").count(), 1);
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     assert_eq!(notified().matches("Original agent needs you").count(), 1);
-    // A one-off observation from the manager's tab keeps that tab's name.
     assert!(!bridge.root.path().join("renamed.txt").exists());
 
     bridge.ok(&["wait", &goal, "--reason", "Approve the file creation"]);
@@ -726,7 +707,9 @@ fn loop_contract_gates_assignments_and_a_spent_budget_reaches_the_inbox() {
         &bridge,
         json!({
             "objective":"Summarize orders","acceptance":["Totals match orders.csv"],
-            "loop":{"max_assignments":1,"autonomy":"ask"}
+            "loop":{"max_assignments":1,"autonomy":"ask","stop_checks":[
+                {"name":"gate","command":"echo checked >> checks-run; exit 1"}
+            ]}
         }),
     );
     let send = |extra: &[&str]| {
@@ -745,11 +728,14 @@ fn loop_contract_gates_assignments_and_a_spent_budget_reaches_the_inbox() {
     ]);
     let unapproved = send(&[]);
     assert!(String::from_utf8_lossy(&unapproved.stderr).contains("--user-approval"));
+    let checks = bridge.workspace.join("checks-run");
+    assert!(!checks.exists(), "refused sends ran a stop check");
     assert!(send(&["--user-approval", "User: send it"]).status.success());
 
     let spent = send(&["--user-approval", "User: try again"]);
     assert!(!spent.status.success());
     assert!(String::from_utf8_lossy(&spent.stderr).contains("budget exhausted"));
+    assert_eq!(std::fs::read_to_string(checks).unwrap(), "checked\n");
     let inbox = bridge.ok(&["inbox"]);
     assert_eq!(inbox[0]["kind"], "answer_manager");
     assert!(
@@ -805,7 +791,6 @@ fn a_patrol_that_finds_progress_and_nothing_else_is_recorded_without_a_wake() {
             .matches("Goal Manager observation")
             .count()
     };
-    // Progress since the previous patrol and no finding: recorded, nobody woken.
     edit_watch(&bridge, |w| w["last_patrol"] = json!(0));
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     let patrols: Vec<_> = bridge
@@ -820,7 +805,6 @@ fn a_patrol_that_finds_progress_and_nothing_else_is_recorded_without_a_wake() {
     assert_eq!(patrols[0]["detail"]["quiet"], true, "{patrols:?}");
     assert_eq!(observations(), 0, "{}", sent_text(&bridge));
 
-    // The same screen since the previous patrol, short of stuck: a wake.
     let now = chrono::Utc::now().timestamp();
     edit_watch(&bridge, |w| {
         w["last_patrol"] = json!(now - 70);
@@ -832,7 +816,6 @@ fn a_patrol_that_finds_progress_and_nothing_else_is_recorded_without_a_wake() {
     assert!(sent_text(&bridge).contains("1-minute check of main"));
     assert!(wakes(&bridge, &goal).len() == 1);
 
-    // A config default restores a wake on every patrol for new contracts.
     std::fs::create_dir_all(bridge.workspace.join(".hgm")).unwrap();
     std::fs::write(
         bridge.workspace.join(".hgm/config.yaml"),
@@ -844,7 +827,6 @@ fn a_patrol_that_finds_progress_and_nothing_else_is_recorded_without_a_wake() {
         bridge.ok(&["show", &always])["spec"]["loop"]["patrol_wake"],
         "always"
     );
-    // A stored contract without the field keeps the quiet default.
     assert!(
         bridge.ok(&["show", &goal])["spec"]["loop"]
             .get("patrol_wake")
@@ -884,15 +866,12 @@ fn watcher_patrols_a_working_agent_and_escalates_a_spent_time_budget() {
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.contains("1-minute check of main"), "{sent}");
-    // The first wake after an assignment carries it in full; the contract
-    // (invariants, stop conditions) stays one command away.
     let wake = &sent[sent.rfind("Goal Manager observation").unwrap()..];
     assert!(wake.contains("New assignment (full text):\nDraft the Q3 report"));
     assert!(wake.contains(&format!("Contract: hgm show {goal}")));
     assert!(!wake.contains("Keep the Q2 numbers"), "{wake}");
     assert!(kinds(&bridge, &goal).contains(&"patrol".to_string()));
 
-    // Age the first assignment past the one-hour budget.
     let events = state_directory(&bridge)
         .join("goals")
         .join(format!("{goal}.events.ndjson"));
@@ -937,7 +916,6 @@ fn handoff_threshold_follows_the_goal_loop_policy() {
             "work",
             "Refactor the module",
         ]);
-        // Codex footer: 30% left means 70% used.
         bridge.write(
             "target.screen",
             "Working on it\n› \n  gpt · Context 30% left · ~/work\n",
@@ -990,7 +968,6 @@ fn a_linked_send_waits_for_a_watch_step_and_types_nothing_past_the_bound() {
         json!({"objective":"Fix login copy","acceptance":["Copy updated"],
             "checks":[{"name":"copy","command":"true"}]}),
     );
-    // Another process (a watch step) holds the supervision lock for `time`.
     let lock = state_directory(&bridge).join("manager/t-original-operation.lock");
     let hold = |time: Duration| {
         let file = std::fs::OpenOptions::new()
@@ -1009,7 +986,6 @@ fn a_linked_send_waits_for_a_watch_step_and_types_nothing_past_the_bound() {
     let before = sent();
     let send = ["send", "--goal", &goal, "--task", "work", "Update the copy"];
 
-    // Past the bound the send fails before typing, names the lock and records nothing.
     let holder = hold(Duration::from_secs(14));
     let start = Instant::now();
     let output = bridge.call(&send);
@@ -1028,7 +1004,6 @@ fn a_linked_send_waits_for_a_watch_step_and_types_nothing_past_the_bound() {
     assert!(!kinds(&bridge, &goal).iter().any(|k| k == "assigned"));
     holder.join().unwrap();
 
-    // A short hold delays the send; it then types, records and arms the watch.
     let holder = hold(Duration::from_millis(1500));
     let start = Instant::now();
     let result = bridge.ok(&send);
@@ -1135,7 +1110,6 @@ fn watcher_stops_on_protected_paths_and_stop_checks_and_only_wakes_on_context_ro
             .extend(extra.as_object().unwrap().clone());
         spec
     };
-    // A protected path changes while the agent works.
     let bridge = Bridge::new();
     std::fs::create_dir_all(bridge.workspace.join("auth")).unwrap();
     std::fs::write(bridge.workspace.join("auth/keys.txt"), "v1").unwrap();
@@ -1151,7 +1125,6 @@ fn watcher_stops_on_protected_paths_and_stop_checks_and_only_wakes_on_context_ro
     );
     assert!(kinds(&bridge, &goal).contains(&"boundary_crossed".to_string()));
 
-    // A machine stop condition holds when the agent settles.
     let bridge = Bridge::new();
     let goal = confirmed(
         &bridge,
@@ -1168,8 +1141,6 @@ fn watcher_stops_on_protected_paths_and_stop_checks_and_only_wakes_on_context_ro
             .contains("Stop condition stop-file")
     );
 
-    // Two signs of context rot wake the manager once with the evidence; the
-    // manager decides on a handoff (`hgm handoff`), the watch does not.
     let bridge = Bridge::new();
     let goal = confirmed(&bridge, checked(json!({})));
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
@@ -1202,7 +1173,6 @@ fn watcher_stops_on_protected_paths_and_stop_checks_and_only_wakes_on_context_ro
     };
     assert_eq!(count("rot_signal"), 2, "{log}");
     assert_eq!(count("wake"), 1, "{log}");
-    // The same signs staying on screen neither wake again nor hand off.
     bridge.write(
         "target.screen",
         "You're absolutely right!\n$ cargo test\n$ cargo test\n$ cargo test\nmore\n› ",
@@ -1219,7 +1189,6 @@ fn watcher_stops_on_protected_paths_and_stop_checks_and_only_wakes_on_context_ro
     );
 }
 
-/// Opens Goal Manager from `pane`, whose tab is labelled `label`.
 fn open_from(bridge: &Bridge, pane: &str, label: &str) -> Output {
     bridge.write(
         "tab.json",
@@ -1234,7 +1203,6 @@ fn open_from(bridge: &Bridge, pane: &str, label: &str) -> Output {
         .unwrap()
 }
 
-/// The Goal Manager's pane closed with its agent: only other panes remain.
 fn close_manager(bridge: &Bridge) {
     for (name, list) in [("panes.json", "panes"), ("agents.json", "agents")] {
         let path = bridge.root.path().join(name);
@@ -1249,12 +1217,10 @@ fn close_manager(bridge: &Bridge) {
 
 #[test]
 fn goal_manager_opens_once_per_tab() {
-    // Bridge::new opened a manager in w1:p2 for the tab of w1:p1.
     let bridge = Bridge::new();
     let read =
         |name: &str| std::fs::read_to_string(bridge.root.path().join(name)).unwrap_or_default();
     let panels = || read("opened.txt").matches("\npanel\n").count();
-    // From the main tab, or the manager itself: switch to the running manager.
     for pane in ["w1:p1", "w1:p2"] {
         let output = open_from(&bridge, pane, "main");
         assert!(
@@ -1265,7 +1231,6 @@ fn goal_manager_opens_once_per_tab() {
     }
     assert_eq!(panels(), 0);
     assert_eq!(read("focused.txt"), "w1:t2\nw1:t2\n");
-    // From the Goal watch tab or a helper's tab: refused.
     let refused = open_from(&bridge, "w1:p1", "Goal watch");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("Goal watch tab"));
@@ -1274,7 +1239,6 @@ fn goal_manager_opens_once_per_tab() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("impl helper"));
     assert_eq!(panels(), 0);
 
-    // A second manager started directly for the same tab stops before launching.
     let mut panes: Value = serde_json::from_str(&read("panes.json")).unwrap();
     let mut second = panes["result"]["panes"][1].clone();
     second["pane_id"] = json!("w1:p3");
@@ -1298,7 +1262,6 @@ fn goal_manager_opens_once_per_tab() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("already open"));
     assert_eq!(read("context"), launched, "no second manager agent started");
 
-    // Once the manager has gone, opening starts a new one.
     close_manager(&bridge);
     assert!(open_from(&bridge, "w1:p1", "main").status.success());
     assert_eq!(panels(), 1);
@@ -1306,8 +1269,6 @@ fn goal_manager_opens_once_per_tab() {
 
 #[test]
 fn a_manager_still_starting_keeps_its_tab_and_a_refused_launch_leaves_no_context() {
-    // Bridge::new registered the manager in w1:p2 moments ago; Herdr does not
-    // show its agent yet. A second manager pane w1:p3 is about to launch.
     let bridge = Bridge::new();
     for (name, list) in [("panes.json", "panes"), ("agents.json", "agents")] {
         let path = bridge.root.path().join(name);
@@ -1342,11 +1303,9 @@ fn a_manager_still_starting_keeps_its_tab_and_a_refused_launch_leaves_no_context
         command
     };
     assert_eq!(contexts(), 1);
-    // A second press of the shortcut switches to the starting manager.
     assert!(open_from(&bridge, "w1:p1", "main").status.success());
     assert_eq!(read("opened.txt").matches("\npanel\n").count(), 0);
 
-    // A launch racing it waits for the tab's launch lease, then sees it.
     let lease = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1364,7 +1323,6 @@ fn a_manager_still_starting_keeps_its_tab_and_a_refused_launch_leaves_no_context
     let launched = read("context");
     assert_eq!(contexts(), 1, "a refused launch leaves no manager context");
 
-    // Past the start window, a pane that still shows no agent is no manager.
     let record = manager_dir(&bridge).join("t-original-manager.json");
     let mut value: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
     value["registered_at"] = json!(0);
@@ -1383,7 +1341,6 @@ fn a_manager_still_starting_keeps_its_tab_and_a_refused_launch_leaves_no_context
 fn opening_goal_manager_names_only_an_unnamed_original_tab() {
     for (label, renamed) in [("1", true), ("", true), ("api", false)] {
         let bridge = Bridge::new();
-        // The first open: no manager runs for the tab yet.
         close_manager(&bridge);
         let output = open_from(&bridge, "w1:p1", label);
         assert!(
@@ -1411,7 +1368,6 @@ fn provider_error_wakes_to_continue_but_a_usage_limit_goes_to_the_user_once() {
     );
     bridge.ok(&["supervise", &goal]);
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
-    // The watch types the fixed continue itself, within the hourly cap.
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(
         sent.starts_with("w1:p1\nContinue the current assignment"),
@@ -1436,6 +1392,7 @@ fn provider_error_wakes_to_continue_but_a_usage_limit_goes_to_the_user_once() {
         watch["held"].as_str().unwrap().contains("usage limit"),
         "{watch}"
     );
+    bridge.ok(&["note", &goal, "Still waiting on this limit"]);
     let inbox = bridge.ok(&["inbox"]);
     assert_eq!(inbox[0]["kind"], "agent_needs_you", "{inbox}");
 }
@@ -1473,7 +1430,6 @@ fn user_and_project_config_override_prompts_and_workflow_defaults() {
     assert!(arguments.contains("CUSTOM OPENER"));
     assert!(arguments.contains("test-model"));
 
-    // A goal's own loop wins; unset fields come from user then project defaults.
     let goal = add_file(
         &bridge,
         json!({"objective":"o","acceptance":["a"],"checks":[{"name":"c","command":"true"}],"loop":{"max_assignments":2}}),
@@ -1504,7 +1460,6 @@ fn user_and_project_config_override_prompts_and_workflow_defaults() {
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.contains("USER WAKE RULE"), "{sent}");
 
-    // A project may add to the guide but not replace it.
     std::fs::write(project.join("config.yaml"), "prompts: {manager: team.md}\n").unwrap();
     let refused = bridge.call(&["config"]);
     assert!(!refused.status.success());
@@ -1526,7 +1481,6 @@ fn correctable_goal(bridge: &Bridge) -> String {
 fn corrections_stay_within_budget_and_never_type_into_drafts_or_busy_codex() {
     let bridge = Bridge::new();
     let goal = correctable_goal(&bridge);
-    // Codex is not known to queue input typed during a turn: wait for it.
     bridge.inventory("working", "idle", "original");
     assert!(
         !bridge
@@ -1604,7 +1558,6 @@ fn a_correction_reaches_a_working_claude_only_through_an_empty_input() {
     };
     let goal = correctable_goal(&bridge);
     inventory("working");
-    // Panes other than w1:p1 read manager.screen in the fixture.
     bridge.write("manager.screen", "Editing parser.rs\n❯ ");
     let steered = run(&[
         "correct",
@@ -1728,7 +1681,6 @@ fn interrupting_send_reaches_a_working_claude_counts_and_confirms_consumption() 
     let goal = correctable_goal(&bridge);
     inventory("working");
     bridge.write("manager.screen", "Editing parser.rs\n❯ ");
-    // Without --interrupt a working agent is not disturbed.
     let plain = run(&[
         "send",
         "--goal",
@@ -1765,7 +1717,6 @@ fn interrupting_send_reaches_a_working_claude_counts_and_confirms_consumption() 
         .unwrap();
     assert_eq!(assigned["detail"]["interrupted"], true);
     assert_eq!(assigned["detail"]["consumed"], true);
-    // A draft, a dialog, or a blocked agent is never typed into.
     for (status, screen) in [
         ("working", "Editing\n❯ my own note"),
         ("working", "Do you want to run cargo test?\n❯ 1. Yes"),
@@ -1791,8 +1742,6 @@ fn a_running_copilot_listed_settled_is_working_and_takes_only_an_interrupt() {
     let bridge = Bridge::new();
     let goal = correctable_goal(&bridge);
     start_role(&bridge, "impl", "w1:p5", "copilot");
-    // Herdr lists the role settled while Copilot runs a tool; its input box is
-    // empty and the status line offers ctrl+c interrupt.
     bridge.write(
         "manager.screen",
         "○ Shell Wait 120 seconds\n  sleep 120\n╻▄▄▄▄\n┃\n╹▀▀▀▀\n ◎ Running bash · 53s ctrl+c interrupt Copilot Fusion\n",
@@ -1869,7 +1818,6 @@ fn compaction_on_screen_asks_the_manager_for_a_goal_check_and_reanchor_is_free()
             .iter()
             .any(|k| k == "compaction_detected")
     );
-    // The next tick sees the event and asks the manager (cooldown permitting).
     let watch = bridge.ok(&["watch"]);
     let pending = watch["pending"].as_str().unwrap_or_default().to_string();
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
@@ -1889,13 +1837,11 @@ fn compaction_on_screen_asks_the_manager_for_a_goal_check_and_reanchor_is_free()
     assert_eq!(reanchor["status"], "admitted", "{reanchor}");
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.contains("restate in at most 5 lines"), "{sent}");
-    // The restatement is recorded on the timeline, not only typed on screen.
     assert!(
         sent.contains("report ") && sent.contains("\"Goal restatement: ...\""),
         "{sent}"
     );
     assert!(kinds(&bridge, &goal).iter().any(|k| k == "reanchor"));
-    // Goal checks do not spend the assignment budget.
     for n in 0..9 {
         bridge.write("target.screen", "Done\n› ");
         bridge.ok(&["reanchor", &goal, "--task", "work", &format!("check {n}")]);
@@ -1934,9 +1880,10 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
     };
     let calls = || std::fs::read_to_string(root.join("worktree.txt")).unwrap_or_default();
 
-    // A branch that exists without a worktree is the person's call: refused.
     git(&repo, &["branch", "taken"]);
     let taken = add_file(&bridge, spec("taken", &root.join("unused")));
+    refused_with(&bridge, &["run", &taken], "confirm the goal");
+    assert_eq!(bridge.ok(&["show", &taken])["status"], "ready");
     let refused = bridge.call(&["confirm", &taken, "--evidence", "User: go"]);
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
@@ -1946,9 +1893,41 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
     assert!(bridge.ok(&["show", &taken])["confirmed"].is_null());
     assert!(calls().is_empty());
 
-    // Confirming creates the checkout as a Herdr worktree workspace.
     let goal = add_file(&bridge, spec("todo/copy", &checkout));
-    let shown = bridge.ok(&["confirm", &goal, "--evidence", "User: go"]);
+    let gate = root.join("hold-worktree");
+    std::fs::write(&gate, "").unwrap();
+    let confirming = bridge
+        .command(&["confirm", &goal, "--evidence", "User: go"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while calls().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "confirmation never reached checkout creation"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let replacing = bridge
+        .command(&[
+            "add",
+            "--replace",
+            &goal,
+            "Different contract",
+            "--criterion",
+            "Different result",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::remove_file(gate).unwrap();
+    let confirmed = confirming.wait_with_output().unwrap();
+    assert!(confirmed.status.success());
+    assert!(!replacing.wait_with_output().unwrap().status.success());
+    let shown: Value = serde_json::from_slice(&confirmed.stdout).unwrap();
     assert_eq!(
         shown["checkout"]["path"],
         checkout.to_str().unwrap(),
@@ -1961,7 +1940,6 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
         git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "todo/copy"
     );
-    // Another goal on the same branch reopens that worktree instead.
     let again = add_file(&bridge, spec("todo/copy", &root.join("elsewhere")));
     let reopened = bridge.ok(&["confirm", &again, "--evidence", "User: go"]);
     assert_eq!(
@@ -1970,7 +1948,6 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
     );
     assert_eq!(reopened["checkout"]["workspace_id"], "w8");
 
-    // Linked assignments say where to work; checks run there.
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "Fix the copy"]);
     let sent = std::fs::read_to_string(root.join("sent.txt")).unwrap();
     assert!(
@@ -1989,7 +1966,6 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
     );
     assert!(!bridge.workspace.join("where.txt").exists());
 
-    // Removal refuses a running watch, then uncommitted changes; nothing goes.
     let remove = || bridge.call(&["checkout", "remove", &goal]);
     let refused = remove();
     let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -2005,7 +1981,6 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
         "{stderr}"
     );
     assert!(checkout.exists() && !calls().contains("worktree remove"));
-    // Clean, it goes through Herdr without --force, and the branch stays.
     std::fs::remove_file(checkout.join("where.txt")).unwrap();
     let removed = bridge.ok(&["checkout", "remove", &goal]);
     assert!(removed["checkout"]["removed_at"].is_string(), "{removed}");
@@ -2017,7 +1992,6 @@ fn a_goal_checkout_is_a_herdr_worktree_where_work_and_checks_run() {
             .iter()
             .any(|k| k == "checkout_removed")
     );
-    // Later checks say the checkout is gone, not that a folder is missing.
     let resumed = bridge.call(&["resume", &goal]);
     let stderr = String::from_utf8_lossy(&resumed.stderr);
     assert!(
@@ -2060,7 +2034,6 @@ fn goals_on_one_pane_share_a_watch_and_a_waiting_goal_gets_no_wake() {
 
     let watch_path = state_directory(&bridge).join("manager/t-original-watch.json");
     let sent = bridge.root.path().join("sent.txt");
-    // Lets the worker settle on `screen` and returns the manager's wake, if any.
     let settle = |screen: &str| {
         let mut watch: Value =
             serde_json::from_slice(&std::fs::read(&watch_path).unwrap()).unwrap();
@@ -2072,13 +2045,11 @@ fn goals_on_one_pane_share_a_watch_and_a_waiting_goal_gets_no_wake() {
         assert!(bridge.call(&["watch-loop", "--once"]).status.success());
         std::fs::read_to_string(&sent).unwrap()[before..].to_string()
     };
-    // Wakes and settle checks follow the latest linked assignment to the pane.
     let wake = settle("Second assignment done\n› ");
     assert!(
         wake.contains(&second) && wake.contains("Second assignment") && !wake.contains(&first),
         "{wake}"
     );
-    // The budget line is the second goal's, the task the one sent last.
     assert!(wake.contains("Assignments for work: 1 of 7."), "{wake}");
     assert!(
         wake.contains(&format!("observation for {second}, task work")),
@@ -2087,8 +2058,6 @@ fn goals_on_one_pane_share_a_watch_and_a_waiting_goal_gets_no_wake() {
     assert!(kinds(&bridge, &second).iter().any(|k| k == "settle_checks"));
     assert!(!kinds(&bridge, &first).iter().any(|k| k == "settle_checks"));
 
-    // The first goal gets the newest assignment, then waits: it leaves the
-    // watch, and the next wake is about the second goal only.
     bridge.write("target.screen", "Finished output\n› ");
     bridge.inventory("idle", "idle", "original");
     bridge.ok(&[
@@ -2109,7 +2078,6 @@ fn goals_on_one_pane_share_a_watch_and_a_waiting_goal_gets_no_wake() {
     let wake = settle("Second assignment checked again\n› ");
     assert!(wake.contains(&second) && !wake.contains(&first), "{wake}");
 
-    // The last goal leaving ends the watch.
     bridge.ok(&["wait", &second, "--reason", "Ask the user"]);
     assert_eq!(bridge.ok(&["watch"])["active"], false);
 }
@@ -2130,22 +2098,17 @@ fn cancel_and_pause_end_watch_records_and_supervise_recovers_a_stale_one() {
     bridge.ok(&["pause", &second]);
     assert_eq!(bridge.ok(&["watch"])["active"], false);
 
-    // A just-armed watch may still be starting its process: not stale yet, so
-    // another goal for the same pane joins it.
     let third = bridge.goal();
     let fourth = bridge.goal();
     bridge.ok(&["supervise", &third]);
     let joined = bridge.ok(&["supervise", &fourth]);
     assert_eq!(joined["goals"], json!([third, fourth]), "{joined}");
-    // Later, no watch process holds the lease: the shared record is stale.
     age_watch(&bridge, 60);
     let watch = bridge.ok(&["supervise", &fourth]);
     assert_eq!(watch["goal"], fourth.as_str(), "{watch}");
     assert!(kinds(&bridge, &third).iter().any(|k| k == "watch_ended"));
 }
 
-/// Pins a helper role in the fixture: Herdr returns pane `pane` for the new
-/// tab, and the pane runs `agent` once started.
 fn start_role(bridge: &Bridge, kind: &str, pane: &str, agent: &str) -> Value {
     let tab = pane.replace(":p", ":t");
     bridge.write(
@@ -2165,7 +2128,6 @@ fn start_role(bridge: &Bridge, kind: &str, pane: &str, agent: &str) -> Value {
         "role-panes.json",
         &json!({"result":{"panes":panes,"agents":panes}}).to_string(),
     );
-    // Panes other than w1:p1 read manager.screen in the fixture.
     bridge.write("manager.screen", "Ready\n❯ ");
     bridge.ok(&["role", "start", kind, "--agent", agent])
 }
@@ -2200,7 +2162,6 @@ fn assignments_route_to_pinned_roles_one_owner_per_task() {
     );
     let launched = std::fs::read_to_string(bridge.root.path().join("started.txt")).unwrap();
     assert!(launched.contains("Bash(hgm report:*)"), "{launched}");
-    // The multi-line guide reaches Claude through a file, never as an argument.
     let guide = launched
         .lines()
         .skip_while(|line| *line != "--append-system-prompt-file")
@@ -2240,7 +2201,6 @@ fn assignments_route_to_pinned_roles_one_owner_per_task() {
     assert!(String::from_utf8_lossy(&taken.stderr).contains("belongs to impl"));
     bridge.ok(&["send", "--goal", &goal, "--task", "other", "Write the docs"]);
 
-    // An impl agent runs only show and report.
     let as_impl = |args: &[&str]| {
         bridge
             .command(args)
@@ -2264,7 +2224,6 @@ fn assignments_route_to_pinned_roles_one_owner_per_task() {
 
 #[test]
 fn codex_and_copilot_roles_start_with_single_line_arguments() {
-    // The fixture refuses line breaks in agent arguments, as Herdr does.
     let bridge = Bridge::new();
     let codex = start_role(&bridge, "impl", "w1:p5", "codex");
     assert_eq!(codex["agent"], "codex");
@@ -2272,8 +2231,6 @@ fn codex_and_copilot_roles_start_with_single_line_arguments() {
         start_role(&bridge, "reviewer", "w1:p6", "copilot")["agent"],
         "copilot"
     );
-    // Herdr types only `codex`; the launcher first on the tab's PATH carries
-    // the guide and environment, which exceed the shell's 1024-byte line.
     let launched = std::fs::read_to_string(bridge.root.path().join("started.txt")).unwrap();
     assert!(!launched.contains("developer_instructions"), "{launched}");
     let launcher = std::path::Path::new(codex["launcher"].as_str().unwrap());
@@ -2293,7 +2250,6 @@ fn codex_and_copilot_roles_start_with_single_line_arguments() {
 #[test]
 fn a_role_that_never_starts_closes_its_tab_and_one_that_runs_is_not_started_twice() {
     let bridge = Bridge::new();
-    // Copilot waits on its own folder-trust question: Herdr's start fails.
     bridge.write("fail-start", "");
     bridge.write(
         "tab-create.json",
@@ -2309,12 +2265,10 @@ fn a_role_that_never_starts_closes_its_tab_and_one_that_runs_is_not_started_twic
     );
     let closed = std::fs::read_to_string(bridge.root.path().join("closed.txt")).unwrap();
     assert_eq!(closed, "w1:t6\n");
-    // Only main is listed: the failed role was not registered.
     assert_eq!(
         bridge.ok(&["role", "list"]).as_array().map_or(0, Vec::len),
         1
     );
-    // Started for real, the role is not started a second time.
     std::fs::remove_file(bridge.root.path().join("fail-start")).unwrap();
     start_role(&bridge, "reviewer", "w1:p6", "claude");
     let again = bridge.call(&["role", "start", "reviewer", "--agent", "claude"]);
@@ -2372,10 +2326,22 @@ fn reviews_are_requested_from_a_reviewer_and_recorded_apart_from_work() {
     let blocking = r#"[{"severity":"blocking","where":"summary.json","issue":"total excludes tax","evidence":"1760 != 1936"}]"#;
     assert!(!submit("impl", "revise", blocking).status.success());
     assert!(!submit("reviewer", "approve", blocking).status.success());
-    // No watch follows the goal: the verdict reaches the person and, with its
-    // input free, the manager at once.
     bridge.write("manager.screen", "› ");
-    let output = submit("reviewer", "revise", blocking);
+    let output = std::thread::scope(|scope| {
+        let first = scope.spawn(|| submit("reviewer", "revise", blocking));
+        let second = submit("reviewer", "revise", blocking);
+        let first = first.join().unwrap();
+        assert_ne!(
+            first.status.success(),
+            second.status.success(),
+            "exactly one submission must succeed"
+        );
+        if first.status.success() {
+            first
+        } else {
+            second
+        }
+    });
     assert!(
         output.status.success(),
         "{}",
@@ -2418,7 +2384,6 @@ fn require_review_holds_run_until_another_provider_approves_the_current_state() 
     );
     bridge.ok(&["confirm", &goal, "--evidence", "User: go"]);
     std::fs::write(bridge.workspace.join("lib.rs"), "fn one() {}").unwrap();
-    // main runs Codex in the fixture, so it is the provider that worked.
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "Build it"]);
     bridge.ok(&["complete", &goal, "work", "--evidence", "Inspected lib.rs"]);
     let held = |command: &str| {
@@ -2436,7 +2401,6 @@ fn require_review_holds_run_until_another_provider_approves_the_current_state() 
             && message.contains(&format!("hgm resume {goal}")),
         "{message}"
     );
-    // Held before the checks: none ran.
     assert!(
         bridge.ok(&["show", &goal])["verifications"]
             .as_array()
@@ -2444,8 +2408,6 @@ fn require_review_holds_run_until_another_provider_approves_the_current_state() 
             .is_empty()
     );
 
-    // Both reviewers read manager.screen in the fixture: show each its own
-    // provider's input line.
     let review_by = |reviewer: &str, verdict: &str| {
         let prompt = if reviewer == "reviewer" {
             "› "
@@ -2478,7 +2440,6 @@ fn require_review_holds_run_until_another_provider_approves_the_current_state() 
     let same = review_by("reviewer", "approve");
     assert!(held("resume").contains(&format!("approving review {same} came from codex")));
 
-    // A second reviewer, on Claude Code, next to the first.
     let mut panes: Vec<Value> = serde_json::from_str::<Value>(
         &std::fs::read_to_string(bridge.root.path().join("panes.json")).unwrap(),
     )
@@ -2502,7 +2463,6 @@ fn require_review_holds_run_until_another_provider_approves_the_current_state() 
     ]);
     let other = review_by("second", "approve");
 
-    // The work dir changes after the verdict: it is stale everywhere.
     std::fs::write(bridge.workspace.join("lib.rs"), "fn one() { two() }").unwrap();
     let packet = bridge.ok(&["packet", &goal]);
     let fresh: Vec<&str> = packet["reviews"]
@@ -2533,8 +2493,6 @@ fn require_review_holds_run_until_another_provider_approves_the_current_state() 
     assert_eq!(row["review"]["fresh"], "stale");
     assert!(held("resume").contains(&format!("approving review {other} is stale")));
 
-    // A fresh approval from the other provider lets the checks run and the
-    // goal reach review; the verdict accepts nothing.
     let fresh_review = review_by("second", "approve");
     let ready = bridge.ok(&["resume", &goal]);
     assert_eq!(ready["status"], "ready_for_review", "{ready}");
@@ -2572,7 +2530,6 @@ fn writes_outside_a_tasks_write_paths_are_recorded_and_wake_the_manager_without_
         ),
         "{sent}"
     );
-    // The worker edits inside and outside its scope; nothing stops it.
     std::fs::write(bridge.workspace.join("src/lib.rs"), "fn a() { b() }").unwrap();
     std::fs::write(bridge.workspace.join("README.md"), "readme, edited").unwrap();
     let before = sent.len();
@@ -2603,8 +2560,6 @@ fn writes_outside_a_tasks_write_paths_are_recorded_and_wake_the_manager_without_
     );
     assert_eq!(packet["outside_write_paths"][0]["task"], "work");
 
-    // A task without write_paths gets the assignment text as before and no
-    // comparison.
     bridge.ok(&["complete", &goal, "work", "--evidence", "Parser done"]);
     let before = sent_text(&bridge).len();
     bridge.inventory("idle", "idle", "original");
@@ -2692,7 +2647,6 @@ fn queue_next_gives_each_goal_its_own_checkout_in_a_git_repository() {
         ),
     );
 
-    // A checkout that cannot be made fails its item; the next one is not held.
     git(&bridge.workspace, &["branch", &branch_of(&first)]);
     let failed = bridge.call(&["queue", "next"]);
     let stderr = String::from_utf8_lossy(&failed.stderr);
@@ -2736,7 +2690,6 @@ fn queue_next_gives_each_goal_its_own_checkout_in_a_git_repository() {
         sent_text(&bridge)
     );
 
-    // The contract's own checkout wins.
     let named = bridge.ok(&["queue", "next"]);
     assert_eq!(named["item"]["id"], third.as_str());
     assert_eq!(named["goal"]["checkout"]["branch"], "contract/own");
@@ -2753,7 +2706,6 @@ fn queue_next_gives_each_goal_its_own_checkout_in_a_git_repository() {
         .collect();
     assert_eq!(branches, ["-", branch_of(&second).as_str(), "contract/own"]);
 
-    // factory.checkout false keeps today's behaviour.
     config("factory: {enabled: true, max_active: 5, checkout: false}\n");
     queue("Fourth", "");
     let plain = bridge.ok(&["queue", "next"]);
@@ -2761,7 +2713,6 @@ fn queue_next_gives_each_goal_its_own_checkout_in_a_git_repository() {
     assert!(plain["item"].get("checkout").is_none());
 }
 
-/// Pipes `stdin` into hgm run as helper role `role`.
 fn as_role_with_input(bridge: &Bridge, role: &str, args: &[&str], stdin: &str) -> Output {
     let mut child = bridge
         .command(args)
@@ -2782,8 +2733,6 @@ fn as_role_with_input(bridge: &Bridge, role: &str, args: &[&str], stdin: &str) -
 
 #[test]
 fn every_refusal_names_its_next_step() {
-    // docs/design.md, principle 5: a refusal says what to do next. Each case
-    // pairs a refused command with the next step its message must name.
     let bridge = Bridge::new();
     let spec = |extra: Value| {
         let mut spec = json!({"objective":"o","acceptance":["a"],
@@ -2861,7 +2810,6 @@ fn a_refused_send_is_recorded_and_attention_accounting_reaches_packet_status_and
         json!({"objective":"Count attention","acceptance":["a"],
             "checks":[{"name":"c","command":"true"}]}),
     );
-    // Unconfirmed: the linked send is refused before anything is typed.
     refused_with(
         &bridge,
         &["send", "--goal", &goal, "--task", "work", "Build it"],
@@ -2884,7 +2832,6 @@ fn a_refused_send_is_recorded_and_attention_accounting_reaches_packet_status_and
     let summary = bridge.ok(&["attention"]);
     assert_eq!(summary[0]["id"], goal.as_str());
     assert_eq!(summary[0]["attention"]["corrections"], 0);
-    // Accounting decides nothing: the task is still open.
     assert_eq!(
         bridge.ok(&["show", &goal])["tasks"][0]["manual_evidence"],
         Value::Null
@@ -2896,7 +2843,6 @@ fn main_files_its_full_report_and_the_manager_reads_it_in_log_and_the_packet() {
     let bridge = Bridge::new();
     let goal = two_task_goal(&bridge);
     start_role(&bridge, "reviewer", "w1:p6", "claude");
-    // The assignment says how, with this build's path for main.
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "Build it"]);
     let sent = sent_text(&bridge);
     assert!(
@@ -2912,7 +2858,6 @@ fn main_files_its_full_report_and_the_manager_reads_it_in_log_and_the_packet() {
             .output()
             .unwrap()
     };
-    // A long report from a file, as main writes one, is kept in full.
     let body = format!(
         "Changed parser.rs and its tests.\n{}\nAC1: verified with cargo test.\nUnresolved: none.",
         "Detail line about the change.\n".repeat(60)
@@ -2951,11 +2896,8 @@ fn main_files_its_full_report_and_the_manager_reads_it_in_log_and_the_packet() {
     let packet = bridge.ok(&["packet", &goal]);
     assert_eq!(packet["reports"][0]["text"], body.trim());
     assert_eq!(packet["reports"][1]["task"], Value::Null);
-    // Nothing completes: the task is still open.
     assert_eq!(packet["tasks"][0]["done"], false);
 
-    // Refused, with nothing recorded: a reviewer, an unknown task, both forms,
-    // an over-long report.
     let reviewer = bridge
         .command(&["report", &goal, "Looks fine"])
         .env("HGM_ROLE", "reviewer")
@@ -2984,7 +2926,6 @@ fn main_files_its_full_report_and_the_manager_reads_it_in_log_and_the_packet() {
         2
     );
 
-    // `target --lines` returns Herdr's scrollback instead of the visible screen.
     bridge.write("target.screen", "…the end of the report\n› ");
     bridge.write(
         "target.recent",
@@ -3017,8 +2958,6 @@ fn workers_record_decisions_and_follow_ups_and_the_packet_gathers_them_apart_fro
         "{launched}"
     );
 
-    // Linked assignments say how to record: main gets this build by its path
-    // with the folder and state named; a helper has hgm on its PATH.
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "Build it"]);
     bridge.ok(&[
         "send", "--to", "impl", "--goal", &goal, "--task", "other", "Docs",
@@ -3045,7 +2984,6 @@ fn workers_record_decisions_and_follow_ups_and_the_packet_gathers_them_apart_fro
         "{sent}"
     );
 
-    // main (no role, no manager context), the manager and impl each record.
     let as_main = bridge
         .command(&[
             "decision",
@@ -3071,7 +3009,6 @@ fn workers_record_decisions_and_follow_ups_and_the_packet_gathers_them_apart_fro
         .output()
         .unwrap();
     assert!(impl_follow_up.status.success());
-    // A reviewer judges; it records no decisions of its own.
     let refused = bridge
         .command(&["decision", &goal, "x", "--why", "y"])
         .env("HGM_ROLE", "reviewer")
@@ -3102,9 +3039,6 @@ fn workers_record_decisions_and_follow_ups_and_the_packet_gathers_them_apart_fro
         );
     }
 
-    // Two reviews: advisory findings become follow-ups; blocking findings
-    // stand only until their reviewer's newer verdict. The watch of the goal
-    // carries each verdict to the manager.
     let mut reviews = vec![];
     for (verdict, findings) in [
         (
@@ -3172,7 +3106,6 @@ fn workers_record_decisions_and_follow_ups_and_the_packet_gathers_them_apart_fro
         .map(|r| r["verdict"].as_str().unwrap())
         .collect();
     assert_eq!(verdicts, ["revise", "approve"]);
-    // The check `c` never ran: that is not verified.
     assert_eq!(packet["checks"][0]["result"], "not_run");
     assert!(
         packet["not_verified"]
@@ -3193,7 +3126,6 @@ fn workers_record_decisions_and_follow_ups_and_the_packet_gathers_them_apart_fro
     assert_eq!(bridge.ok(&["show", &goal])["status"], "ready");
 }
 
-/// Writes the fixture's pane and agent inventory: worker `w1:p1`, manager `w1:p2`.
 fn write_inventory(root: &std::path::Path, worker: &str, manager: &str, terminal: &str) {
     let agents = json!([
         {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":terminal,"agent":"codex","agent_status":worker,"agent_session":{"value":"worker"},"focused":false},
@@ -3211,10 +3143,6 @@ fn write_inventory(root: &std::path::Path, worker: &str, manager: &str, terminal
     .unwrap();
 }
 
-/// A fake Herdr socket at the bridge's socket path. Every `events.subscribe`
-/// is confirmed; the agent-state subscription is handed to `state`, which may
-/// change the fixture, write events, or close the stream. Other connections
-/// stay open and silent until the listener's lifetime ends.
 fn fake_socket(
     bridge: &Bridge,
     state: impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static,
@@ -3262,11 +3190,8 @@ fn status_event(status: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// How long a test waits for a state another process records; slow CI hosts
-/// must not turn a late state into a failure.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Polls `probe` until it returns a value, failing after [`WAIT`].
 fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = std::time::Instant::now() + WAIT;
     loop {
@@ -3281,8 +3206,6 @@ fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// Runs a state-changing command, retrying while the state is busy: a running
-/// watch saving its record makes the CLI ask the caller to retry.
 fn ok_when_free(bridge: &Bridge, args: &[&str]) -> Value {
     eventually(&args.join(" "), || {
         let output = bridge.call(args);
@@ -3295,12 +3218,10 @@ fn ok_when_free(bridge: &Bridge, args: &[&str]) -> Value {
     })
 }
 
-/// The Herdr sidebar calls the fixture recorded.
 fn metadata(bridge: &Bridge) -> String {
     std::fs::read_to_string(bridge.root.path().join("metadata.txt")).unwrap_or_default()
 }
 
-/// Complete sidebar reports in `metadata`: each ends with the budget token.
 fn sidebar_reports(metadata: &str) -> usize {
     metadata.matches("\n--token\nbudget=").count()
 }
@@ -3315,7 +3236,6 @@ fn event_watch_reads_the_screen_on_each_change_so_a_dialog_reported_done_is_held
     let root = bridge.root.path().to_path_buf();
     let server = fake_socket(&bridge, move |stream| {
         std::thread::sleep(std::time::Duration::from_millis(700));
-        // Herdr reports `done` while an approval dialog is on screen.
         std::fs::write(
             root.join("target.screen"),
             "Create file\nDo you want to create summary.json?\n❯ 1. Yes\n  2. No",
@@ -3325,8 +3245,6 @@ fn event_watch_reads_the_screen_on_each_change_so_a_dialog_reported_done_is_held
         stream.write_all(&status_event("done")).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(4));
     });
-    // Polling would not look again within 3 s, and the reconcile waits 30 s:
-    // only the event can lead to the second read.
     let output = bridge.call(&["watch-loop", "--run-for-secs", "3"]);
     assert!(
         output.status.success(),
@@ -3348,7 +3266,6 @@ fn event_watch_reads_the_screen_on_each_change_so_a_dialog_reported_done_is_held
         !sent.lines().any(|line| line == "w1:p1"),
         "nothing is typed into the dialog: {sent}"
     );
-    // Held: the user was told; the manager is not woken while the dialog stays.
     assert!(
         !sent.lines().any(|line| line == "w1:p2"),
         "no wake while held: {sent}"
@@ -3383,7 +3300,6 @@ fn a_dialog_that_stays_while_the_state_moves_is_told_once() {
             .filter(|e| e["kind"] == "attention")
             .count()
     };
-    // Shown while working, then Herdr reports the pane blocked: one notice.
     observe("working", dialog);
     observe("blocked", dialog);
     assert_eq!(attentions(), 1);
@@ -3392,7 +3308,6 @@ fn a_dialog_that_stays_while_the_state_moves_is_told_once() {
             .as_str()
             .is_some_and(|held| held.contains("blocked"))
     );
-    // Answered: the worker runs again, so the next dialog is news.
     observe("working", "Running the check\n");
     observe("blocked", dialog);
     assert_eq!(attentions(), 2);
@@ -3410,7 +3325,6 @@ fn dropped_events_fall_back_to_polling_with_a_full_re_read() {
     let root = bridge.root.path().to_path_buf();
     let _server = fake_socket(&bridge, move |stream| {
         std::thread::sleep(std::time::Duration::from_millis(700));
-        // The worker finishes, but the stream ends without reporting it.
         std::fs::write(root.join("target.screen"), "Finished output\n› ").unwrap();
         write_inventory(&root, "done", "idle", "original");
         stream.shutdown(std::net::Shutdown::Both).unwrap();
@@ -3431,7 +3345,6 @@ fn dropped_events_fall_back_to_polling_with_a_full_re_read() {
         .collect();
     assert_eq!(modes.len(), 1, "{log}");
     assert_eq!(modes[0]["detail"]["mode"], "polling");
-    // The re-read right after the drop found the finished worker and woke the manager.
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
     assert!(sent.starts_with("w1:p2\n"), "{sent}");
     let log = bridge.ok(&["log", &goal]);
@@ -3454,7 +3367,6 @@ fn worker_pane_exit_ends_the_event_watch_and_tells_the_user() {
     let root = bridge.root.path().to_path_buf();
     let _server = fake_socket(&bridge, move |stream| {
         std::thread::sleep(std::time::Duration::from_millis(700));
-        // Only the manager remains.
         let manager = json!([{"pane_id":"w1:p2","tab_id":"w1:t2","terminal_id":"manager","agent":"codex","agent_status":"idle","agent_session":{"value":"manager"}}]);
         std::fs::write(
             root.join("panes.json"),
@@ -3499,7 +3411,6 @@ fn a_pause_ends_a_quiet_event_watch_within_seconds_and_clears_the_sidebar() {
     bridge.inventory("working", "idle", "original");
     bridge.write("target.screen", "Editing files\n› ");
     bridge.ok(&["supervise", &goal]);
-    // Herdr confirms the subscription and then stays quiet.
     let _server = fake_socket(&bridge, |_stream| {
         std::thread::sleep(std::time::Duration::from_secs(8));
     });
@@ -3514,7 +3425,6 @@ fn a_pause_ends_a_quiet_event_watch_within_seconds_and_clears_the_sidebar() {
     bridge.ok(&["pause", &goal]);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    // No event and no 30 s reconcile were needed to notice the end.
     assert!(
         paused.elapsed() < std::time::Duration::from_secs(4),
         "{:?}",
@@ -3534,7 +3444,6 @@ fn a_pane_gone_behind_a_status_event_still_ends_as_target_exited() {
     let root = bridge.root.path().to_path_buf();
     let _server = fake_socket(&bridge, move |stream| {
         std::thread::sleep(std::time::Duration::from_millis(700));
-        // The pane closed; Herdr's status event arrives before its exit event.
         let manager = json!([{"pane_id":"w1:p2","tab_id":"w1:t2","terminal_id":"manager","agent":"codex","agent_status":"idle","agent_session":{"value":"manager"}}]);
         for (name, list) in [("panes.json", "panes"), ("agents.json", "agents")] {
             std::fs::write(
@@ -3566,15 +3475,12 @@ fn watch_tab_and_sidebar_show_the_goal_and_the_end_clears_the_sidebar() {
     let bridge = Bridge::new();
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
-    // The pause below ends the watch at its next poll; the run limit only
-    // bounds a watch that never ends.
     let child = bridge
         .command(&["watch-loop", "--polling", "--run-for-secs", "30"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // While watching: the worker's sidebar carries the goal, state and budget.
     let shown = eventually("the sidebar report", || {
         let shown = metadata(&bridge);
         (sidebar_reports(&shown) > 0).then_some(shown)
@@ -3590,9 +3496,7 @@ fn watch_tab_and_sidebar_show_the_goal_and_the_end_clears_the_sidebar() {
     let tab = String::from_utf8_lossy(&output.stdout);
     assert!(tab.contains(&goal) && tab.contains("w1:p1"), "{tab}");
     assert!(tab.contains("polling"), "{tab}");
-    // Before the first assignment the whole budget is shown.
     assert!(tab.contains("assignments 0/"), "{tab}");
-    // After the end: why it ended and how to rearm, and a cleared sidebar.
     assert!(
         tab.contains("stopped_by_goal") && tab.contains(&format!("hgm supervise {goal}")),
         "{tab}"
@@ -3613,7 +3517,6 @@ fn a_reopened_manager_keeps_the_tab_watch_roles_and_pending_transfer() {
     );
     let requested = bridge.ok(&["handoff"]);
     let transfer = requested["id"].as_str().unwrap().to_string();
-    // State lives under the pinned terminal, not the manager context.
     let manager_dir = std::fs::read_dir(bridge.state.join("workspaces"))
         .unwrap()
         .next()
@@ -3628,7 +3531,6 @@ fn a_reopened_manager_keeps_the_tab_watch_roles_and_pending_transfer() {
         );
     }
 
-    // The user reopens Goal Manager from the same tab (a new manager context).
     let output = bridge.call(&["manager", "--agent", "claude"]);
     assert!(output.status.success());
     let reopened = std::fs::read_to_string(bridge.root.path().join("context")).unwrap();
@@ -3663,7 +3565,6 @@ fn manager_dir(bridge: &Bridge) -> PathBuf {
         .join("manager")
 }
 
-/// Holds the tab's watch lease like a running watch process.
 fn hold_watch_lease(bridge: &Bridge) -> std::fs::File {
     let lease = std::fs::OpenOptions::new()
         .create(true)
@@ -3675,7 +3576,6 @@ fn hold_watch_lease(bridge: &Bridge) -> std::fs::File {
     lease
 }
 
-/// Moves the tab's watch record `secs` into the past, past the start window.
 #[test]
 fn a_handoff_continues_after_its_watch_ended_and_reopens_a_watch_when_none_runs() {
     let bridge = Bridge::new();
@@ -3688,7 +3588,6 @@ fn a_handoff_continues_after_its_watch_ended_and_reopens_a_watch_when_none_runs(
             .count()
     };
     let before = monitors();
-    // The goal is paused: its watch ends, and no watch process runs.
     bridge.ok(&["pause", &goal]);
     age_watch(&bridge, 60);
     assert_eq!(bridge.ok(&["watch"])["active"], false);
@@ -3709,7 +3608,6 @@ fn a_handoff_continues_after_its_watch_ended_and_reopens_a_watch_when_none_runs(
         json!({"transfer":transfer["id"],"session":"worker","safe_to_restart":true}).to_string(),
     )
     .unwrap();
-    // The ended watch still advances the transfer.
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     assert_eq!(bridge.ok(&["handoff-status"])["phase"], "awaiting_exit");
     let sent = std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap();
@@ -3728,8 +3626,6 @@ fn a_network_error_wakes_the_manager_to_continue_and_repeated_stops_reach_the_pe
         assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     };
     let sent = || std::fs::read_to_string(bridge.root.path().join("sent.txt")).unwrap_or_default();
-    // 12:49 on 2026-11-15: the turn ended on a network error, not on finished
-    // work. The manager typed a continue at 13:00; the watch types it at once.
     observe("Writing summary.json\n⎿  API Error: Can't reach the API server (ENOTFOUND)\n› ");
     let typed = sent();
     assert!(
@@ -3754,14 +3650,11 @@ fn a_network_error_wakes_the_manager_to_continue_and_repeated_stops_reach_the_pe
             .unwrap()
             .contains("ENOTFOUND")
     );
-    // The next wake carries the record.
     observe("Continuing summary.json\nWrote summary.json\n› ");
     let wake = sent();
     let wake = &wake[typed.len()..];
     assert!(wake.contains("w1:p2\nGoal Manager observation"), "{wake}");
     assert!(wake.contains("provider_continue"), "{wake}");
-    // main stays settled short of completion with no next step: once it has
-    // been idle longer than watch.idle_notice_secs, the person hears, once.
     observe("Waiting for instructions\n› ");
     let attentions = || -> Vec<Value> {
         bridge
@@ -3787,7 +3680,6 @@ fn a_network_error_wakes_the_manager_to_continue_and_repeated_stops_reach_the_pe
     );
 }
 
-/// Moves the watched worker's idle stretch `secs` into the past.
 fn idle_watch(bridge: &Bridge, secs: i64) {
     let path = manager_dir(bridge).join("t-original-watch.json");
     let mut watch: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -3820,8 +3712,6 @@ fn a_spent_wake_budget_leaves_the_goal_waiting_for_the_person() {
     assert!(waiting, "the goal waits for the person");
 }
 
-/// Moves the tab's last wake out of the cooldown, so the next observation
-/// may wake the manager again.
 fn cool_watch(bridge: &Bridge) {
     let path = manager_dir(bridge).join("t-original-watch.json");
     let mut watch: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -3848,13 +3738,10 @@ fn an_unwatched_goal_stops_the_manager_once_and_supervise_reuses_a_starting_watc
             .count()
     };
     assert_eq!(opened(), 1);
-    // Re-arming while the watch process may still be starting opens no second tab.
     bridge.ok(&["supervise", &goal]);
     assert_eq!(opened(), 1);
-    // Starting: the manager may stop.
     assert_eq!(bridge.hook(json!({"stop_hook_active":false})), json!({}));
 
-    // The watch process is gone (closed tab, old build) but the record is active.
     age_watch(&bridge, 60);
     let blocked = bridge.hook(json!({"stop_hook_active":false}));
     assert_eq!(blocked["decision"], "block");
@@ -3865,9 +3752,7 @@ fn an_unwatched_goal_stops_the_manager_once_and_supervise_reuses_a_starting_watc
             .contains(&format!("hgm supervise {goal}")),
         "{blocked}"
     );
-    // Only once per stop.
     assert_eq!(bridge.hook(json!({"stop_hook_active":true})), json!({}));
-    // Rearming opens a new watch tab.
     bridge.ok(&["supervise", &goal]);
     assert_eq!(opened(), 2);
 }
@@ -3880,8 +3765,6 @@ fn a_new_watch_closes_the_ended_goal_watch_tab_so_one_remains() {
         |name: &str| std::fs::read_to_string(bridge.root.path().join(name)).unwrap_or_default();
     for (tab, label, closed) in [("w1:t9", "Goal watch", true), ("w1:t8", "api", false)] {
         bridge.ok(&["supervise", &goal]);
-        // The watch runs in its own tab, then a wait ends it; its tab stays on
-        // the end view.
         let output = bridge
             .command(&["watch-loop", "--polling", "--run-for-secs", "1"])
             .env("HERDR_TAB_ID", tab)
@@ -3900,7 +3783,6 @@ fn a_new_watch_closes_the_ended_goal_watch_tab_so_one_remains() {
         let opened = read("opened.txt").matches("monitor").count();
         bridge.ok(&["supervise", &goal]);
         assert_eq!(read("opened.txt").matches("monitor").count(), opened + 1);
-        // Only a tab that still shows the Goal watch is closed.
         assert_eq!(
             read("closed.txt").lines().any(|t| t == tab),
             closed,
@@ -3917,7 +3799,6 @@ fn a_redeployed_build_takes_over_the_running_watch() {
     bridge.inventory("working", "idle", "original");
     bridge.write("target.screen", "Editing files\n› ");
     bridge.ok(&["supervise", &goal]);
-    // The watch runs from a deployed copy, replaced like a deploy: temp + rename.
     let deployed = bridge.root.path().join("deployed");
     std::fs::create_dir(&deployed).unwrap();
     let program = deployed.join("hgm");
@@ -3927,21 +3808,16 @@ fn a_redeployed_build_takes_over_the_running_watch() {
     let _server = fake_socket(&bridge, move |stream| {
         let _ = subscribed.send(());
         if redeploy.recv_timeout(WAIT).is_ok() {
-            // Any state change wakes the loop, which then notices the new build.
             stream.write_all(&status_event("working")).unwrap();
         }
-        // The stream stays open until the test ends.
         let _ = redeploy.recv_timeout(WAIT);
     });
-    // The pause below ends the watch; the run limit only bounds a watch that
-    // never ends.
     let child = bridge
         .command_with(&program, &["watch-loop", "--run-for-secs", "30"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // A subscribed watch has already noted the build it runs from.
     subscription
         .recv_timeout(WAIT)
         .expect("the watch subscribes to Herdr events");
@@ -3955,7 +3831,6 @@ fn a_redeployed_build_takes_over_the_running_watch() {
             .any(|kind| kind == "watch_reloaded")
             .then_some(())
     });
-    // The new build shows the watch in the worker's sidebar again.
     eventually("the new build to report the sidebar", || {
         (sidebar_reports(&metadata(&bridge)) > 1).then_some(())
     });
@@ -3979,11 +3854,9 @@ fn a_redeployed_build_takes_over_the_running_watch() {
         .filter(|e| e["kind"] == "watch_reloaded")
         .cloned()
         .collect();
-    // Each replacement reloads once: the new build does not reload itself.
     assert_eq!(reloads.len(), 1, "{reloads:?}");
 }
 
-/// The user restarts the original agent in its tab: same pane, new session.
 fn restart_worker_session(bridge: &Bridge, session: &str) {
     for name in ["panes.json", "agents.json"] {
         let path = bridge.root.path().join(name);
@@ -4004,6 +3877,10 @@ fn a_session_the_user_restarted_is_adopted_only_on_request() {
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
     restart_worker_session(&bridge, "restarted-by-user");
+    edit_watch(
+        &bridge,
+        |w| w["native_goal"] = json!({"goal":goal,"assigned_at":"2026-11-18T00:00:00Z","set_at":1}),
+    );
     let refused = bridge.call(&["target"]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("target --adopt"));
@@ -4020,6 +3897,7 @@ fn a_session_the_user_restarted_is_adopted_only_on_request() {
     let adopted = bridge.ok(&["target", "--adopt", "User: continue the work in main"]);
     assert_eq!(adopted["adopted"]["goal"], goal.as_str());
     assert_eq!(adopted["binding"]["session"]["value"], "restarted-by-user");
+    assert!(bridge.ok(&["watch"])["native_goal"].is_null());
     assert_eq!(
         bridge.ok(&["watch"])["origin"]["session"]["value"],
         "restarted-by-user"
@@ -4038,7 +3916,6 @@ fn a_session_the_user_restarted_is_adopted_only_on_request() {
         restarted["detail"]["evidence"],
         "User: continue the work in main"
     );
-    // Adopting the bound session again changes nothing.
     assert!(
         bridge
             .ok(&["target", "--adopt", "again"])
@@ -4047,7 +3924,6 @@ fn a_session_the_user_restarted_is_adopted_only_on_request() {
     );
     bridge.ok(&["send", "Continue with the current step"]);
 
-    // A session in another tab is never adopted.
     bridge.inventory("idle", "idle", "replacement");
     assert!(
         !bridge
@@ -4084,7 +3960,6 @@ fn watch_state_saved_under_a_manager_context_moves_to_the_terminal() {
         .unwrap()
         .path()
         .join("manager");
-    // An earlier build kept the watch under the manager context.
     let legacy = manager_dir.join(format!("{}-watch.json", bridge.context));
     std::fs::rename(manager_dir.join("t-original-watch.json"), &legacy).unwrap();
     assert_eq!(bridge.ok(&["watch"])["active"], true);
@@ -4092,8 +3967,6 @@ fn watch_state_saved_under_a_manager_context_moves_to_the_terminal() {
     assert!(manager_dir.join("t-original-watch.json").exists());
 }
 
-/// A patrol and a settle wake for a contract and assignment the size of the
-/// ones managers wrote on 2026-11-14; returns the two wake texts.
 fn sample_wakes() -> (String, String, String) {
     let bridge = Bridge::new();
     let item = |n: usize| {
@@ -4143,7 +4016,6 @@ fn sample_wakes() -> (String, String, String) {
     watch["last_sent"] = json!(0);
     std::fs::write(&watch_path, watch.to_string()).unwrap();
     let settle = wake(&bridge);
-    // Nothing changes after the settle: the wake about an unchanged state.
     let mut watch: Value = serde_json::from_slice(&std::fs::read(&watch_path).unwrap()).unwrap();
     watch["last_sent"] = json!(0);
     watch["last_change"] = json!(chrono::Utc::now().timestamp() - 400);
@@ -4151,9 +4023,6 @@ fn sample_wakes() -> (String, String, String) {
     let unchanged = wake(&bridge);
     (patrol, settle, unchanged)
 }
-/// Wakes carry what changed: the assignment in full only on its first wake,
-/// and new screen lines only. docs/verification.md records the sizes
-/// (`cargo test --test bridge wakes_carry -- --nocapture` prints them).
 #[test]
 fn wakes_carry_the_full_assignment_once_and_only_new_lines() {
     let (patrol, settle, unchanged) = sample_wakes();
@@ -4163,8 +4032,6 @@ fn wakes_carry_the_full_assignment_once_and_only_new_lines() {
         settle.len(),
         unchanged.len()
     );
-    // A wake about a state that did not change carries no new output and no
-    // rule list (docs/design.md, principle 2): at most 1,000 bytes.
     assert!(
         unchanged.contains("no observed target change"),
         "{unchanged}"
@@ -4185,7 +4052,6 @@ fn wakes_carry_the_full_assignment_once_and_only_new_lines() {
             && !settle.contains("and report briefly."),
         "{settle}"
     );
-    // The settle wake quotes only the line added since the patrol.
     assert!(
         settle.contains("⏺ Done: committed.") && !settle.contains("Step 30:"),
         "{settle}"
@@ -4202,7 +4068,6 @@ fn wakes_carry_the_full_assignment_once_and_only_new_lines() {
     );
 }
 
-/// The inventory with the manager pane running `agent` in `state`.
 fn manager_inventory(bridge: &Bridge, worker: &str, agent: &str, state: &str) {
     let agents = json!([
         {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"original","agent":"codex","agent_status":worker,"agent_session":{"value":"worker"},"focused":false},
@@ -4244,7 +4109,6 @@ fn a_stop_after_new_work_reaches_a_busy_claude_manager_at_once_but_never_a_draft
     bridge.write("target.screen", "Editing summary.json\n› ");
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
     assert!(wakes(&bridge, &goal).is_empty(), "main is still working");
-    // A wake went out a moment ago: the cooldown would hold the next one.
     edit_watch(&bridge, |w| w["last_sent"] = json!(chrono_now()));
     manager_inventory(&bridge, "done", "claude", "working");
     bridge.write("target.screen", "Wrote summary.json\n› ");
@@ -4258,7 +4122,6 @@ fn a_stop_after_new_work_reaches_a_busy_claude_manager_at_once_but_never_a_draft
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["detail"]["via"], "queued", "{delivered:?}");
 
-    // The next stop meets a draft in the manager's input: nothing is typed.
     manager_inventory(&bridge, "working", "claude", "working");
     bridge.write("target.screen", "Checking totals\n› ");
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
@@ -4304,8 +4167,6 @@ fn idle_main_is_told_shown_and_supervise_retunes_the_running_watch() {
         "{notified}"
     );
 
-    // While the watch process runs (it holds the lease), status and inbox
-    // show the idle stretch.
     let lease = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -4330,7 +4191,6 @@ fn idle_main_is_told_shown_and_supervise_retunes_the_running_watch() {
         "{row}"
     );
 
-    // supervise on the running watch applies new timings, or says why not.
     let retuned = bridge.ok(&[
         "supervise",
         &goal,
@@ -4372,7 +4232,6 @@ fn chrono_now() -> i64 {
         .as_secs() as i64
 }
 
-/// A confirmed goal whose contract adds `extra` to one command check.
 fn confirmed_goal(bridge: &Bridge, check: &str, extra: Value) -> String {
     let mut spec = json!({"objective":"Fix login copy","acceptance":["Copy updated"],
         "checks":[{"name":"copy","command":check}]});
@@ -4442,7 +4301,6 @@ fn a_prepared_step_is_checked_at_once_and_can_be_replaced_or_withdrawn() {
         (first["status"].clone(), first["replaced"].clone()),
         (json!("prepared"), json!(false))
     );
-    // A second step queues behind the first; one can be withdrawn by place.
     let second = bridge.ok(&args(&prepare(&goal, "Write the totals and the tax")));
     assert_eq!(
         (second["replaced"].clone(), second["place"].clone()),
@@ -4548,6 +4406,13 @@ fn queued_steps_are_delivered_in_order_one_each_time_main_settles() {
         let before = sent_text(&bridge).len();
         assert!(bridge.call(&["watch-loop", "--once"]).status.success());
         let new = sent_text(&bridge)[before..].to_string();
+        let worker_inputs = sent_text(&bridge).matches("w1:p1\nGoal").count();
+        assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+        assert_eq!(
+            sent_text(&bridge).matches("w1:p1\nGoal").count(),
+            worker_inputs,
+            "a second observation of the same settle consumed a step"
+        );
         bridge.inventory("working", "idle", "original");
         bridge.write(
             "target.screen",
@@ -4578,7 +4443,6 @@ fn queued_steps_are_delivered_in_order_one_each_time_main_settles() {
         .collect();
     assert_eq!(assigned.len(), 2);
 
-    // A single step stored by an earlier build reads as a queue of one.
     let file = manager_dir(&bridge).join("t-original-prepared-main.json");
     std::fs::write(
         &file,
@@ -4604,7 +4468,6 @@ fn a_prepared_step_waits_while_a_check_regressed_and_a_direct_send_supersedes_it
     bridge.inventory("done", "idle", "original");
     bridge.write("target.screen", "Copy updated\n› ");
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
-    // The next work starts; a step is prepared; then the check breaks.
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "Polish the copy"]);
     bridge.inventory("working", "idle", "original");
     bridge.write("target.screen", "Polishing\n› ");
@@ -4634,7 +4497,6 @@ fn a_prepared_step_waits_while_a_check_regressed_and_a_direct_send_supersedes_it
         "{new}"
     );
     assert!(kinds(&bridge, &goal).contains(&"prepared_held".to_string()));
-    // The manager's own next assignment replaces the step.
     bridge.ok(&[
         "send",
         "--goal",
@@ -4715,7 +4577,6 @@ fn main_working_without_progress_wakes_the_manager_and_tells_the_person_once() {
         wake.contains("is working but has shown no progress for 3m"),
         "{wake}"
     );
-    // The wake says when the work dir last changed, as the timeline records.
     assert!(
         wake.contains("its working directory last changed at"),
         "{wake}"
@@ -4739,13 +4600,10 @@ fn main_working_without_progress_wakes_the_manager_and_tells_the_person_once() {
     );
 }
 
-/// A bridge whose original agent is Claude Code in pane w1:p1, run through
-/// its own manager context.
 struct ClaudeWorker {
     bridge: Bridge,
     context: String,
     origin: String,
-    /// The Goal Manager's agent and state (Codex and idle unless a test sets them).
     manager: std::cell::RefCell<(&'static str, &'static str)>,
 }
 impl ClaudeWorker {
@@ -4829,7 +4687,6 @@ fn a_new_contract_queues_the_native_goal_with_the_assignment_and_reads_it_back()
         "assignment"
     );
     worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
-    // Typed right behind the assignment, before the worker ever settled.
     let sent = sent_text(&worker.bridge);
     let assignment = sent.find("Update the copy").unwrap();
     let typed = sent
@@ -4841,7 +4698,6 @@ fn a_new_contract_queues_the_native_goal_with_the_assignment_and_reads_it_back()
         worker.events(&goal, "native_goal_set").is_empty(),
         "pending until read"
     );
-    // The worker shows `Goal set:` for this goal and task: now it is set.
     worker.step(
         "working",
         &format!(
@@ -4850,7 +4706,6 @@ fn a_new_contract_queues_the_native_goal_with_the_assignment_and_reads_it_back()
     );
     let set = worker.events(&goal, "native_goal_set");
     assert_eq!(set[0]["detail"]["via"], "queued", "{set:?}");
-    // When the native goal ends the worker settles: checks run, the manager wakes.
     worker.step("done", "✔ Goal achieved (9s · 1 turn · 924 tokens)\n❯ ");
     assert!(!worker.events(&goal, "settle_checks").is_empty());
     assert_eq!(
@@ -4861,13 +4716,11 @@ fn a_new_contract_queues_the_native_goal_with_the_assignment_and_reads_it_back()
     assert!(wakes.contains("the native goal reports met"), "{wakes}");
     assert_eq!(worker.goal_lines(), 1, "never typed twice");
 
-    // No `Goal set:` before the worker sits settled: uncertain, not replayed.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(&worker.bridge, "true", json!({}));
     worker.bridge.write("goal-pasted", "");
     worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
     assert_eq!(worker.events(&goal, "native_goal_queued").len(), 1);
-    // Just settled: the queued line may still be about to run, so it waits.
     worker.step("done", "Updated the copy\n❯ ");
     assert!(worker.events(&goal, "native_goal_set").is_empty());
     let now = chrono::Utc::now().timestamp();
@@ -4885,7 +4738,6 @@ fn a_new_contract_queues_the_native_goal_with_the_assignment_and_reads_it_back()
         "an uncertain set is never typed again"
     );
 
-    // A plan request gets no native goal.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(&worker.bridge, "true", json!({"loop":{"plan_first":true}}));
     worker.ok(&[
@@ -4902,10 +4754,6 @@ fn a_new_contract_queues_the_native_goal_with_the_assignment_and_reads_it_back()
 
 #[test]
 fn a_dialog_that_opens_while_the_settle_checks_run_gets_no_native_goal() {
-    // Natively (Claude Code 2.1.325, 2026-11-15) a dialog opened seconds after
-    // the turn ended, while hgm ran the settle checks, and the native goal
-    // typed from the earlier observation went into it. The check below opens
-    // the same dialog on the fake screen once, as that turn did.
     let worker = ClaudeWorker::new();
     worker.bridge.write(
         "dialog.screen",
@@ -4934,17 +4782,14 @@ fn a_dialog_that_opens_while_the_settle_checks_run_gets_no_native_goal() {
         sent_text(&worker.bridge)
     );
     assert!(!kinds(&worker.bridge, &goal).contains(&"native_goal_set".to_string()));
-    // Once the dialog is gone, the next observation sets the goal.
     worker.step("done", "Updated the copy\n❯ ");
     assert_eq!(worker.goal_lines(), 1, "{}", sent_text(&worker.bridge));
 }
 
-/// What a worker shows when a dialog opened after the watch's observation.
 const DIALOG_AFTER_READ: &str = "   Teach auto mode about your environment?\n   ❯ How you use Claude here     Mixed\n     Continue\n   ←/→ to change · Enter to continue · Esc to cancel\n";
 
 #[test]
 fn the_watch_reads_the_worker_again_before_typing_a_continue_or_a_clear() {
-    // A continue after a provider error: free when observed, a dialog when read again.
     let bridge = Bridge::new();
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
@@ -4970,7 +4815,6 @@ fn the_watch_reads_the_worker_again_before_typing_a_continue_or_a_clear() {
         "{log}"
     );
 
-    // A clear because a stop condition holds: the stop check ran since the observation.
     let (worker, goal) = ClaudeWorker::with_native_goal(
         json!({"loop":{"stop_checks":[{"name":"stop-file","command":"test -f STOP"}]}}),
     );
@@ -4986,7 +4830,6 @@ fn the_watch_reads_the_worker_again_before_typing_a_continue_or_a_clear() {
 
 #[test]
 fn input_that_the_worker_or_manager_did_not_take_is_recorded_as_uncertain() {
-    // The /goal line stayed in the input: not known to be set, so never cleared.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(
         &worker.bridge,
@@ -5010,9 +4853,15 @@ fn input_that_the_worker_or_manager_did_not_take_is_recorded_as_uncertain() {
     worker.state("done", "Updated the copy\n❯ ");
     worker.ok(&["wait", &goal, "--reason", "User decides"]);
     assert_eq!(worker.clears_typed(), 0, "{}", sent_text(&worker.bridge));
+    let typed = worker.goal_lines();
+    worker.ok(&["supervise", &goal]);
+    worker.step("done", "Updated the copy\n❯ ");
+    assert_eq!(
+        worker.goal_lines(),
+        typed,
+        "uncertain input was replayed after rearming"
+    );
 
-    // The line emptied but Claude Code took it as pasted text (over 800
-    // characters, measured 2026-11-16): no `Goal set:` answer, so not set.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(
         &worker.bridge,
@@ -5031,7 +4880,6 @@ fn input_that_the_worker_or_manager_did_not_take_is_recorded_as_uncertain() {
     );
     assert_eq!(set[0]["detail"]["delivery"], "uncertain", "{set:?}");
 
-    // A wake left in the manager's input is recorded as unconfirmed.
     let bridge = Bridge::new();
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
@@ -5082,7 +4930,6 @@ fn a_native_goal_is_set_after_an_assignment_read_as_an_observation_and_cleared_o
     );
     assert!(line.chars().count() < 4_000);
     assert!(kinds(&worker.bridge, &goal).contains(&"native_goal_set".to_string()));
-    // The goal drives the worker; then the evaluator reports it met.
     worker.step(
         "working",
         "Working toward the goal\n◎ /goal active (12s)\n❯ ",
@@ -5106,7 +4953,6 @@ fn a_native_goal_is_set_after_an_assignment_read_as_an_observation_and_cleared_o
     assert!(worker.ok(&["show", &goal])["native_goal"]["outcome"] == "met");
     let wakes = sent_text(&worker.bridge);
     assert!(wakes.contains("the native goal reports met"), "{wakes}");
-    // A plan request never gets a native goal.
     worker.ok(&[
         "send",
         "--goal",
@@ -5119,7 +4965,6 @@ fn a_native_goal_is_set_after_an_assignment_read_as_an_observation_and_cleared_o
     worker.step("working", "Planning\n❯ ");
     worker.step("done", "Plan written\n❯ ");
     assert_eq!(worker.goal_lines(), 1);
-    // The next assignment gets one; waiting for the person clears it.
     worker.ok(&["send", "--goal", &goal, "--task", "work", "Polish the copy"]);
     worker.step("working", "Polishing\n❯ ");
     worker.step("done", "Polished\n❯ ");
@@ -5183,11 +5028,8 @@ fn no_native_goal_for_codex_or_when_the_contract_turns_it_off() {
 }
 
 impl ClaudeWorker {
-    /// A confirmed goal (contract plus `extra`) whose first assignment ran,
-    /// so the watch has set its native goal on the settled worker.
     fn with_native_goal(mut extra: Value) -> (Self, String) {
         let worker = Self::new();
-        // These cases cover the setting after the first settle (`settle`).
         let policy = extra
             .as_object_mut()
             .unwrap()
@@ -5240,7 +5082,6 @@ fn pausing_or_cancelling_a_goal_clears_its_native_goal() {
 fn a_handoff_clears_the_native_goal_before_anything_else() {
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     let before = sent_text(&worker.bridge);
-    // Whether the handoff itself can go on is not the point here.
     worker.run(&["handoff"]);
     let after = sent_text(&worker.bridge)[before.len()..].to_string();
     assert!(after.starts_with("w1:p1\n/goal clear\n"), "{after}");
@@ -5257,7 +5098,6 @@ fn a_stop_condition_protected_path_or_spent_budget_clears_the_native_goal_first(
         let from = all.iter().position(|k| k == "native_goal_set").unwrap();
         all[from..].to_vec()
     };
-    // A machine stop condition holds.
     let (worker, goal) = ClaudeWorker::with_native_goal(
         json!({"loop":{"stop_checks":[{"name":"stop-file","command":"test -f STOP"}]}}),
     );
@@ -5276,7 +5116,6 @@ fn a_stop_condition_protected_path_or_spent_budget_clears_the_native_goal_first(
     let stopped = order.iter().position(|k| k == "stop_condition").unwrap();
     assert!(cleared < stopped, "{order:?}");
 
-    // A protected path changes.
     let worker = ClaudeWorker::new();
     std::fs::create_dir_all(worker.bridge.workspace.join("auth")).unwrap();
     std::fs::write(worker.bridge.workspace.join("auth/keys.txt"), "v1").unwrap();
@@ -5303,7 +5142,6 @@ fn a_stop_condition_protected_path_or_spent_budget_clears_the_native_goal_first(
     let crossed = order.iter().position(|k| k == "boundary_crossed").unwrap();
     assert!(cleared < crossed, "{order:?}");
 
-    // The watch's wake budget is spent.
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     edit_watch(&worker.bridge, |w| w["max_wakes"] = w["wakes"].clone());
     worker.step("done", "Still updated\n❯ ");
@@ -5337,7 +5175,6 @@ fn a_working_worker_gets_the_clear_as_queued_input_but_never_into_a_draft() {
 
 #[test]
 fn an_uncertain_set_or_clear_is_recorded_and_never_replayed() {
-    // Setting: the prompt into main fails; it is recorded once, not retried.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(
         &worker.bridge,
@@ -5361,8 +5198,6 @@ fn an_uncertain_set_or_clear_is_recorded_and_never_replayed() {
     assert_eq!(set.len(), 1);
     assert_eq!(set[0]["detail"]["delivery"], "uncertain");
 
-    // Clearing: the prompt fails; the pause goes on, the clear is recorded
-    // once and the watch does not type it again.
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     worker.bridge.write("fail-send-w1:p1", "");
     worker.ok(&["pause", &goal]);
@@ -5375,7 +5210,6 @@ fn an_uncertain_set_or_clear_is_recorded_and_never_replayed() {
     assert_eq!(worker.ok(&["show", &goal])["control"], "pause");
 }
 
-/// The manager's own `/goal` lines typed into its pane (w1:p2).
 fn manager_goal_lines(bridge: &Bridge) -> usize {
     sent_text(bridge)
         .matches("w1:p2\n/goal hgm Goal Manager (")
@@ -5384,7 +5218,6 @@ fn manager_goal_lines(bridge: &Bridge) -> usize {
 fn manager_clears(bridge: &Bridge) -> usize {
     sent_text(bridge).matches("w1:p2\n/goal clear").count()
 }
-/// The status row of `goal`.
 fn status_row(worker: &ClaudeWorker, goal: &str) -> Value {
     worker
         .ok(&["status"])
@@ -5395,8 +5228,6 @@ fn status_row(worker: &ClaudeWorker, goal: &str) -> Value {
         .cloned()
         .unwrap()
 }
-/// A tab whose Goal Manager runs Claude Code (working, empty input) and whose
-/// confirmed goal was sent to main, with the manager's goal read back as set.
 fn claude_manager_with_goal() -> (ClaudeWorker, String) {
     let worker = ClaudeWorker::new();
     *worker.manager.borrow_mut() = ("claude", "working");
@@ -5418,7 +5249,6 @@ fn a_claude_manager_gets_its_own_goal_while_a_confirmed_goal_runs() {
     let goal = confirmed_goal(&worker.bridge, "true", json!({}));
     worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
     worker.step("working", "Editing the copy\n❯ ");
-    // Queued into the working manager's empty input, pending until read back.
     assert_eq!(
         manager_goal_lines(&worker.bridge),
         1,
@@ -5439,7 +5269,6 @@ fn a_claude_manager_gets_its_own_goal_while_a_confirmed_goal_runs() {
         status_row(&worker, &goal)["manager_goal"],
         json!({"set": true, "outcome": "pending", "guarded": false})
     );
-    // Its own `Goal set:` shows: set. Both native goals are displayed.
     worker.step("working", "Editing the copy\n❯ ");
     let set = worker.events(&goal, "manager_goal_set");
     assert_eq!(set.len(), 2, "{set:?}");
@@ -5454,7 +5283,6 @@ fn a_claude_manager_gets_its_own_goal_while_a_confirmed_goal_runs() {
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_goal_lines(&worker.bridge), 1, "set once");
 
-    // The goal waits for the person: none is in progress, so it is cleared.
     worker.ok(&["wait", &goal, "--reason", "Which audience?"]);
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_clears(&worker.bridge), 1);
@@ -5466,7 +5294,6 @@ fn a_claude_manager_gets_its_own_goal_while_a_confirmed_goal_runs() {
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_clears(&worker.bridge), 1, "cleared once");
 
-    // `manager.native_goal: false` turns it off.
     let worker = ClaudeWorker::new();
     *worker.manager.borrow_mut() = ("claude", "working");
     worker.bridge.write("manager.screen", "✻ Thinking…\n❯ ");
@@ -5483,14 +5310,12 @@ fn a_claude_manager_gets_its_own_goal_while_a_confirmed_goal_runs() {
     assert_eq!(manager_goal_lines(&worker.bridge), 0);
     assert!(status_row(&worker, &goal).get("manager_goal").is_none());
 
-    // Another provider's manager: nothing is read or typed for it.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(&worker.bridge, "true", json!({}));
     worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
     worker.step("working", "Editing the copy\n❯ ");
     assert!(!sent_text(&worker.bridge).contains("w1:p2\n/goal"));
 
-    // A manager with a draft in its input gets nothing typed.
     let worker = ClaudeWorker::new();
     *worker.manager.borrow_mut() = ("claude", "working");
     worker
@@ -5508,7 +5333,6 @@ fn the_spin_guard_clears_a_manager_goal_that_continues_with_no_await_once() {
     let (worker, goal) = claude_manager_with_goal();
     let lock_path = manager_dir(&worker.bridge).join("t-original-await.lock");
     let spinning = "◯ Goal not yet met… continuing\n⏺ Nothing new.\n◯ Goal not yet met… continuing\n⏺ Nothing new.\n◯ Goal not yet met… continuing\n✻ Thinking…\n❯ ";
-    // Continuations while an await runs are not spinning.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -5520,14 +5344,12 @@ fn the_spin_guard_clears_a_manager_goal_that_continues_with_no_await_once() {
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_clears(&worker.bridge), 0);
     drop(lock);
-    // A quoted worker continuation (indented) is not the manager's.
     worker.bridge.write(
         "manager.screen",
         &format!("{spinning}\n  ⎿  ◯ Goal not yet met… continuing\n❯ "),
     );
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_clears(&worker.bridge), 0);
-    // Three more with no await and no manager action: cleared once, told.
     worker.bridge.write(
         "manager.screen",
         &format!("{spinning}\n{spinning}\n  ⎿  quoted\n❯ "),
@@ -5547,14 +5369,12 @@ fn the_spin_guard_clears_a_manager_goal_that_continues_with_no_await_once() {
         "manager_goal_spinning"
     );
     assert_eq!(status_row(&worker, &goal)["manager_goal"]["guarded"], true);
-    // Not set again for this manager session, even after a manager action.
     worker.ok(&["correct", &goal, "--task", "work", "Keep to the copy"]);
     worker.step("working", "Editing the copy\n❯ ");
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_goal_lines(&worker.bridge), 1);
     assert_eq!(manager_clears(&worker.bridge), 1);
 
-    // A manager action between continuations resets the count.
     let (worker, goal) = claude_manager_with_goal();
     worker.bridge.write("manager.screen", spinning);
     worker.ok(&["correct", &goal, "--task", "work", "Keep to the copy"]);
@@ -5567,7 +5387,6 @@ fn a_running_await_takes_the_wake_past_a_draft_and_prints_it() {
     let bridge = Bridge::new();
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
-    // The user's draft sits in the manager's input: typing would wait.
     bridge.write("manager.screen", "› user's unfinished draft");
     let waiting = bridge
         .command(&["await", "--timeout", "30"])
@@ -5601,14 +5420,12 @@ fn a_running_await_takes_the_wake_past_a_draft_and_prints_it() {
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["detail"]["via"], "await");
 
-    // With nothing to hand over, it returns when its time is up.
     edit_watch(&bridge, |w| {
         w["last_observation_at"] = json!(0);
         w["last_change"] = json!(chrono_now());
     });
     let timeout = bridge.ok(&["await", "--timeout", "1"]);
     assert_eq!(timeout["ended"], "timeout", "{timeout}");
-    // Once the watch has ended, it says so at once.
     bridge.ok(&["wait", &goal, "--reason", "Which audience?"]);
     let ended = bridge.ok(&["await", "--timeout", "30"]);
     assert_eq!(ended["ended"], "watch_ended", "{ended}");
@@ -5623,15 +5440,12 @@ fn a_manager_goal_that_ended_where_hgm_did_not_see_it_is_read_from_the_indicator
     edit_watch(&worker.bridge, |w| {
         w["manager_goal"]["set_at"] = json!(past)
     });
-    // Still set: the indicator shows above the input line.
     worker.bridge.write(
         "manager.screen",
         "⏺ 待機\n✻ Crunched for 2s · done 3:05 AM\n    ◎ /goal active (12s)\n────\n❯ \n────\n",
     );
     worker.step("working", "Editing the copy\n❯ ");
     assert!(worker.events(&goal, "manager_goal").is_empty());
-    // Natively a queued goal met at the stop that ran it: the outcome shows
-    // above the echoed `Goal set:` and no indicator remains.
     worker.bridge.write(
         "manager.screen",
         "⏺ 待機\n✔ Goal achieved (4s · 1 turn · 647 tokens)\n✻ Sautéed for 5s · done 3:05 AM\n❯ Goal set: hgm Goal Manager (03:05:34): done when hgm status shows\n⏺ 待機\n✻ Crunched for 2s · done 3:05 AM\n────\n❯ \n────\n",
@@ -5645,7 +5459,6 @@ fn a_manager_goal_that_ended_where_hgm_did_not_see_it_is_read_from_the_indicator
         false,
         "the display follows"
     );
-    // Not typed again until the manager acts.
     worker.step("working", "Editing the copy\n❯ ");
     assert_eq!(manager_goal_lines(&worker.bridge), 1);
 }
@@ -5656,12 +5469,9 @@ fn a_worker_goal_met_at_the_stop_that_ran_it_is_read_from_the_indicator() {
     let goal = confirmed_goal(&worker.bridge, "true", json!({}));
     worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
     let past = chrono_now() - 60;
-    // The queued goal ran at the end of the assignment's turn and was met at
-    // once: its outcome shows above the echoed `Goal set:`, no indicator.
     let met = format!(
         "⏺ Updated the copy.\n✔ Goal achieved (4s · 1 turn · 647 tokens)\n✻ Sautéed for 5s · done 3:05 AM\n❯ Goal set: hgm goal {goal} task work: the assigned work is done\n⏺ Done.\n────\n❯ \n────\n"
     );
-    // While the indicator still shows, the goal is set.
     worker.step(
         "done",
         &met.replace("⏺ Done.\n", "⏺ Done.\n    ◎ /goal active (4s)\n"),
@@ -5676,7 +5486,6 @@ fn a_worker_goal_met_at_the_stop_that_ran_it_is_read_from_the_indicator() {
         &met.replace("⏺ Done.\n", "⏺ Done.\n    ◎ /goal active (4s)\n"),
     );
     assert!(worker.events(&goal, "native_goal").is_empty());
-    // Without it, the end is recorded as met, from the line above the set.
     worker.step("done", &met);
     let ended = worker.events(&goal, "native_goal");
     assert_eq!(ended.len(), 1, "{ended:?}");
@@ -5693,7 +5502,6 @@ fn a_worker_goal_met_at_the_stop_that_ran_it_is_read_from_the_indicator() {
     assert_eq!(worker.goal_lines(), 1, "never typed again");
 }
 
-/// Holds `<key>-operation.lock` as a watch step does.
 fn hold_operation_lock(bridge: &Bridge) -> std::fs::File {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -5707,8 +5515,6 @@ fn hold_operation_lock(bridge: &Bridge) -> std::fs::File {
 
 #[test]
 fn a_quiet_patrol_still_runs_the_stop_checks() {
-    // CX-6: under patrol_wake finding a progressing patrol wakes nobody; the
-    // stop checks must run all the same.
     let bridge = Bridge::new();
     let stop = bridge.root.path().join("STOP");
     let spec = json!({"objective":"Long report","acceptance":["Report covers Q3"],
@@ -5744,8 +5550,6 @@ fn a_quiet_patrol_still_runs_the_stop_checks() {
 
 #[test]
 fn a_native_goal_a_draft_kept_from_clearing_is_cleared_after_the_watch_ends() {
-    // CX-1: a stop ends the watch at once; the ended watch clears the goal
-    // once main's input is free, never into the draft.
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     worker.state("done", "Updated the copy\n❯ half-typed note");
     let paused = worker.run(&["pause", &goal]);
@@ -5768,7 +5572,6 @@ fn a_native_goal_a_draft_kept_from_clearing_is_cleared_after_the_watch_ends() {
 
 #[test]
 fn a_native_goal_is_not_cleared_in_a_session_the_user_started_since() {
-    // CX-2: the pane now runs another session than the bound one.
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     let panes = json!([
         {"pane_id":"w1:p1","tab_id":"w1:t1","terminal_id":"replacement","agent":"claude","agent_status":"idle","focused":false},
@@ -5790,7 +5593,6 @@ fn a_native_goal_is_not_cleared_in_a_session_the_user_started_since() {
 
 #[test]
 fn a_stop_reads_the_watch_again_under_the_lease() {
-    // CX-3: what a watch step saved while the stop waited for the lease stays.
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     let lock = hold_operation_lock(&worker.bridge);
     let pausing = worker
@@ -5821,8 +5623,6 @@ fn a_stop_reads_the_watch_again_under_the_lease() {
 
 #[test]
 fn a_direct_send_waits_while_a_watch_step_holds_the_lease() {
-    // CX-4: the manager's own delivery and the watch's prepared step never
-    // type at once.
     let bridge = Bridge::new();
     let goal = bridge.goal();
     bridge.ok(&["supervise", &goal]);
@@ -5850,7 +5650,6 @@ fn a_direct_send_waits_while_a_watch_step_holds_the_lease() {
 
 #[test]
 fn a_prepared_step_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
-    // CX-5: a step marked as being typed when the watch stopped is uncertain.
     let bridge = Bridge::new();
     let goal = confirmed_goal(&bridge, "true", json!({}));
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
@@ -5872,7 +5671,6 @@ fn a_prepared_step_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
     bridge.inventory("done", "idle", "original");
     bridge.write("target.screen", "First step done\n› ");
     assert!(bridge.call(&["watch-loop", "--once"]).status.success());
-    // The wake to the manager (w1:p2) may quote the step; main never gets it.
     assert!(
         !delivered(&bridge, &goal, "Second step"),
         "never typed into main again: {}",
@@ -5895,8 +5693,6 @@ fn a_prepared_step_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
 
 #[test]
 fn a_native_goal_a_stop_left_set_is_cleared_by_the_next_watch_of_the_pane() {
-    // CX-1, rest: a watch armed again before the ending one cleared main's
-    // goal carries it, and clears it since its goal is not watched any more.
     let (worker, a) = ClaudeWorker::with_native_goal(json!({}));
     worker.state("done", "Updated the copy\n❯ half-typed note");
     assert!(worker.run(&["pause", &a]).status.success());
@@ -5918,8 +5714,6 @@ fn a_native_goal_a_stop_left_set_is_cleared_by_the_next_watch_of_the_pane() {
 
 #[test]
 fn the_ending_watch_waits_for_the_operation_lease_before_the_watch_lease() {
-    // CX2-1: while `supervise` holds the operation lease to start a new watch,
-    // the ending watch holds nothing the new one needs.
     let (worker, goal) = ClaudeWorker::with_native_goal(json!({}));
     worker.state("done", "Updated the copy\n❯ half-typed note");
     assert!(worker.run(&["pause", &goal]).status.success());
@@ -5943,15 +5737,11 @@ fn the_ending_watch_waits_for_the_operation_lease_before_the_watch_lease() {
     assert!(watch_lock.try_lock().is_ok(), "the watch lease stays free");
     drop(watch_lock);
     drop(lock);
-    // A one-off run that met a held operation lease exits with an error; the
-    // point is what it held while it waited.
     let _ = draining.wait_with_output().unwrap();
 }
 
 #[test]
 fn after_an_uncertain_prepared_step_the_next_waits_for_the_manager() {
-    // CX2-2 and CX2-3: the marker is written before the step is typed, and
-    // after an uncertain delivery the next step waits.
     let bridge = Bridge::new();
     let goal = confirmed_goal(&bridge, "true", json!({}));
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
@@ -5980,7 +5770,6 @@ fn after_an_uncertain_prepared_step_the_next_waits_for_the_manager() {
         at_prompt[0]["sending_at"].is_string(),
         "marked before typing: {at_prompt}"
     );
-    // Two more; the first was being typed when the watch stopped.
     std::fs::remove_file(bridge.root.path().join("snapshot-prepared")).unwrap();
     bridge.inventory("working", "idle", "original");
     bridge.write("target.screen", "Working on the second\n› ");
@@ -6017,7 +5806,6 @@ fn after_an_uncertain_prepared_step_the_next_waits_for_the_manager() {
 
 #[test]
 fn a_direct_send_is_admitted_under_the_lease_it_waits_for() {
-    // CX2-4: an assignment the watch delivered while the send waited counts.
     let bridge = Bridge::new();
     let goal = confirmed_goal(&bridge, "true", json!({"loop":{"max_assignments":2}}));
     bridge.ok(&["send", "--goal", &goal, "--task", "work", "First step"]);
@@ -6032,7 +5820,6 @@ fn a_direct_send_is_admitted_under_the_lease_it_waits_for() {
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    // Meanwhile the watch delivered a prepared step for the same task.
     let text = std::fs::read_to_string(&events).unwrap();
     let assigned = text
         .lines()
@@ -6050,7 +5837,6 @@ fn a_direct_send_is_admitted_under_the_lease_it_waits_for() {
 
 #[test]
 fn a_shared_goals_prepared_step_is_held_at_its_own_boundary() {
-    // CX2-5: the step's goal has its own protected paths, checked before it goes.
     let bridge = Bridge::new();
     let a = confirmed_goal(&bridge, "true", json!({}));
     std::fs::create_dir_all(bridge.workspace.join("secret")).unwrap();
@@ -6096,7 +5882,6 @@ fn a_shared_goals_prepared_step_is_held_at_its_own_boundary() {
 
 #[test]
 fn a_stop_condition_comes_before_a_native_goal_set_at_settle() {
-    // CX2-6: under `settle`, the /goal would start new work.
     let worker = ClaudeWorker::new();
     let stop = worker.bridge.root.path().join("STOP");
     let goal = confirmed_goal(
@@ -6113,8 +5898,6 @@ fn a_stop_condition_comes_before_a_native_goal_set_at_settle() {
     assert!(worker.events(&goal, "stop_condition").len() == 1);
 }
 
-/// Whether the watch or a send delivered `text` to main as a linked
-/// assignment of `goal`'s task work (its delivered form).
 fn delivered(bridge: &Bridge, goal: &str, text: &str) -> bool {
     sent_text(bridge).contains(&format!(
         "w1:p1\nGoal {goal}, work, assigned to main.\n{text}"
@@ -6123,8 +5906,6 @@ fn delivered(bridge: &Bridge, goal: &str, text: &str) -> bool {
 
 #[test]
 fn a_native_goal_is_not_carried_to_another_session_in_the_pane() {
-    // CX3-1: after the user started Codex in main's pane and reopened the
-    // manager, the old Claude Code goal is not the new session's to clear.
     let (worker, a) = ClaudeWorker::with_native_goal(json!({}));
     worker.state("done", "Updated the copy\n❯ half-typed note");
     assert!(worker.run(&["pause", &a]).status.success());
@@ -6168,7 +5949,6 @@ fn a_native_goal_is_not_carried_to_another_session_in_the_pane() {
 
 #[test]
 fn a_stopped_goals_prepared_step_with_a_removed_checkout_does_not_end_the_watch() {
-    // CX3-2: its boundaries are checked only for a goal still served.
     let bridge = Bridge::new();
     let a = confirmed_goal(&bridge, "true", json!({}));
     std::fs::create_dir_all(bridge.workspace.join("secret")).unwrap();
@@ -6214,7 +5994,6 @@ fn another_providers_check_runs_at_settle_and_wakes_the_manager_with_its_verdict
         "bin/codex",
         "#!/bin/sh\nout=; prev=\nfor a in \"$@\"; do [ \"$prev\" = -o ] && out=$a; prev=$a; done\nprintf '%s\\n' \"$@\" > \"$FIXTURE_ROOT/cross-args\"\ncat > \"$FIXTURE_ROOT/cross-prompt\"\nprintf 'VERDICT: changes_requested\\n- notes.txt misses world\\n' > \"$out\"\n",
     );
-    // Off by default: nothing starts.
     let off = confirmed_goal(&worker.bridge, "true", json!({}));
     worker.ok(&["send", "--goal", &off, "--task", "work", "Update the copy"]);
     worker.step("working", "Editing the copy\n❯ ");
@@ -6276,8 +6055,6 @@ fn another_providers_check_runs_at_settle_and_wakes_the_manager_with_its_verdict
     );
 }
 
-/// A fake Codex for cross checks: records its arguments and prompt, then runs
-/// `body` (with `$out` set to its `-o` file).
 fn fake_codex(worker: &ClaudeWorker, body: &str) {
     std::fs::write(
         worker.bridge.root.path().join("bin/codex"),
@@ -6285,7 +6062,6 @@ fn fake_codex(worker: &ClaudeWorker, body: &str) {
     )
     .unwrap();
 }
-/// Steps the watch until `kind` shows on `goal`'s timeline.
 fn step_until(worker: &ClaudeWorker, goal: &str, kind: &str) -> Vec<Value> {
     for _ in 0..30 {
         worker.step("done", "Updated the copy\n❯ ");
@@ -6300,7 +6076,6 @@ fn step_until(worker: &ClaudeWorker, goal: &str, kind: &str) -> Vec<Value> {
 
 #[test]
 fn a_cross_check_runs_without_settle_checks_and_a_failed_reviewer_has_no_verdict() {
-    // CX4-4, CX4-7, CX4-8, CX4-9, CX4-10.
     let worker = ClaudeWorker::new();
     fake_codex(&worker, "printf 'VERDICT: approve\\n' > \"$out\"\nexit 3");
     let goal = confirmed_goal(
@@ -6333,7 +6108,6 @@ fn a_cross_check_runs_without_settle_checks_and_a_failed_reviewer_has_no_verdict
 
 #[test]
 fn a_cross_check_still_running_when_the_watch_ends_is_stopped_and_recorded() {
-    // CX4-6.
     let worker = ClaudeWorker::new();
     fake_codex(&worker, "sleep 30");
     let goal = confirmed_goal(
@@ -6353,8 +6127,6 @@ fn a_cross_check_still_running_when_the_watch_ends_is_stopped_and_recorded() {
 
 #[test]
 fn a_native_goal_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
-    // UC-2: `sending` is saved before typing; a watch that stopped in between
-    // leaves it, and the next one records it as uncertain without retyping.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(
         &worker.bridge,
@@ -6378,7 +6150,6 @@ fn a_native_goal_the_watch_was_typing_when_it_stopped_is_never_typed_again() {
 
 #[test]
 fn a_linked_send_is_refused_once_a_stop_condition_holds() {
-    // UC-4: the boundary the watch would stop at, before anything is typed.
     let bridge = Bridge::new();
     let stop = bridge.root.path().join("STOP");
     let goal = confirmed_goal(
@@ -6397,9 +6168,176 @@ fn a_linked_send_is_refused_once_a_stop_condition_holds() {
 }
 
 #[test]
+fn a_dialog_on_the_final_read_defers_the_native_goal() {
+    let worker = ClaudeWorker::new();
+    let goal = confirmed_goal(
+        &worker.bridge,
+        "true",
+        json!({"loop":{"native_goal":"settle"}}),
+    );
+    worker.ok(&["send", "--goal", &goal, "--task", "work", "Update the copy"]);
+    worker.step("working", "Editing\n❯ ");
+    let path = manager_dir(&worker.bridge).join("t-original-watch.json");
+    worker
+        .bridge
+        .write("dialog-when-sending", path.to_str().unwrap());
+    worker.bridge.write("dialog.screen", DIALOG_AFTER_READ);
+    worker.step("done", "Finished\n❯ ");
+    assert_eq!(worker.goal_lines(), 0);
+    std::fs::remove_file(worker.bridge.root.path().join("dialog-when-sending")).unwrap();
+    worker.step("done", "Finished\n❯ ");
+    assert_eq!(worker.goal_lines(), 1);
+}
+
+#[test]
+fn a_reserved_provider_continue_survives_a_watch_restart() {
+    let bridge = Bridge::new();
+    let goal = bridge.goal();
+    bridge.ok(&["supervise", &goal]);
+    let path = manager_dir(&bridge).join("t-original-watch.json");
+    bridge.write("snapshot-prepared", path.to_str().unwrap());
+    bridge.inventory("done", "idle", "original");
+    bridge.write(
+        "target.screen",
+        "⎿  API Error: Can't reach the API server (ENOTFOUND)\n› ",
+    );
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    std::fs::copy(bridge.root.path().join("prepared-at-prompt.json"), &path).unwrap();
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    assert_eq!(sent_text(&bridge).matches("w1:p1\nContinue").count(), 1);
+}
+
+#[test]
+fn a_legacy_cross_check_needs_an_exit_record_to_confirm_termination() {
+    let bridge = Bridge::new();
+    let goal = bridge.goal();
+    bridge.ok(&["supervise", &goal]);
+    let dir = state_directory(&bridge).join("runs/cross-legacy");
+    std::fs::create_dir(&dir).unwrap();
+    edit_watch(&bridge, |w| {
+        w["cross_check"] = json!({"id":"cross-legacy","goal":goal,
+        "reviewer":"codex","started_at":1,"pid":u32::MAX})
+    });
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    let watch = bridge.ok(&["watch"]);
+    assert_eq!(watch["cross_check"]["stop_unconfirmed"], true);
+    assert!(!kinds(&bridge, &goal).iter().any(|k| k == "cross_checked"));
+    std::fs::write(dir.join("exit"), "1\n").unwrap();
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    assert!(kinds(&bridge, &goal).iter().any(|k| k == "cross_checked"));
+}
+
+#[test]
+fn assignments_require_an_open_goal_and_dependency_ready_task() {
+    let bridge = Bridge::new();
+    let goal = confirmed_goal(
+        &bridge,
+        "true",
+        json!({"tasks":[
+        {"id":"first","instruction":"First"},{"id":"second","instruction":"Second","depends_on":["first"]}]}),
+    );
+    let send = |task: &str, reason: &str| {
+        refused_with(
+            &bridge,
+            &["send", "--goal", &goal, "--task", task, "Work"],
+            reason,
+        )
+    };
+    send("second", "unfinished dependencies");
+    bridge.ok(&["complete", &goal, "first", "--evidence", "Finished"]);
+    send("first", "is complete");
+    bridge.ok(&["wait", &goal, "--reason", "Clarify"]);
+    send("second", "waiting");
+    assert!(sent_text(&bridge).is_empty());
+}
+
+#[test]
+fn concurrent_role_changes_preserve_both_results() {
+    let bridge = Bridge::new();
+    start_role(&bridge, "impl", "w1:p5", "claude");
+    start_role(&bridge, "reviewer", "w1:p6", "claude");
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| bridge.ok(&["role", "stop", "impl"]));
+        bridge.ok(&["role", "stop", "reviewer"]);
+        first.join().unwrap();
+    });
+    let roles = bridge.ok(&["role", "list"]);
+    assert_eq!(roles.as_array().unwrap().len(), 1);
+    assert_eq!(roles[0]["role"], "main");
+}
+
+#[test]
+fn one_goals_stop_condition_keeps_its_neighbor_watched() {
+    let bridge = Bridge::new();
+    let first = confirmed_goal(&bridge, "true", json!({}));
+    let second = confirmed_goal(
+        &bridge,
+        "true",
+        json!({"loop":{"stop_checks":[{"name":"stop","command":"test -f STOP"}]}}),
+    );
+    for goal in [&first, &second] {
+        bridge.ok(&["send", "--goal", goal, "--task", "work", "Begin"]);
+    }
+    std::fs::write(bridge.workspace.join("STOP"), "").unwrap();
+    bridge.inventory("done", "idle", "original");
+    bridge.write("target.screen", "Finished\n› ");
+    assert!(bridge.call(&["watch-loop", "--once"]).status.success());
+    let record = bridge.ok(&["watch"]);
+    assert_eq!(record["active"], true);
+    assert_eq!(record["goal"], first);
+    assert!(!bridge.ok(&["show", &second])["waiting"].is_null());
+}
+
+#[test]
+fn stop_checks_use_exit_status_and_surface_execution_errors() {
+    let bridge = Bridge::new();
+    for (command, expected) in [
+        ("head -c 262145 /dev/zero", "stop condition boundary holds"),
+        ("printf '\\377'", "stop condition boundary holds"),
+        ("sleep 10", "timed out"),
+    ] {
+        let goal = confirmed_goal(
+            &bridge,
+            "true",
+            json!({"loop":{"stop_checks":[{"name":"boundary","command":command,"timeout_secs":1}]}}),
+        );
+        refused_with(&bridge, &["send", "--goal", &goal, "Next step"], expected);
+        assert!(!sent_text(&bridge).contains("Next step"));
+    }
+}
+
+#[test]
+fn releasing_a_watch_without_a_native_goal_waits_for_the_watch_writer() {
+    let bridge = Bridge::new();
+    let goal = bridge.goal();
+    bridge.ok(&["supervise", &goal]);
+    let lock = hold_operation_lock(&bridge);
+    let file = manager_dir(&bridge).join("t-original-watch.json");
+    let mut in_flight: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let mut pausing = bridge
+        .command(&["pause", &goal])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while bridge.ok(&["show", &goal])["control"] != "pause" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pause never reached the goal"
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    in_flight["wakes"] = json!(7);
+    std::fs::write(&file, in_flight.to_string()).unwrap();
+    drop(lock);
+    assert!(pausing.wait().unwrap().success());
+    let watch: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(watch["active"], false);
+    assert_eq!(watch["wakes"], 7);
+}
+
+#[test]
 fn a_native_goal_is_saved_as_being_typed_before_it_is_typed() {
-    // UCV-5: the watch record holds `sending` while the /goal is typed, so a
-    // watch that stops in between leaves it for the next one.
     let worker = ClaudeWorker::new();
     let goal = confirmed_goal(
         &worker.bridge,

@@ -1,76 +1,38 @@
-//! Goal watch tab text and Herdr sidebar metadata, built as pure functions.
-//!
-//! The watch loop collects a [`WatchView`] snapshot and passes it here; nothing
-//! in this module calls Herdr or reads files.
 use chrono::{DateTime, Local, TimeZone, Utc};
 use std::fmt::Display;
 
-/// Timeline events shown in the watch tab.
 const RECENT_EVENTS: usize = 5;
-/// Source id under which hgm reports pane metadata to Herdr.
 const SIDEBAR_SOURCE: &str = "hgm";
-/// Tokens set by [`sidebar_args`]; [`clear_args`] clears the same names.
 const SIDEBAR_TOKENS: [&str; 3] = ["goal", "state", "budget"];
-/// Column limit for the sidebar title and token values.
 const SIDEBAR_WIDTH: usize = 40;
-/// Characters of the goal id shown in the sidebar.
 const SIDEBAR_GOAL_CHARS: usize = 10;
 
-/// Snapshot of one goal watch, taken by the watch loop for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WatchView {
-    /// Goal id, used in the rearm command.
     pub(crate) goal: String,
-    /// Goal objective.
     pub(crate) objective: String,
-    /// Watched role, such as main, impl or reviewer.
     pub(crate) role: String,
-    /// Herdr pane id of the watched agent.
     pub(crate) pane: String,
-    /// Native agent state reported by Herdr or read from the screen.
     pub(crate) state: String,
-    /// Watch mode, such as "events" or "polling".
     pub(crate) mode: Option<String>,
-    /// Most recent observation of the watched pane.
     pub(crate) last_observation: Option<String>,
-    /// Why wakes are held (only the user can resolve it), when they are.
     pub(crate) held_reason: Option<String>,
-    /// The wake waiting to reach the manager (cooldown or a busy manager).
     pub(crate) pending_reason: Option<String>,
-    /// Manager wakes used so far.
     pub(crate) wakes_used: u32,
-    /// Manager wake budget.
     pub(crate) wakes_max: u32,
-    /// Seconds until the next patrol of a working agent; zero or less means it
-    /// is due. `None` while the agent is not working.
     pub(crate) next_check_secs: Option<i64>,
-    /// Patrol interval in minutes; zero when the goal has no patrol.
     pub(crate) patrol_minutes: u32,
-    /// Seconds the worker has sat settled short of completion, while it does.
     pub(crate) idle_secs: Option<i64>,
-    /// Seconds settled short of completion before the person is told.
     pub(crate) idle_notice_secs: u64,
-    /// The native goal hgm set on the worker and its last outcome, if any.
     pub(crate) native_goal: Option<String>,
-    /// The native goal hgm set on the Goal Manager and its last outcome, if any.
     pub(crate) manager_goal: Option<String>,
-    /// Minutes of time budget left; negative means the budget is exceeded.
     pub(crate) time_left_minutes: Option<i64>,
-    /// Assignments used and allowed.
     pub(crate) assignments: Option<(u32, u32)>,
-    /// Timeline events, oldest first, as (time, kind, short summary).
-    /// Only the last five are shown.
     pub(crate) events: Vec<(DateTime<Utc>, String, String)>,
-    /// Why the watch ended, once it has.
     pub(crate) ended_reason: Option<String>,
-    /// A recent notification or wake, or the current hold, for the sheep to say.
     pub(crate) notice: Option<String>,
 }
 
-/// The sheep that runs across the Goal watch tab (chosen by the user), facing
-/// left. The watch process draws it by itself: no Herdr call, no model,
-/// nothing for an agent. Widths count terminal columns: full-width characters
-/// take two.
 const SHEEP: [&str; SHEEP_ROWS] = [
     "⠀,〜⌒⌒､⌒ヽ",
     " (⊂,~〜､⊃）） ) )",
@@ -79,7 +41,6 @@ const SHEEP: [&str; SHEEP_ROWS] = [
     "　ヽ〜  〜  ノノ",
     "　　UU￣UU",
 ];
-/// [`SHEEP`] mirrored column by column, facing right.
 const SHEEP_RIGHT: [&str; SHEEP_ROWS] = [
     "       ノ⌒,⌒⌒〜､",
     "( (（（⊂,〜~､⊃)",
@@ -88,17 +49,10 @@ const SHEEP_RIGHT: [&str; SHEEP_ROWS] = [
     " ヽヽ  〜  〜ノ",
     "       UU￣UU",
 ];
-/// Rows of [`SHEEP`].
 pub(crate) const SHEEP_ROWS: usize = 6;
-/// The other leg pose (facing left, then right); alternating it with the last
-/// row makes the sheep run.
 const SHEEP_STRIDE: [&str; 2] = ["　 U U￣U U", "      U U￣U U"];
-/// The sheep's nose, under which its speech bubble points.
 const SHEEP_NOSE: char = 'ﻌ';
 
-/// Lines of the sheep at animation step `tick` in a tab `width` columns wide.
-/// It moves one column per step and turns back at each edge. A `notice`
-/// appears in a speech bubble above its head. Empty when the tab is too narrow.
 pub(crate) fn sheep(tick: u64, width: usize, notice: Option<&str>) -> Vec<String> {
     let body = SHEEP
         .iter()
@@ -116,7 +70,6 @@ pub(crate) fn sheep(tick: u64, width: usize, notice: Option<&str>) -> Vec<String
         (2 * track - step, false)
     };
     let x = x as usize;
-    // The face leads: mirrored while the sheep runs right.
     let mut rows = if right { SHEEP_RIGHT } else { SHEEP };
     if !tick.is_multiple_of(2) {
         rows[SHEEP_ROWS - 1] = SHEEP_STRIDE[usize::from(right)];
@@ -143,9 +96,6 @@ pub(crate) fn sheep(tick: u64, width: usize, notice: Option<&str>) -> Vec<String
     lines
 }
 
-/// Renders the Goal watch tab as plain text lines joined by `\n`, without a
-/// trailing newline or ANSI sequences. Every line fits in `width` columns;
-/// longer lines end with "…". Event times use the local time zone.
 pub(crate) fn render(view: &WatchView, width: usize) -> String {
     render_in(view, width, &Local)
 }
@@ -206,8 +156,6 @@ where
                 wakes.push_str(" · ");
                 wakes.push_str(&next_check(secs));
             }
-            // Patrols run only while the agent works; a settled agent wakes
-            // the manager by settling.
             None if view.patrol_minutes > 0 => wakes.push_str(&format!(
                 " · next patrol when {} works (every {})",
                 single_line(&view.role),
@@ -242,8 +190,6 @@ where
         .join("\n")
 }
 
-/// Arguments after the `herdr` binary that report goal state and budget in the
-/// watched pane's sidebar.
 pub(crate) fn sidebar_args(view: &WatchView) -> Vec<String> {
     let mut args = metadata_args(&view.pane);
     args.push("--title".into());
@@ -263,8 +209,6 @@ pub(crate) fn sidebar_args(view: &WatchView) -> Vec<String> {
     args
 }
 
-/// Arguments after the `herdr` binary that clear everything [`sidebar_args`]
-/// set on `pane`.
 pub(crate) fn clear_args(pane: &str) -> Vec<String> {
     let mut args = metadata_args(pane);
     args.push("--clear-title".into());
@@ -299,8 +243,6 @@ fn sidebar_state(view: &WatchView) -> String {
     }
 }
 
-/// Budget in the short form the narrow sidebar fits, such as
-/// "wakes 2/8 · 1h 30m left · 1/5 assigned".
 fn sidebar_budget(view: &WatchView) -> String {
     let mut parts = vec![format!("wakes {}/{}", view.wakes_used, view.wakes_max)];
     if let Some(minutes) = view.time_left_minutes {
@@ -348,7 +290,6 @@ fn next_check(secs: i64) -> String {
     }
 }
 
-/// Formats a non-negative span as "45s", "4m 10s" or "1h 30m".
 pub(crate) fn duration(secs: i64) -> String {
     let (hours, minutes, seconds) = (secs / 3600, secs % 3600 / 60, secs % 60);
     match (hours, minutes, seconds) {
@@ -359,8 +300,6 @@ pub(crate) fn duration(secs: i64) -> String {
     }
 }
 
-/// Collapses whitespace, including newlines, to single spaces and drops other
-/// control characters so one value never spans lines.
 fn single_line(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -370,7 +309,6 @@ fn single_line(text: &str) -> String {
         .collect()
 }
 
-/// Truncates `text` to `width` terminal columns, ending with "…" when cut.
 fn fit(text: &str, width: usize) -> String {
     if display_width(text) <= width {
         return text.to_owned();
@@ -467,7 +405,6 @@ mod tests {
         assert_eq!(SHEEP.iter().map(|row| display_width(row)).max(), Some(body));
         let track = width - body - 1;
         let face = |tick: u64| sheep(tick, width, None)[2].clone();
-        // Running right, the face is at the front (right) of the body.
         assert_eq!(face(0), "（　(　(Ꮚ• ﻌ •Ꮚ))");
         assert_eq!(face(1), " （　(　(Ꮚ• ﻌ •Ꮚ))");
         for (left, right) in SHEEP.iter().zip(SHEEP_RIGHT) {
@@ -480,7 +417,6 @@ mod tests {
             sheep(1, width, None)[last],
             "legs move"
         );
-        // At the right edge it turns: the original sheep faces left.
         assert_eq!(
             face(track as u64 + 1),
             format!("{}((Ꮚ• ﻌ •Ꮚ)　)　）", " ".repeat(track - 1))
@@ -694,7 +630,6 @@ mod tests {
         );
         assert!(!text.contains("held"), "{text}");
         assert!(sidebar_args(&view).contains(&"state=done · wake pending".to_string()));
-        // A hold wins: only the user can resolve it.
         view.held_reason = Some("dialog".into());
         let text = render_utc(&view, 80);
         assert!(text.contains("\nheld: dialog\n") && !text.contains("wake pending"));

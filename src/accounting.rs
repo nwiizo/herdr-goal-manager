@@ -1,14 +1,7 @@
-//! Attention accounting: what a goal cost its readers, computed from its
-//! timeline alone. Wakes and notices interrupt the manager and the person; a
-//! wake that no manager action followed interrupted for nothing. The numbers
-//! are observations: nothing here completes a task or accepts a goal.
 use crate::{events::Event, model::Goal};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-/// Manager actions that answer a wake: work sent, a correction or goal check,
-/// a recorded completion, or a wait for the person. A step the watch
-/// delivered itself (`via: watch`) was prepared before the wake.
 pub(crate) fn manager_action(event: &Event) -> bool {
     match event.kind.as_str() {
         "assigned" => event.detail["via"].as_str() != Some("watch"),
@@ -16,11 +9,9 @@ pub(crate) fn manager_action(event: &Event) -> bool {
         _ => false,
     }
 }
-/// Work reaching the worker: it is no longer idle.
 fn work_sent(event: &Event) -> bool {
     matches!(event.kind.as_str(), "assigned" | "correction" | "reanchor")
 }
-/// The worker settled: a settle check, or a wake about a settled state.
 fn settled(event: &Event) -> bool {
     event.kind == "settle_checks"
         || (event.kind == "wake"
@@ -28,8 +19,6 @@ fn settled(event: &Event) -> bool {
                 reason.contains("settled") || reason.starts_with("target state changed to")
             }))
 }
-/// The goal stops waiting on its worker: done, awaiting review, waiting for
-/// the person, or finished.
 fn stops_idle(event: &Event) -> bool {
     event.kind == "waiting"
         || event.kind == "accepted"
@@ -40,7 +29,6 @@ fn stops_idle(event: &Event) -> bool {
             ))
 }
 
-/// The goal's attention accounting at `now`, from `events` (in time order).
 pub(crate) fn compute(goal: &Goal, events: &[Event], now: DateTime<Utc>) -> Value {
     let wake_at: Vec<usize> = (0..events.len())
         .filter(|&i| events[i].kind == "wake")
@@ -53,8 +41,6 @@ pub(crate) fn compute(goal: &Goal, events: &[Event], now: DateTime<Utc>) -> Valu
             events[i + 1..end].iter().any(manager_action)
         })
         .count();
-    // Idle stretches: from a settle to the next work, or to the goal leaving
-    // its worker's hands; one still open runs to `now` while the goal runs.
     let mut stretches: Vec<i64> = vec![];
     let mut since: Option<DateTime<Utc>> = None;
     for event in events {
@@ -102,8 +88,6 @@ pub(crate) fn compute(goal: &Goal, events: &[Event], now: DateTime<Utc>) -> Valu
     })
 }
 
-/// One line for humans: `12 wakes (3 followed by an action) · idle 14m,
-/// longest 6m · 5 notices · awaiting review 2h 3m · 1 correction · 0 refused`.
 pub(crate) fn line(accounting: &Value) -> String {
     let n = |key: &str| accounting[key].as_i64().unwrap_or(0);
     let duration = crate::watch_view::duration;
@@ -155,7 +139,6 @@ mod tests {
                 "wake",
                 json!({"reason": "main settled and every command check passes"}),
             ),
-            // The manager answers the first wake 4 minutes later.
             event(14, "assigned", json!({"task": "work"})),
             event(20, "wake", json!({"reason": "3-minute check of main"})),
             event(
@@ -183,12 +166,9 @@ mod tests {
         ];
         let accounting = compute(&goal, &events, at(80));
         assert_eq!(accounting["wakes"], 3);
-        // The patrol wake was followed by nothing until the next wake.
         assert_eq!(accounting["wakes_acted_on"], 2);
-        // Idle 10->14 (4 min) and 25->31 (6 min).
         assert_eq!(accounting["idle_total_secs"], 600);
         assert_eq!(accounting["idle_longest_secs"], 360);
-        // The idle notice and the ready-for-review status notified the person.
         assert_eq!(accounting["notices"], 2);
         assert_eq!(accounting["awaiting_review_secs"], 30 * 60);
         assert_eq!(accounting["corrections"], 1);

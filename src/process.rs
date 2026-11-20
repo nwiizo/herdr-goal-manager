@@ -1,5 +1,3 @@
-//! Configured commands execute directly; prompts never become shell source.
-
 use crate::{model::CommandSpec, store::Store};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -9,7 +7,6 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
-/// Runs `spec` in `dir`: the goal's checkout, or the managed workspace.
 pub(crate) async fn execute(
     store: &Store,
     dir: &std::path::Path,
@@ -18,15 +15,71 @@ pub(crate) async fn execute(
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<String> {
+    let RunOutput {
+        status,
+        mut stdout,
+        mut stderr,
+        directory,
+    } = run(store, dir, id, spec, prompt, timeout_secs).await?;
+    ensure!(
+        status.success(),
+        "runner exited with {status}; {}\nLogs: {}",
+        tail(&mut stderr, 8192)?,
+        directory.display()
+    );
+    ensure!(
+        stdout.metadata()?.len() <= 262_144,
+        "runner output exceeds 256 KiB; inspect {}",
+        directory.display()
+    );
+    stdout.seek(SeekFrom::Start(0))?;
+    let mut output = String::new();
+    stdout
+        .read_to_string(&mut output)
+        .context("runner stdout must be UTF-8")?;
+    Ok(output)
+}
+
+struct RunOutput {
+    status: std::process::ExitStatus,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    directory: std::path::PathBuf,
+}
+
+pub(crate) async fn predicate(
+    store: &Store,
+    dir: &std::path::Path,
+    id: &str,
+    spec: &CommandSpec,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let output = run(store, dir, id, spec, "", timeout_secs).await?;
+    output.status.code().map(|code| code == 0).with_context(|| {
+        format!(
+            "stop check exited with {}; inspect {}",
+            output.status,
+            output.directory.display()
+        )
+    })
+}
+
+async fn run(
+    store: &Store,
+    dir: &std::path::Path,
+    id: &str,
+    spec: &CommandSpec,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<RunOutput> {
     let directory = store.run_directory(id)?;
     std::io::Write::write_all(
         &mut open_log(&directory.join("prompt.txt"))?,
         prompt.as_bytes(),
     )?;
-    let mut stdout = open_log(&directory.join("stdout.log"))?;
-    let mut stderr = open_log(&directory.join("stderr.log"))?;
+    let stdout = open_log(&directory.join("stdout.log"))?;
+    let stderr = open_log(&directory.join("stderr.log"))?;
     let mut command = tokio::process::Command::new(&spec.program);
-    // Prompts are data on stdin or in HGM_PROMPT, never generated shell source.
     command
         .args(&spec.args)
         .current_dir(dir)
@@ -70,23 +123,12 @@ pub(crate) async fn execute(
         }
     };
     drop(group);
-    ensure!(
-        status.success(),
-        "runner exited with {status}; {}\nLogs: {}",
-        tail(&mut stderr, 8192)?,
-        directory.display()
-    );
-    ensure!(
-        stdout.metadata()?.len() <= 262_144,
-        "runner output exceeds 256 KiB; inspect {}",
-        directory.display()
-    );
-    stdout.seek(SeekFrom::Start(0))?;
-    let mut output = String::new();
-    stdout
-        .read_to_string(&mut output)
-        .context("runner stdout must be UTF-8")?;
-    Ok(output)
+    Ok(RunOutput {
+        status,
+        stdout,
+        stderr,
+        directory,
+    })
 }
 
 fn tail(file: &mut std::fs::File, limit: u64) -> Result<String> {

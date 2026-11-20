@@ -1,14 +1,3 @@
-//! User and project overrides for prompts and workflow defaults.
-//!
-//! The user config (`$XDG_CONFIG_HOME/herdr-goal-manager/config.yaml`, or
-//! `~/.config/...`) may replace the manager guide. A project config
-//! (`<workspace>/.hgm/config.yaml`) may only add to it, like `AGENTS.md`: a
-//! cloned repository must not rewrite the manager's ground rules. Neither can
-//! configure away code-enforced rules (confirmation, budgets, word caps, `auto`
-//! needing a check, human acceptance) or add commands: stop checks and checks
-//! belong to each confirmed goal. The optional factory mode (`factory`) is off
-//! by default; a project may switch it on or off but may only tighten its
-//! review limits below the user's (or the built-in) values.
 use crate::{
     contract::{Autonomy, LoopPolicy},
     model::GoalSpec,
@@ -21,31 +10,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The built-in manager guide; `prompts.manager` in the user config replaces it.
 pub(crate) const BUILTIN_GUIDE: &str = include_str!("../prompts/manager.md");
-/// The guide section for the factory queue, added while factory mode is on.
 pub(crate) const FACTORY_GUIDE: &str = include_str!("../prompts/factory.md");
-/// First user turn for every provider. The guide itself travels as system or
-/// developer instructions so it is not mistaken for the user's task.
 pub(crate) const BUILTIN_OPENER: &str = "Continue our goal conversation. Run hgm overview once, then ask only what is needed to move forward.";
-/// Wakes per goal and manager context: three-minute checks for about eight hours.
 pub(crate) const DEFAULT_MAX_WAKES: u32 = 160;
-/// The most wakes a goal's watch may be given.
 pub(crate) const MAX_WAKES_LIMIT: u32 = 500;
-/// User decision (2026-11-15): the watch's times default to three minutes.
-/// Seconds without an observed change before the manager is woken.
 pub(crate) const DEFAULT_IDLE_SECS: u64 = 180;
-/// Seconds between wakes for patrols and unchanged screens.
 pub(crate) const DEFAULT_COOLDOWN_SECS: u64 = 180;
-/// Seconds the worker may sit settled short of completion before the person is told.
 pub(crate) const DEFAULT_IDLE_NOTICE_SECS: u64 = 180;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct File {
-    /// Manager provider when the original tab runs no known agent.
     agent: Option<String>,
-    /// Model per provider (`claude`, `codex`, `copilot`).
     models: BTreeMap<String, String>,
     prompts: Prompts,
     #[serde(rename = "loop")]
@@ -55,7 +32,6 @@ struct File {
     manager: ManagerDefaults,
 }
 
-/// The Goal Manager's own settings.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ManagerDefaults {
@@ -73,18 +49,13 @@ impl ManagerDefaults {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Prompts {
-    /// File replacing the built-in guide (user config only).
     manager: Option<PathBuf>,
-    /// Files appended to the guide, relative to the config file.
     manager_append: Vec<PathBuf>,
     opener: Option<String>,
-    /// Text appended to every wake notice.
     wake_append: Option<String>,
-    /// Text appended to every linked assignment, before the contract.
     assignment_append: Option<String>,
 }
 
-/// Defaults for a new goal's `loop`; fields the goal sets itself win.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LoopDefaults {
@@ -112,7 +83,6 @@ pub(crate) struct LoopDefaults {
     pub cross_check: Option<crate::contract::CrossCheck>,
 }
 
-/// Monitoring defaults for `supervise` and linked sends.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct WatchDefaults {
@@ -129,14 +99,9 @@ pub(crate) struct WatchDefaults {
     pub idle_notice_secs: Option<u64>,
 }
 
-/// Results awaiting review before the factory queue stops dispatching: one
-/// under review and one finished, so a third waits for the person.
 pub(crate) const DEFAULT_MAX_AWAITING_REVIEW: u32 = 2;
-/// Confirmed goals in progress before the factory queue stops dispatching:
-/// the original tab runs one agent, and parallel loops are not started.
 pub(crate) const DEFAULT_MAX_ACTIVE: u32 = 1;
 
-/// The optional factory mode: a local queue of agreed contracts.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct FactoryDefaults {
@@ -152,7 +117,6 @@ pub(crate) struct FactoryDefaults {
     pub checkout: Option<bool>,
 }
 impl FactoryDefaults {
-    /// No config file sets a factory key; `hgm config` then omits the section.
     fn is_unset(&self) -> bool {
         *self == Self::default()
     }
@@ -163,8 +127,6 @@ impl FactoryDefaults {
     pub(crate) fn max_active(&self) -> u32 {
         self.max_active.unwrap_or(DEFAULT_MAX_ACTIVE)
     }
-    /// Applies one config file. The user file sets values; a later project
-    /// file may switch the mode and lower, never raise, a review limit.
     fn apply(&mut self, file: Self, is_user: bool) -> Result<()> {
         if !is_user {
             for (key, value, ceiling) in [
@@ -202,7 +164,6 @@ impl FactoryDefaults {
     }
 }
 
-/// Effective overrides after merging the user and project configs.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct Config {
     pub agent: Option<String>,
@@ -262,8 +223,6 @@ fn join(first: Option<String>, second: Option<String>) -> Option<String> {
     }
 }
 
-/// Reads the user config, then the workspace config; later values win and
-/// appended text accumulates.
 pub(crate) fn load(workspace: &Path) -> Result<Config> {
     let mut config = Config::default();
     let project = project_path(workspace);
@@ -289,7 +248,16 @@ pub(crate) fn load(workspace: &Path) -> Result<Config> {
             config.guide = Some(read_text(base, manager)?.1);
         }
         for file in &prompts.manager_append {
-            config.guide_append.push(read_text(base, file)?);
+            let path = base
+                .join(file)
+                .canonicalize()
+                .with_context(|| format!("resolve prompt file {}", base.join(file).display()))?;
+            ensure!(
+                is_user || path.starts_with(workspace.canonicalize()?),
+                "project manager_append must resolve inside the workspace: {}",
+                file.display()
+            );
+            config.guide_append.push(read_text(base, &path)?);
         }
         config.opener = prompts.opener.or(config.opener);
         config.wake_append = join(config.wake_append, prompts.wake_append);
@@ -320,7 +288,6 @@ pub(crate) fn load(workspace: &Path) -> Result<Config> {
     }
     Ok(config)
 }
-/// Copies keys from `defaults` that `target` does not set.
 fn fill(target: &mut Map<String, Value>, defaults: Value) {
     if let Value::Object(defaults) = defaults {
         for (key, value) in defaults {
@@ -328,7 +295,6 @@ fn fill(target: &mut Map<String, Value>, defaults: Value) {
         }
     }
 }
-/// Overwrites `base` keys with `overlay` keys.
 fn merge(base: &mut Value, overlay: Value) {
     if let (Some(base), Value::Object(overlay)) = (base.as_object_mut(), overlay) {
         base.extend(overlay);
@@ -376,11 +342,9 @@ impl Config {
         merge(&mut policy, serde_json::to_value(&self.loop_defaults)?);
         serde_json::from_value::<LoopPolicy>(policy)?.validate()
     }
-    /// Whether factory mode is on (`factory.enabled: true`).
     pub(crate) fn factory_enabled(&self) -> bool {
         self.factory.enabled == Some(true)
     }
-    /// Refuses a factory command unless `factory.enabled` is true.
     pub(crate) fn require_factory(&self) -> Result<()> {
         ensure!(
             self.factory.enabled == Some(true),
@@ -391,14 +355,11 @@ impl Config {
         );
         Ok(())
     }
-    /// The manager guide: built-in or replaced, then appended sections.
     pub(crate) fn guide(&self) -> String {
         let mut guide = self
             .guide
             .clone()
             .unwrap_or_else(|| BUILTIN_GUIDE.to_string());
-        // The queue section joins only where factory mode is on, so the
-        // guide stays the same for everyone else.
         if self.factory_enabled() {
             guide += "\n\n";
             guide += FACTORY_GUIDE.trim_end();
@@ -432,27 +393,20 @@ impl Config {
     pub(crate) fn max_wakes(&self) -> u32 {
         self.watch.max_wakes.unwrap_or(DEFAULT_MAX_WAKES)
     }
-    /// Default 30 s: a closed pane and dropped events show up within this time.
     pub(crate) fn reconcile_secs(&self) -> u64 {
         self.watch.reconcile_secs.unwrap_or(30)
     }
-    /// Whether hgm sets a native goal on a Claude Code Goal Manager (default on).
     pub(crate) fn manager_native_goal(&self) -> bool {
         self.manager.native_goal.unwrap_or(true)
     }
-    /// Whether the Goal watch tab shows its running sheep (default on).
     pub(crate) fn sheep(&self) -> bool {
         self.watch.sheep.unwrap_or(true)
     }
 }
 
-/// Builds a goal spec from a parsed goal file, filling `loop` fields the goal
-/// does not set from the configured defaults.
 pub(crate) fn goal_spec(workspace: &Path, raw: Value) -> Result<GoalSpec> {
     goal_spec_with(raw, &load(workspace)?.loop_defaults)
 }
-/// Builds a goal spec from a parsed goal file and the given `loop` defaults,
-/// such as those recorded when a contract was queued.
 pub(crate) fn goal_spec_with(mut raw: Value, defaults: &LoopDefaults) -> Result<GoalSpec> {
     let defaults = serde_json::to_value(defaults)?;
     let Some(object) = raw.as_object_mut() else {
@@ -464,8 +418,6 @@ pub(crate) fn goal_spec_with(mut raw: Value, defaults: &LoopDefaults) -> Result<
         .as_object_mut()
     {
         fill(policy, defaults);
-        // A new contract sets the native goal with each assignment; a stored
-        // one without the field keeps setting it after the first settle.
         policy
             .entry("native_goal")
             .or_insert_with(|| json!("assignment"));
@@ -473,8 +425,6 @@ pub(crate) fn goal_spec_with(mut raw: Value, defaults: &LoopDefaults) -> Result<
     serde_json::from_value(raw).context("invalid goal definition")
 }
 
-/// Text appended to wake notices. A config typo must not end an unattended
-/// loop, so an error is reported and the notice goes out without it.
 pub(crate) fn wake_extra(workspace: &Path) -> String {
     match load(workspace) {
         Ok(config) => config
@@ -586,10 +536,6 @@ mod tests {
 
     #[test]
     fn each_guide_stays_within_its_word_budget() {
-        // The manager guide may not grow past its length before the
-        // 2026-11-15 additions: four goals added paragraphs one at a time that
-        // day, so a new rule must replace words, not add them. The other
-        // budgets sit just above the 2026-11-16 revision.
         const MANAGER: usize = 2_135;
         const IMPL: usize = 300;
         const REVIEWER: usize = 340;

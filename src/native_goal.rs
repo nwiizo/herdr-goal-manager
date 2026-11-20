@@ -1,8 +1,3 @@
-//! The provider's native goal (`/goal` in Claude Code) on the watched worker:
-//! set after a linked assignment so the worker keeps going between turns by
-//! itself, and cleared whenever hgm needs it to stop. hgm keeps what `/goal`
-//! lacks: its own checks, budgets, protected paths and the user's acceptance.
-//! The native evaluator's verdict is recorded as an observation only.
 use crate::{
     binding::args,
     contract::{Autonomy, NativeGoalMode},
@@ -16,17 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// The longest condition hgm types, in bytes. Claude Code 2.1.325 takes a
-/// `/goal` line typed through Herdr as pasted text, not as a command, once it
-/// is longer than 800 characters (800 ran, 801 was pasted; measured
-/// 2026-11-16). Bytes are never fewer than characters, so this keeps the
-/// whole line under that with room to spare.
 pub(crate) const MAX_CONDITION: usize = 700;
-/// Turns one linked assignment may drive through the native goal, per
-/// `loop.max_assignments` of the contract.
 const TURNS_PER_ASSIGNMENT: u32 = 10;
 
-/// The native goal hgm set on the watched worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NativeGoalState {
     pub goal: String,
@@ -49,10 +36,6 @@ impl NativeGoalState {
     }
 }
 
-/// When the contract wants a native goal on a worker running `agent`, or
-/// `None`: only Claude Code under autonomy auto has one (Codex and Copilot
-/// stay off until a native check confirms the same behaviour), and an unset
-/// `loop.native_goal` (a stored contract) means after the first settle.
 pub(crate) fn mode(goal: &Goal, agent: &str) -> Option<NativeGoalMode> {
     let policy = &goal.spec.loop_policy;
     if agent != "claude" || policy.autonomy != Autonomy::Auto {
@@ -63,15 +46,10 @@ pub(crate) fn mode(goal: &Goal, agent: &str) -> Option<NativeGoalMode> {
         mode => Some(mode),
     }
 }
-/// Whether the contract wants a native goal on a worker running `agent`.
 pub(crate) fn enabled(goal: &Goal, agent: &str) -> bool {
     mode(goal, agent).is_some()
 }
 
-/// The condition: a template in the binary filled with contract fields only
-/// (goal and task ids, the report every linked assignment asks for, the
-/// registered check commands, the boundaries and a turn bound from the loop
-/// policy). No assignment text or other model output enters it.
 pub(crate) fn condition(goal: &Goal, task: Option<&str>) -> String {
     let spec = &goal.spec;
     let head = format!(
@@ -122,8 +100,6 @@ pub(crate) fn condition(goal: &Goal, task: Option<&str>) -> String {
     if listed.len() <= MAX_CONDITION {
         return listed;
     }
-    // Too long to type as a command: name the lists by where the worker has
-    // them, the contract appended to its assignment.
     build(
         (!checks.is_empty()).then(|| {
             "Show in this conversation that the check commands in this goal's contract exit 0."
@@ -136,18 +112,13 @@ pub(crate) fn condition(goal: &Goal, task: Option<&str>) -> String {
     )
 }
 
-/// What became of a line typed into the worker.
 pub(crate) enum Typed {
-    /// The input line emptied and the screen shows the command's answer.
+    Occupied,
     Seen,
-    /// Queued while the worker works; Claude Code runs a queued slash command
-    /// after the turn (seen natively, 2026-11-16), so its answer comes later.
     Queued,
-    /// Not known to have arrived, and why.
     Unconfirmed(&'static str),
 }
 
-/// Lines of `screen` that hold one of `answers`.
 fn answers(screen: &str, answers: &[&str]) -> usize {
     screen
         .lines()
@@ -155,21 +126,22 @@ fn answers(screen: &str, answers: &[&str]) -> usize {
         .count()
 }
 
-/// Types `text` into the watched worker under the delivery rules: a settled
-/// worker with an empty input line, or (`queued`) a working Claude Code or
-/// Copilot with an empty input line and no dialog. An emptied input line is
-/// not enough: Claude Code 2.1.325 takes a `/goal` line typed through Herdr
-/// as pasted text once it is longer than 800 characters (measured 2026-11-16)
-/// and empties the line all the same, so a settled worker must also show a
-/// new line with one of `answer`. An error means the delivery is uncertain.
 pub(crate) async fn type_into(
-    pane: &str,
+    target: &crate::binding::Target,
     text: &str,
     agent: &str,
     answer: &[&str],
     queued: bool,
 ) -> Result<Typed> {
-    let before = answers(&crate::binding::screen(pane).await?, answer);
+    let pane = &target.pane;
+    let (live, screen) = crate::watch::fresh_worker(pane).await?;
+    if target.check(&live).is_err()
+        || !(crate::signals::can_prompt(&live, &screen)
+            || (queued && crate::watch::takes_queued_input(&live, &screen)))
+    {
+        return Ok(Typed::Occupied);
+    }
+    let before = answers(&screen, answer);
     herdr::query(&args(&["agent", "prompt", pane, text])).await?;
     if !crate::supervision::input_consumed(pane, agent)
         .await
@@ -189,9 +161,6 @@ pub(crate) async fn type_into(
     Ok(Typed::Unconfirmed("no answer to it appeared on screen"))
 }
 
-/// Sets the native goal for the latest linked assignment. The caller checked
-/// that the worker's input is free; an uncertain delivery is recorded and
-/// never replayed.
 pub(crate) async fn set(
     store: &Store,
     watch: &mut Watch,
@@ -199,7 +168,7 @@ pub(crate) async fn set(
     task: Option<&str>,
     assigned_at: DateTime<Utc>,
     agent: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let condition = condition(goal, task);
     let command = format!("/goal {condition}");
     let state = NativeGoalState {
@@ -209,22 +178,18 @@ pub(crate) async fn set(
         set_at: Utc::now().timestamp(),
         outcome: None,
     };
-    // Saved before typing: a watch that stops in between finds it on restart,
-    // records it as uncertain and never types it again.
+    let previous = watch.native_goal.take();
     watch.native_goal = Some(NativeGoalState {
         outcome: Some("sending".into()),
         ..state.clone()
     });
     crate::watch::save_watch(store, watch)?;
-    match type_into(
-        &watch.origin.pane.clone(),
-        &command,
-        agent,
-        &["Goal set:"],
-        false,
-    )
-    .await
-    {
+    match type_into(&watch.origin, &command, agent, &["Goal set:"], false).await {
+        Ok(Typed::Occupied) => {
+            watch.native_goal = previous;
+            crate::watch::save_watch(store, watch)?;
+            return Ok(false);
+        }
         Ok(Typed::Seen | Typed::Queued) => {
             store.record(
                 &goal.id,
@@ -233,8 +198,6 @@ pub(crate) async fn set(
             )?;
             watch.native_goal = Some(state);
         }
-        // The line may sit in the input, have gone into something else on
-        // screen, or have arrived as text: the goal is not known to be set.
         Ok(Typed::Unconfirmed(why)) => {
             store.record(
                 &goal.id,
@@ -252,28 +215,20 @@ pub(crate) async fn set(
                 "native_goal_set",
                 json!({"task": task, "delivery": "uncertain", "error": format!("{error:#}")}),
             )?;
-            // Not replayed: the assignment counts as handled either way.
             watch.native_goal = Some(NativeGoalState {
                 outcome: Some("uncertain".into()),
                 ..state
             });
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Clears the native goal hgm set, when it may still be set, so the worker
-/// stops driving itself. A working worker gets `/goal clear` as queued input
-/// only where the provider queues it and its input line is empty with no
-/// dialog. The worker is read right before typing, since a stop check may have
-/// run since the observation; otherwise the clear waits for a later one.
 pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Result<bool> {
     let Some(state) = watch.native_goal.clone().filter(NativeGoalState::is_set) else {
         return Ok(true);
     };
     let (live, screen) = crate::watch::fresh_worker(&watch.origin.pane).await?;
-    // The goal belongs to the bound session: a session the user started in
-    // that pane since is not typed into, and has no goal hgm set.
     if let Err(error) = watch.origin.check(&live) {
         store.record(
             &state.goal,
@@ -302,29 +257,27 @@ pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Res
     });
     crate::watch::save_watch(store, watch)?;
     let answer = ["Goal cleared:", "No goal set"];
-    let (detail, outcome) = match type_into(
-        &watch.origin.pane.clone(),
-        "/goal clear",
-        agent,
-        &answer,
-        queued,
-    )
-    .await
-    {
-        Ok(Typed::Seen) => (json!({"reason": reason, "consumed": true}), "cleared"),
-        Ok(Typed::Queued) => (
-            json!({"reason": reason, "consumed": true, "queued": true}),
-            "cleared",
-        ),
-        Ok(Typed::Unconfirmed(why)) => (
-            json!({"reason": reason, "delivery": "uncertain", "why": why}),
-            "uncertain",
-        ),
-        Err(error) => (
-            json!({"reason": reason, "delivery": "uncertain", "error": format!("{error:#}")}),
-            "uncertain",
-        ),
-    };
+    let (detail, outcome) =
+        match type_into(&watch.origin, "/goal clear", agent, &answer, queued).await {
+            Ok(Typed::Occupied) => {
+                watch.native_goal = Some(state);
+                crate::watch::save_watch(store, watch)?;
+                return Ok(false);
+            }
+            Ok(Typed::Seen) => (json!({"reason": reason, "consumed": true}), "cleared"),
+            Ok(Typed::Queued) => (
+                json!({"reason": reason, "consumed": true, "queued": true}),
+                "cleared",
+            ),
+            Ok(Typed::Unconfirmed(why)) => (
+                json!({"reason": reason, "delivery": "uncertain", "why": why}),
+                "uncertain",
+            ),
+            Err(error) => (
+                json!({"reason": reason, "delivery": "uncertain", "error": format!("{error:#}")}),
+                "uncertain",
+            ),
+        };
     store.record(&state.goal, "native_goal_cleared", detail)?;
     watch.native_goal = Some(NativeGoalState {
         outcome: Some(outcome.into()),
@@ -333,10 +286,6 @@ pub(crate) async fn clear(store: &Store, watch: &mut Watch, reason: &str) -> Res
     Ok(true)
 }
 
-/// Clears the native goal on this tab's watched worker, for `goal` or any
-/// goal, from a command that stops the goal (wait, pause, cancel, review,
-/// acceptance) or before a handoff. Best-effort: the watch clears it on its
-/// next step otherwise.
 pub(crate) async fn clear_for(store: &Store, goal: Option<&str>, reason: &str) -> Result<()> {
     let Ok(context) = crate::binding::session(store) else {
         return Ok(());
@@ -348,14 +297,11 @@ pub(crate) async fn clear_for(store: &Store, goal: Option<&str>, reason: &str) -
             .as_ref()
             .is_some_and(|state| goal.is_none_or(|goal| state.goal == goal) && state.is_set())
     };
-    // A first look without the lease: most stops have no native goal to clear.
     if !crate::watch::load_watch(store, &key).is_ok_and(|watch| wanted(&watch)) {
         return Ok(());
     }
     let cleared = async {
         let _operation = crate::binding::wait_operation_lease(store, &key).await?;
-        // Read again under the lease: a watch step or another command may have
-        // changed the record meanwhile, and the whole record is saved back.
         let mut watch = crate::watch::load_watch(store, &key)?;
         if !wanted(&watch) {
             return Ok(true);
@@ -364,7 +310,6 @@ pub(crate) async fn clear_for(store: &Store, goal: Option<&str>, reason: &str) -
         crate::watch::save_watch(store, &watch)?;
         anyhow::Ok(typed)
     };
-    // The command that stops the goal goes on; the ending watch retries.
     match cleared.await {
         Ok(true) => {}
         Ok(false) => eprintln!(
@@ -377,15 +322,6 @@ pub(crate) async fn clear_for(store: &Store, goal: Option<&str>, reason: &str) -
     Ok(())
 }
 
-/// Queues the native goal right behind a linked non-plan assignment
-/// (`loop.native_goal: assignment`). Claude Code runs a slash command typed
-/// during a turn once the turn ends (native check, 2026-11-16), so the goal
-/// takes over where the assignment's turn stops, and nothing is typed into a
-/// dialog that may open after it. The delivery rules hold: the worker is read
-/// again first, and the line goes in only when its input line is empty and no
-/// dialog shows. The set is pending until the watch reads `Goal set:`
-/// (`watch::confirm_pending_goal`). Returns the state for the watch, or `None`
-/// when nothing was typed (the watch then sets it after the first settle).
 pub(crate) async fn with_assignment(
     store: &Store,
     goal: &Goal,
@@ -422,16 +358,14 @@ pub(crate) async fn with_assignment(
         set_at: Utc::now().timestamp(),
         outcome: Some("pending".into()),
     };
-    // Saved before typing, as every native goal input is.
-    if let Ok(mut record) = crate::watch::load_watch(store, key) {
-        record.native_goal = Some(NativeGoalState {
-            outcome: Some("sending".into()),
-            ..state.clone()
-        });
-        crate::watch::save_watch(store, &record)?;
-    }
+    let mut record = crate::watch::load_watch(store, key)?;
+    let previous = record.native_goal.replace(NativeGoalState {
+        outcome: Some("sending".into()),
+        ..state.clone()
+    });
+    crate::watch::save_watch(store, &record)?;
     match type_into(
-        pane,
+        &record.origin,
         &format!("/goal {condition}"),
         agent,
         &["Goal set:"],
@@ -439,6 +373,11 @@ pub(crate) async fn with_assignment(
     )
     .await
     {
+        Ok(Typed::Occupied) => {
+            record.native_goal = previous;
+            crate::watch::save_watch(store, &record)?;
+            return Ok(None);
+        }
         Ok(Typed::Queued | Typed::Seen) => store.record(
             &goal.id,
             "native_goal_queued",
@@ -506,8 +445,6 @@ mod tests {
             vec!["x".repeat(300); 20].join(", ")
         ));
         let text = condition(&long, None);
-        // The whole typed line stays under the 800 characters measured on
-        // Claude Code, in bytes, so a long contract never arrives as text.
         assert!(text.len() <= MAX_CONDITION, "{}", text.len());
         assert!(format!("/goal {text}").len() < 800);
         assert!(text.ends_with("Or stop after 30 turns."));
@@ -523,7 +460,6 @@ mod tests {
                 "objective: o\nacceptance: [a]\nchecks: [{{name: c, command: 'true'}}]\n{field}"
             ))
         };
-        // A stored contract without the field, or with `true`, keeps the settle.
         assert_eq!(mode(&with(""), "claude"), Some(NativeGoalMode::Settle));
         assert_eq!(
             mode(&with("loop: {native_goal: true}\n"), "claude"),
@@ -545,7 +481,6 @@ mod tests {
         let refused: Result<crate::model::GoalSpec, _> =
             serde_norway::from_str("objective: o\nacceptance: [a]\nloop: {native_goal: soon}\n");
         assert!(format!("{}", refused.unwrap_err()).contains("assignment, settle or false"));
-        // Off is written as `false`, as stored contracts already have it.
         assert_eq!(
             serde_json::to_value(NativeGoalMode::Off).unwrap(),
             serde_json::json!(false)

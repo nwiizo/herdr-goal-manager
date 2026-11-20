@@ -1,5 +1,3 @@
-//! Scheduling and acceptance remain independent of the terminal and executor.
-
 use crate::{model::*, process, store::Store};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
@@ -50,7 +48,10 @@ pub(crate) async fn run(
         "timeout and attempt limit must be positive"
     );
     let _lease = store.execution_lease()?;
-    let goal = store.update(id, |goal| goal.recover(options.resume))?;
+    let goal = store.update(id, |goal| {
+        goal.work_dir()?;
+        goal.recover(options.resume)
+    })?;
     let result = run_inner(store, goal, executor, &options).await;
     if let Err(error) = &result {
         finish(store, id, GoalStatus::NeedsInput, &format!("{error:#}"))?;
@@ -184,8 +185,6 @@ async fn run_inner(
             "Manual, failed, or dependency-blocked tasks remain. Inspect with show; complete manual work with evidence, or resume unfinished automatic work.",
         );
     }
-    // Asked before the checks run, so a missing verdict costs no check time,
-    // and again after they pass, in case a check changed the work dir.
     let review_hold = |goal: &Goal| -> Result<Option<String>> {
         Ok(crate::roles::review_hold(goal, &store.events(&goal.id)?))
     };
@@ -269,8 +268,6 @@ async fn run_inner(
 }
 
 async fn verify(store: &Store, id: &str, executor: &impl Executor) -> Result<Option<bool>> {
-    // The state the checks judge; a later change makes their pass describe an
-    // earlier state. An unreadable work dir fails the checks themselves.
     let fingerprint = store
         .load(id)?
         .work_dir()
@@ -352,13 +349,8 @@ async fn verify(store: &Store, id: &str, executor: &impl Executor) -> Result<Opt
     ))
 }
 
-/// Human acceptance rechecks the current workspace; an earlier pass cannot
-/// accept a now-failing outcome. Manual-only goals still require explicit evidence.
-/// Records the user's agreement to a goal's loop contract. Every refusal of
-/// [`Goal::confirm`] applies before anything changes, so a contract that
-/// cannot be confirmed creates no checkout; then the checkout is prepared,
-/// the protected-path baseline taken and the agreement saved.
 pub(crate) async fn confirm_goal(store: &Store, id: &str, evidence: &str) -> Result<Goal> {
+    let _contract = store.contract_lease(id)?;
     let mut goal = store.load(id)?;
     goal.clone().confirm(evidence.into(), String::new())?;
     if goal.spec.checkout.is_some() && goal.checkout.is_none() {
@@ -384,12 +376,12 @@ pub(crate) async fn accept(
         "acceptance evidence must not be empty"
     );
     let _lease = store.execution_lease()?;
-    let goal = store.load(id)?;
-    ensure!(
-        goal.status == GoalStatus::ReadyForReview,
-        "goal must be ready_for_review before acceptance"
-    );
     store.update(id, |goal| {
+        ensure!(
+            goal.status == GoalStatus::ReadyForReview && goal.control != Control::Cancel,
+            "goal must be ready_for_review before acceptance"
+        );
+        goal.request(Control::Run)?;
         goal.status = GoalStatus::Running;
         Ok(())
     })?;
@@ -458,9 +450,6 @@ fn stop(store: &Store, id: &str) -> Result<Goal> {
         Ok(())
     })
 }
-/// The summary of a failed verification. A check whose environment denied it
-/// access (a sandbox, for example) produced no result about the work, so it is
-/// named apart from checks that failed on their own, which `failure` describes.
 fn failure_summary(goal: &Goal, failure: &str) -> String {
     const DENIED: &str = "Operation not permitted";
     let (denied, failed): (Vec<&CheckResult>, Vec<&CheckResult>) = goal

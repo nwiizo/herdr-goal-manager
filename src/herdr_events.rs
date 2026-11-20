@@ -1,10 +1,5 @@
-//! Herdr's event stream for one watched pane, read from its Unix socket
-//! (protocol 22: one JSON object per line).
-//!
-//! Observed with Herdr 0.9.5: a connection accepts one `events.subscribe`;
-//! `pane.output_matched` fires once per subscription and also for text already
-//! on screen; process exit arrives as `pane_exited`, while closing a tab sends
-//! no event, so the watch's reconcile read notices a closed pane.
+//! Herdr 0.9.5 allows one subscription per connection. Output matches are
+//! one-shot and can match existing text. Closing a tab sends no event.
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -13,24 +8,18 @@ use tokio::{
     net::UnixStream,
 };
 
-/// What Herdr reported about the watched pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Signal {
-    /// The pane's agent changed state (`idle`, `working`, `blocked`, `done`, `unknown`).
     Status(String),
-    /// Output matched the attention pattern; the matched line.
     Output(String),
-    /// The pane's process exited or the pane closed.
     Gone,
 }
 
-/// One subscription on its own connection.
 pub(crate) struct Subscription {
     lines: Lines<BufReader<UnixStream>>,
     pane: String,
 }
 
-/// Agent state changes, exit and close of `pane`.
 pub(crate) fn state_subscriptions(pane: &str) -> Value {
     json!([
         {"type": "pane.agent_status_changed", "pane_id": pane},
@@ -38,7 +27,6 @@ pub(crate) fn state_subscriptions(pane: &str) -> Value {
         {"type": "pane.closed"},
     ])
 }
-/// The first visible line of `pane` that matches `pattern` (a regex).
 pub(crate) fn output_subscription(pane: &str, pattern: &str) -> Value {
     json!([{
         "type": "pane.output_matched",
@@ -48,7 +36,6 @@ pub(crate) fn output_subscription(pane: &str, pattern: &str) -> Value {
     }])
 }
 
-/// Connects to `socket`, subscribes, and waits for Herdr to confirm.
 pub(crate) async fn subscribe(
     socket: &Path,
     pane: &str,
@@ -85,8 +72,6 @@ pub(crate) async fn subscribe(
 }
 
 impl Subscription {
-    /// The next signal for the watched pane; `None` when the stream ended.
-    /// Events for other panes and unknown kinds are skipped.
     pub(crate) async fn next(&mut self) -> Result<Option<Signal>> {
         while let Some(line) = self.lines.next_line().await? {
             let Ok(event) = serde_json::from_str::<Value>(&line) else {
@@ -100,8 +85,6 @@ impl Subscription {
     }
 }
 
-/// Herdr names stream events with dots (`pane.agent_status_changed`) and
-/// lifecycle events with underscores (`pane_exited`); both are accepted.
 fn signal_for(event: &Value, pane: &str) -> Option<Signal> {
     let data = &event["data"];
     if data["pane_id"].as_str() != Some(pane) {

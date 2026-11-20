@@ -1,11 +1,3 @@
-//! Another provider's check of the watched worker's work (`loop.cross_check`).
-//! When the worker has settled after new work, the watch starts a one-shot,
-//! read-only run of the other provider's CLI (Codex for a Claude Code worker,
-//! Claude Code for the rest, or the one the contract names) on the goal's
-//! acceptance, the task and the work dir's changes. The watch does not wait
-//! for it: it reads the result at a later observation, records it and wakes
-//! the manager. The verdict is an observation only: it completes and accepts
-//! nothing.
 use crate::{contract::CrossCheck, store::Store, watch::Watch};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -13,20 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::os::unix::process::CommandExt;
 
-/// How long a check may run, collecting the changes included, before the
-/// watch stops it.
 const TIMEOUT_SECS: i64 = 900;
-/// Findings a result keeps on the timeline and in the wake.
 const MAX_FINDINGS: usize = 10;
-/// The most of the assignment text the prompt quotes, in characters.
 const MAX_ASSIGNMENT: usize = 2_000;
 
-/// The shell around the reviewer's CLI. It collects the work dir's changes
-/// itself, so a slow or misconfigured Git (an external diff or textconv
-/// helper, an fsmonitor) runs under the check's timeout and process group, not
-/// inside the watch's step: helpers are switched off and the output is cut
-/// (60 KB of diff, 20 KB of untracked names). The exit status written is the
-/// reviewer's.
 const SHELL: &str = r#"{
   cat "$HGM_CROSS_IN"
   printf '\n'
@@ -38,10 +20,8 @@ const SHELL: &str = r#"{
   else
     printf 'The work dir is not a Git repository: read the files it holds.\n'
   fi
-} | "$@" > "$HGM_CROSS_OUT" 2> "$HGM_CROSS_ERR"
-echo $? > "$HGM_CROSS_EXIT""#;
+} | "$@" > "$HGM_CROSS_OUT" 2> "$HGM_CROSS_ERR""#;
 
-/// A check the watch started and has not read back yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CrossRun {
     pub id: String,
@@ -51,11 +31,14 @@ pub(crate) struct CrossRun {
     /// `codex` or `claude`.
     pub reviewer: String,
     pub started_at: i64,
-    /// The shell, which leads the run's process group.
+    /// Historical metadata. Only the supervisor that spawned a child signals it.
     pub pid: u32,
+    #[serde(default)]
+    pub supervised: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_unconfirmed: bool,
 }
 
-/// The provider that checks a worker running `agent` under `mode`, if any.
 pub(crate) fn reviewer(mode: CrossCheck, agent: &str) -> Option<&'static str> {
     match mode {
         CrossCheck::Off => None,
@@ -65,23 +48,21 @@ pub(crate) fn reviewer(mode: CrossCheck, agent: &str) -> Option<&'static str> {
     }
 }
 
-/// `text` as one line of plain characters, at most `max` of them: the
-/// reviewer's output is model output, and control characters (escape
-/// sequences, carriage returns) must not reach the manager's terminal.
 fn clean(text: &str, max: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
-/// Stops a check's process group: the shell leads its own group, so TERM
-/// reaches the CLI and Git it started, not only the shell around them.
-fn stop_group(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", "--", &format!("-{pid}")])
-        .output();
+fn stop_group(child: &mut std::process::Child) -> Result<()> {
+    // The supervisor holds the unreaped child, so its PID cannot be reused.
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id())?),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .context("stop the cross-check process group")?;
+    child.wait().context("wait for the stopped cross check")?;
+    Ok(())
 }
 
-/// What the reviewer reads before the changes the shell appends: the
-/// contract fields that say what done means and what this task covers.
 fn prompt(
     goal: &crate::model::Goal,
     task: Option<&str>,
@@ -125,10 +106,6 @@ fn prompt(
     )
 }
 
-/// Starts the check for the latest linked work once the worker has settled
-/// after it: at most one check per assignment or correction, one at a time.
-/// Work that settles while a check runs is checked after it, at a later
-/// observation, because only a started check counts it as covered.
 pub(crate) fn request(
     store: &Store,
     watch: &mut Watch,
@@ -151,8 +128,6 @@ pub(crate) fn request(
     if covered {
         watch.cross_due = false;
     }
-    // Due once a settle after a change was seen (the watch's settle
-    // detection, which also runs the settle checks); kept while a check runs.
     if !settled
         || !watch.cross_due
         || covered
@@ -189,7 +164,55 @@ fn start(
         prompt(goal, task, assignment, &work_dir),
     )
     .context("write the cross check prompt")?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--workspace")
+        .arg(&store.workspace)
+        .arg("--state-dir")
+        .arg(&store.root)
+        .args(["cross-check-worker", &id, reviewer])
+        .current_dir(&work_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(dir.join("supervisor.log"))?)
+        .process_group(0)
+        .spawn()
+        .context("start cross-check supervisor")?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    store.record(
+        &goal.id,
+        "cross_check_started",
+        json!({"reviewer": reviewer, "task": task, "run": id}),
+    )?;
+    watch.cross_check = Some(CrossRun {
+        id,
+        goal: goal.id.clone(),
+        task: task.map(String::from),
+        reviewer: reviewer.into(),
+        started_at: Utc::now().timestamp(),
+        pid,
+        supervised: true,
+        stop_unconfirmed: false,
+    });
+    Ok(())
+}
+
+pub(crate) fn worker(store: &Store, id: &str, reviewer: &str) -> Result<()> {
+    anyhow::ensure!(
+        id.starts_with("cross-") && matches!(reviewer, "claude" | "codex"),
+        "invalid cross check"
+    );
+    let dir = store.run_path(id)?;
+    anyhow::ensure!(
+        dir.join("prompt.txt").is_file(),
+        "missing cross-check prompt"
+    );
+    std::fs::File::create_new(dir.join("supervisor.started"))
+        .context("cross-check run already started or unavailable")?;
     let result = dir.join("result.txt");
+    let work_dir = std::env::current_dir()?;
     let mut args: Vec<String> = match reviewer {
         "codex" => vec![
             "exec".into(),
@@ -203,7 +226,6 @@ fn start(
             result.display().to_string(),
             "-".into(),
         ],
-        // Read, Grep and Glob only, and no hooks: a user's hook could write.
         _ => vec![
             "-p".into(),
             "--permission-mode".into(),
@@ -217,13 +239,12 @@ fn start(
         ],
     };
     args.insert(0, reviewer.into());
-    // Claude Code answers on stdout; Codex writes its last message to -o.
     let stdout = if reviewer == "codex" {
         dir.join("log.txt")
     } else {
         result.clone()
     };
-    let mut child = std::process::Command::new("sh")
+    let child = std::process::Command::new("sh")
         .arg("-c")
         .arg(SHELL)
         .arg("sh")
@@ -233,38 +254,41 @@ fn start(
         .env("HGM_CROSS_DIR", &work_dir)
         .env("HGM_CROSS_OUT", &stdout)
         .env("HGM_CROSS_ERR", dir.join("stderr.txt"))
-        .env("HGM_CROSS_EXIT", dir.join("exit"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0)
-        .spawn()
-        .with_context(|| format!("start the {reviewer} check"))?;
-    store.record(
-        &goal.id,
-        "cross_check_started",
-        json!({"reviewer": reviewer, "task": task, "run": id}),
-    )?;
-    watch.cross_check = Some(CrossRun {
-        id,
-        goal: goal.id.clone(),
-        task: task.map(String::from),
-        reviewer: reviewer.into(),
-        started_at: Utc::now().timestamp(),
-        pid: child.id(),
-    });
-    // Reaped when it ends, so a long-running watch leaves no zombie behind.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            std::fs::write(dir.join("exit"), "launch_failed")?;
+            return Err(error).with_context(|| format!("start the {reviewer} check"));
+        }
+    };
+    let start = std::time::Instant::now();
+    let outcome = loop {
+        if let Some(status) = child.try_wait()? {
+            break status.code().unwrap_or(-1).to_string();
+        }
+        let requested = std::fs::read_to_string(dir.join("stop")).ok();
+        if requested.is_some() || start.elapsed().as_secs() >= TIMEOUT_SECS as u64 {
+            stop_group(&mut child)?;
+            break if requested.as_deref() == Some("stopped") {
+                "stopped"
+            } else {
+                "timeout"
+            }
+            .into();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    std::fs::write(dir.join("exit.tmp"), outcome)?;
+    std::fs::rename(dir.join("exit.tmp"), dir.join("exit"))?;
     Ok(())
 }
 
-/// Reads a finished check back: records its verdict and findings and returns
-/// the note for the next wake. One still running past [`TIMEOUT_SECS`] is
-/// stopped and recorded as timed out; with `ended` (the watch has ended) a
-/// running one is stopped at once.
-pub(crate) fn poll(
+pub(crate) async fn poll(
     store: &Store,
     watch: &mut Watch,
     now: i64,
@@ -274,7 +298,36 @@ pub(crate) fn poll(
         return Ok(None);
     };
     let dir = store.run_path(&run.id)?;
-    let exit = std::fs::read_to_string(dir.join("exit")).ok();
+    let exit_path = dir.join("exit");
+    let mut exit = std::fs::read_to_string(&exit_path).ok();
+    if exit.is_none() && (ended || now - run.started_at >= TIMEOUT_SECS) {
+        if run.supervised && !run.stop_unconfirmed {
+            std::fs::write(dir.join("stop"), if ended { "stopped" } else { "timeout" })?;
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                exit = std::fs::read_to_string(&exit_path).ok();
+                if exit.is_some() {
+                    break;
+                }
+            }
+        }
+        if exit.is_none() && !run.stop_unconfirmed {
+            let reason = format!(
+                "Termination of cross check {} is unconfirmed; inspect its run directory {}",
+                run.id,
+                dir.display()
+            );
+            store.record(
+                &run.goal,
+                "attention",
+                json!({"cause":"cross_check_stop_unconfirmed","reason":reason,"run":run.id}),
+            )?;
+            if let Some(state) = &mut watch.cross_check {
+                state.stop_unconfirmed = true;
+            }
+            return Ok(Some(reason));
+        }
+    }
     let (verdict, findings, status) = match exit {
         Some(status) => {
             let status = status.trim().to_string();
@@ -284,8 +337,8 @@ pub(crate) fn poll(
                 .find_map(|line| line.trim().strip_prefix("VERDICT:"))
                 .map(|v| v.trim().to_string())
                 .filter(|v| v == "approve" || v == "changes_requested");
-            // A reviewer that failed has no verdict, whatever it printed.
             let verdict = match named {
+                _ if matches!(status.as_str(), "stopped" | "timeout") => status.clone(),
                 _ if status != "0" => "failed".to_string(),
                 Some(verdict) => verdict,
                 None => "no_verdict".into(),
@@ -299,11 +352,6 @@ pub(crate) fn poll(
                 .collect();
             (verdict, findings, status)
         }
-        None if ended || now - run.started_at >= TIMEOUT_SECS => {
-            stop_group(run.pid);
-            let why = if ended { "stopped" } else { "timeout" };
-            (why.to_string(), vec![], String::new())
-        }
         None => return Ok(None),
     };
     store.record(
@@ -313,7 +361,6 @@ pub(crate) fn poll(
                "findings": findings, "exit": status, "run": run.id}),
     )?;
     watch.cross_check = None;
-    // Model output, quoted as data: never raw text in the manager's input.
     let detail = if findings.is_empty() {
         String::new()
     } else {
@@ -363,8 +410,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(alive(&sleeper));
-        stop_group(shell.id());
-        let _ = shell.wait();
+        stop_group(&mut shell).unwrap();
         let mut gone = false;
         for _ in 0..50 {
             if !alive(&sleeper) {
@@ -378,7 +424,6 @@ mod tests {
 
     #[test]
     fn reviewer_output_reaches_the_manager_as_plain_text() {
-        // An escape sequence and a carriage return in a finding are dropped.
         assert_eq!(
             clean("- \u{1b}[2Jcleared\rscreen", 200),
             "- [2Jclearedscreen"

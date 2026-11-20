@@ -1,5 +1,3 @@
-//! Admission of assignments under the confirmed loop contract. Rules here are
-//! enforced in code, not left to the manager's reading of its instructions.
 use crate::{
     contract::Autonomy,
     events::Event,
@@ -9,7 +7,6 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Local, Utc};
 
-/// Where an assignment belongs and how it may be sent.
 pub(crate) struct Assignment<'a> {
     pub goal: Option<&'a str>,
     pub task: Option<&'a str>,
@@ -28,14 +25,10 @@ pub(crate) struct Assignment<'a> {
     pub via: Option<&'a str>,
 }
 
-/// What a delivery is for; each kind has its own text, budget and timeline event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
-    /// New linked work, counted against `loop.max_assignments`.
     Assignment,
-    /// A short steer back to the contract, counted against `loop.max_corrections`.
     Correction,
-    /// A request to restate the goal; not counted, and its reply is not evidence.
     Reanchor,
 }
 impl Delivery {
@@ -57,27 +50,18 @@ impl Delivery {
     }
 }
 
-/// One-shot spec discipline: longer assignments should link files instead.
 pub(crate) const ASSIGNMENT_WORD_BUDGET: usize = 400;
-/// A correction names what is off and what to do; longer text is a new assignment.
 pub(crate) const CORRECTION_WORD_BUDGET: usize = 150;
-/// How the wait reason starts when a task's assignment budget is spent.
 pub(crate) const ASSIGNMENT_BUDGET_SPENT: &str = "Assignment budget exhausted";
-/// How the wait reason starts when a task's correction budget is spent.
 pub(crate) const CORRECTION_BUDGET_SPENT: &str = "Correction budget exhausted";
 
-/// What happened to one task since it was last reopened.
 #[derive(Default)]
 struct TaskHistory<'a> {
     assigned: u32,
     corrections: u32,
     plan_approved: bool,
-    /// Role that received the task's linked assignments.
     owner: Option<&'a str>,
 }
-/// The task whose plan `approve-plan` without `--task` approves: the one task
-/// a plan was asked for (`send --plan`) and not yet approved. Several are
-/// refused with the exact command for each; none approves the goal as a whole.
 pub(crate) fn plan_pending(events: &[Event], goal: &str) -> Result<Option<String>> {
     let mut pending: Vec<Option<String>> = vec![];
     for event in events {
@@ -126,11 +110,6 @@ fn task_history<'a>(events: &'a [Event], task: Option<&str>) -> TaskHistory<'a> 
     history
 }
 
-/// The current time and what is left of the loop budget, given with every
-/// wake: an unattended manager otherwise guesses the time and overruns. In the
-/// last quarter of `max_hours` it asks to finish rather than widen the work.
-/// Assignments used and allowed for the latest assigned task, and minutes of
-/// the time budget left (negative once spent), as `budget_line` counts them.
 pub(crate) fn budget_numbers(
     goal: &Goal,
     events: &[Event],
@@ -188,10 +167,6 @@ pub(crate) fn budget_line(
     line
 }
 
-/// Why the worker should restate the goal now, and the trigger time: after a
-/// detected compaction, a restart or a scope change since the last goal check,
-/// and every `loop.reanchor_minutes` of work. Nothing is due before work starts.
-/// The restatement re-reads the goal; it is not evidence of progress.
 pub(crate) fn reanchor_due(
     goal: &Goal,
     events: &[Event],
@@ -228,21 +203,12 @@ pub(crate) fn reanchor_due(
     })
 }
 
-/// Admits an assignment and returns the text to deliver. Every assignment must
-/// fit a one-shot spec. A linked one also needs a live goal, an agent-performed
-/// task, a confirmed contract, the user's approval under `ask`, an approved
-/// plan under `plan_first`, budget left, and one owner per task; it then
-/// carries the contract. A correction has its own smaller budget and text.
-/// A spent budget turns into a wait so the user is asked instead.
 pub(crate) fn admit(store: &Store, assignment: &Assignment<'_>, text: &str) -> Result<String> {
     admission(store, assignment, text, true)
 }
-/// Every refusal of [`admit`] with no side effect: a spent budget refuses
-/// without setting the goal waiting. Used when a step is stored for later.
 pub(crate) fn check(store: &Store, assignment: &Assignment<'_>, text: &str) -> Result<()> {
     admission(store, assignment, text, false).map(|_| ())
 }
-/// The refusal for a spent budget; with `wait`, the goal waits for the user.
 fn spent(store: &Store, id: &str, reason: String, wait: bool) -> anyhow::Error {
     if !wait {
         return anyhow::anyhow!("{reason}");
@@ -282,15 +248,38 @@ fn admission(
         goal.status
     );
     if let Some(task) = assignment.task {
-        let task = goal
+        let (index, task) = goal
             .tasks
             .iter()
-            .find(|t| t.spec.id == task)
+            .enumerate()
+            .find(|(_, t)| t.spec.id == task)
             .with_context(|| format!("unknown task ID {task}"))?;
         ensure!(
             task.spec.runner.is_none(),
             "task {} runs a configured command; it is not assigned to an agent: run it with hgm run GOAL",
             task.spec.id
+        );
+        if assignment.kind != Delivery::Reanchor {
+            ensure!(
+                !task.succeeded(),
+                "task {} is complete; revise it before assigning more work",
+                task.spec.id
+            );
+            ensure!(
+                goal.dependencies_done(index),
+                "task {} has unfinished dependencies",
+                task.spec.id
+            );
+        }
+    }
+    if assignment.kind != Delivery::Reanchor {
+        ensure!(
+            crate::watch::short_of_completion(&goal),
+            "goal {id} is paused, waiting, or ready for review; resolve its current state before assigning work"
+        );
+        ensure!(
+            goal.tasks.is_empty() || goal.tasks.iter().any(|task| !task.succeeded()),
+            "all tasks on goal {id} are complete; verify them or revise the goal before assigning work"
         );
     }
     ensure!(
@@ -298,7 +287,6 @@ fn admission(
         "goal {id} has no confirmed loop contract; show the user the outcome, checks and budget, then record their words with hgm confirm {id} --evidence TEXT"
     );
     let policy = &goal.spec.loop_policy;
-    // A goal check adds no work, so it needs no approval under `ask`.
     ensure!(
         policy.autonomy != Autonomy::Ask
             || assignment.kind == Delivery::Reanchor
@@ -310,8 +298,6 @@ fn admission(
     let events = store.events(id)?;
     let history = task_history(&events, assignment.task);
     let task = assignment.task.unwrap_or("this goal");
-    // Two agents editing one task collapse into merge conflicts; a task changes
-    // hands only after a revision reopens it.
     if let Some(owner) = history.owner {
         ensure!(
             owner == assignment.to,
@@ -334,17 +320,12 @@ fn admission(
                 );
                 return Err(spent(store, id, reason, wait_on_spent));
             }
-            // A correction follows an assignment that carried the contract; it
-            // points to the contract instead of repeating part of it (on
-            // 2026-11-15 the repeated lists outgrew the corrections).
             return Ok(format!(
                 "Goal Manager correction for goal {id}, {task}: {text}\nStop the step that leaves the contract, fix it, then continue the assignment and report what changed. The contract of your assignment still binds you: {} show {id}.",
                 hgm_for(store, assignment.to)?,
             ));
         }
         Delivery::Reanchor => {
-            // The restatement goes on the timeline, so the manager reads it
-            // from hgm (on 2026-11-16 three goal checks got no visible reply).
             let hgm = hgm_for(store, assignment.to)?;
             let flag = assignment
                 .task
@@ -365,7 +346,6 @@ fn admission(
         }
         Delivery::Assignment => {}
     }
-    // The approval is recorded per task, so the command names it exactly.
     let approve = match assignment.task {
         Some(task) => format!("hgm approve-plan {id} --task {task} --evidence TEXT"),
         None => format!("hgm approve-plan {id} --evidence TEXT"),
@@ -386,8 +366,6 @@ fn admission(
     } else {
         ""
     };
-    // Configured project practice (e.g. "run the tests before reporting"); like
-    // the contract it is outside the manager's word budget.
     let practice = crate::config::load(&store.workspace)?
         .assignment_append
         .unwrap_or_default();
@@ -402,7 +380,6 @@ fn admission(
             )
         })
         .unwrap_or_default();
-    // The task's write scope, when it names one; hgm compares, never blocks.
     let scope = assignment
         .task
         .and_then(|task| goal.tasks.iter().find(|t| t.spec.id == task))
@@ -422,9 +399,6 @@ fn admission(
     ))
 }
 
-/// How the recipient of a linked assignment records its choices and the
-/// findings that should not block. Helper roles have `hgm` on their PATH with
-/// this folder and state; main runs this build by its path, with both named.
 fn record_line(store: &Store, id: &str, task: Option<&str>, to: &str) -> Result<String> {
     let hgm = hgm_for(store, to)?;
     let task = task.map(|t| format!(" --task {t}")).unwrap_or_default();
@@ -432,9 +406,6 @@ fn record_line(store: &Store, id: &str, task: Option<&str>, to: &str) -> Result<
         "Record each choice you make inside the contract when you make it: {hgm} decision {id}{task} \"WHAT\" --why \"WHY\". Record a finding that should not block this work: {hgm} follow-up {id}{task} \"WHAT\". File your report when you finish or stop, in full, so the manager reads it from hgm: {hgm} report {id}{task} \"TEXT\" (or --file PATH)."
     ))
 }
-/// How `to` runs hgm: main has no `hgm` on its PATH, so it gets this build's
-/// path with the folder (and a state folder other than the default); a helper
-/// role runs plain `hgm`.
 fn hgm_for(store: &Store, to: &str) -> Result<String> {
     Ok(if to == "main" {
         let quote = |path: &std::path::Path| crate::manager::quote(path.as_os_str());
@@ -580,7 +551,6 @@ mod tests {
             .contains("--user-approval")
         );
         check(&store, &assignment(&ask, Some("User: yes")), "Do it")?;
-        // A spent budget refuses at once without setting the goal waiting.
         let spent = add(
             "objective: o\nacceptance: [a]\nchecks: [{name: c, command: 'true'}]\nloop: {max_assignments: 1}\n",
         )?;
@@ -617,16 +587,12 @@ mod tests {
         Ok(())
     }
 
-    /// Words in `text`, as `wc -w` counts them.
     fn words(text: &str) -> usize {
         text.split_whitespace().count()
     }
 
     #[test]
     fn every_text_hgm_types_stays_within_its_word_budget() -> Result<()> {
-        // Budgets for the texts hgm types into an agent, measured on a minimal
-        // contract (one acceptance item, one check) so only hgm's own words
-        // count. Each sits a little above the 2026-11-16 revision.
         const ASSIGNMENT_APPENDIX: usize = 160;
         const CORRECTION: usize = 45;
         const GOAL_CHECK: usize = 90;

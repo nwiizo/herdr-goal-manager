@@ -1,5 +1,3 @@
-//! Persisted goal contract and deterministic state transitions.
-
 use crate::contract::{Autonomy, LoopPolicy};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
@@ -97,7 +95,6 @@ pub(crate) struct GoalSpec {
     pub loop_policy: LoopPolicy,
 }
 
-/// Words, counting two CJK characters as one word so Japanese text is budgeted too.
 pub(crate) fn word_units(text: &str) -> usize {
     let cjk = text
         .chars()
@@ -106,8 +103,6 @@ pub(crate) fn word_units(text: &str) -> usize {
     text.split_whitespace().count() + cjk / 2
 }
 
-/// An unresolved question stated with its resolution path, so agents do not
-/// silently decide it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenQuestion {
@@ -119,10 +114,8 @@ pub(crate) struct OpenQuestion {
     pub default: Option<String>,
 }
 
-/// Spec length above which agents follow rules less reliably.
 pub(crate) const SPEC_WORD_BUDGET: usize = 800;
 
-/// The checkout a contract asks for: `branch` from `base` in `repository`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CheckoutSpec {
@@ -151,7 +144,6 @@ impl CheckoutSpec {
         Ok(())
     }
 }
-/// The checkout hgm created or reopened for a goal (a Herdr workspace).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Checkout {
@@ -312,9 +304,7 @@ impl GoalSpec {
     pub fn words(&self) -> usize {
         self.word_fields().iter().map(|(_, words)| words).sum()
     }
-    /// The contract's words per field, in contract order, so an author over
-    /// budget sees where the words are (2026-11-15: four failed adds that
-    /// only said the total).
+    /// Word counts by field, in contract order.
     pub fn word_fields(&self) -> Vec<(&'static str, usize)> {
         let sum = |texts: &mut dyn Iterator<Item = &String>| -> usize {
             texts.map(|text| word_units(text)).sum()
@@ -435,7 +425,6 @@ impl GoalSpec {
     }
 }
 
-/// Every entry names a path inside the workspace: relative, without `..`.
 fn relative_paths(paths: &[String]) -> bool {
     paths.iter().all(|p| {
         let path = std::path::Path::new(p);
@@ -447,8 +436,6 @@ fn relative_paths(paths: &[String]) -> bool {
     })
 }
 
-/// Whether workspace-relative `path` lies in one of `scope` (a file or a
-/// directory and everything under it).
 pub(crate) fn within(path: &str, scope: &[String]) -> bool {
     let path = std::path::Path::new(path);
     scope.iter().any(|entry| path.starts_with(entry))
@@ -622,6 +609,11 @@ impl Goal {
     /// instead of a missing-directory error.
     pub fn work_dir(&self) -> Result<&std::path::Path> {
         let Some(checkout) = &self.checkout else {
+            ensure!(
+                self.spec.checkout.is_none(),
+                "goal {} needs its configured checkout; confirm the goal before running its commands",
+                self.id
+            );
             return Ok(self.workspace.as_path());
         };
         if let Some(removed) = checkout.removed_at {
@@ -695,8 +687,6 @@ impl Goal {
         if control == Control::Run {
             self.waiting = None;
         }
-        // Control steers automation. Review and input states describe the outcome,
-        // so pausing or resuming wakeups must not hide a result awaiting a human.
         self.status = match (control, self.status) {
             (_, GoalStatus::Running) => GoalStatus::Running,
             (Control::Cancel, _) => GoalStatus::Cancelled,
